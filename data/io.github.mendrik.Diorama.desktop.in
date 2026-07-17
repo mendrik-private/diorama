@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Image Viewer
+Comment=View, compare, and edit images
+Exec=diorama %U
+Icon=io.github.mendrik.Diorama
+Terminal=false
+Type=Application
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/avif;image/heif;image/tiff;image/svg+xml;image/bmp;image/jxl;image/jp2;
+StartupNotify=true
+DBusActivatable=true
+

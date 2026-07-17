@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.mendrik.Diorama" path="/io/github/mendrik/Diorama/">
+    <key name="zoom-filter" type="s"><default>'soft'</default></key>
+    <key name="transparency-background" type="s"><default>'gray'</default></key>
+    <key name="window-width" type="i"><default>1000</default></key>
+    <key name="window-height" type="i"><default>700</default></key>
+    <key name="window-maximized" type="b"><default>false</default></key>
+    <key name="last-zoom-mode" type="s"><default>'fit'</default></key>
+    <key name="last-zoom" type="d"><default>1.0</default></key>
+    <key name="last-open-folder-uri" type="s"><default>''</default></key>
+    <key name="scale-resampling" type="s"><default>'bicubic'</default></key>
+    <key name="folder-sort" type="s"><default>'name'</default></key>
+    <key name="preserve-metadata" type="b"><default>true</default></key>
+    <key name="png-compression" type="i"><default>6</default></key>
+    <key name="jpeg-quality" type="i"><default>92</default></key>
+    <key name="jpeg-background" type="s"><default>'white'</default></key>
+    <key name="palette-dithering" type="b"><default>false</default></key>
+    <key name="compare-lens-size" type="i"><default>280</default></key>
+    <key name="compare-lens-magnification" type="d"><default>4.0</default></key>
+    <key name="ai-model-installed" type="b"><default>false</default></key>
+  </schema>
+</schemalist>

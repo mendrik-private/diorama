@@ -1,0 +1,29 @@
+{
+  "app-id": "io.github.mendrik.Diorama",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "50",
+  "sdk": "org.gnome.Sdk",
+  "command": "diorama",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--device=dri",
+    "--talk-name=org.freedesktop.portal.Desktop"
+  ],
+  "modules": [
+    {
+      "name": "diorama",
+      "buildsystem": "meson",
+      "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin"
+      },
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        }
+      ]
+    }
+  ]
+}

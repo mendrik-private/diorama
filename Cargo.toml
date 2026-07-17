@@ -1,0 +1,43 @@
+[package]
+name = "diorama"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A fast, native GNOME image viewer"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+fast_image_resize = "6.0.0"
+flate2 = "1.1.9"
+gio = { version = "0.22.8", features = ["v2_80"] }
+glib = { version = "0.22.8", features = ["v2_80"] }
+glycin = { version = "3.1.0", features = ["gdk4"] }
+gtk = { package = "gtk4", version = "0.11.4", features = ["gnome_49"] }
+image = { version = "0.25.10", features = ["avif", "bmp", "exr", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+crc32fast = "1.5.0"
+libadwaita = { version = "0.9.2", features = ["v1_9", "gtk_v4_20"] }
+lru = "0.16.2"
+palette = "0.7.6"
+rayon = "1.11.0"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[dev-dependencies]
+base64 = "0.22.1"
+proptest = "1.9.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
