@@ -111,6 +111,7 @@ struct WindowState {
     edit_drag: Cell<Option<EditDrag>>,
     edit_scale: Cell<f64>,
     compare_canvas: RefCell<Option<ImageCanvas>>,
+    compare_rendered: RefCell<Option<image::RgbaImage>>,
     compare_scrolled: RefCell<Option<gtk::ScrolledWindow>>,
     compare_paned: RefCell<Option<gtk::Paned>>,
     compare_locked: Cell<bool>,
@@ -286,6 +287,7 @@ impl ViewerWindow {
             edit_drag: Cell::new(None),
             edit_scale: Cell::new(1.0),
             compare_canvas: RefCell::new(None),
+            compare_rendered: RefCell::new(None),
             compare_scrolled: RefCell::new(None),
             compare_paned: RefCell::new(None),
             compare_locked: Cell::new(true),
@@ -780,6 +782,21 @@ impl ViewerWindow {
         let Some(image) = self.0.rendered.borrow().clone() else {
             return;
         };
+        self.paint_pencil_preview(&self.0.canvas, &image);
+    }
+
+    fn preview_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
+        let Some(image) = self.0.compare_rendered.borrow().clone() else {
+            return;
+        };
+        self.paint_pencil_preview(canvas, &image);
+    }
+
+    fn paint_pencil_preview(
+        &self,
+        canvas: &ImageCanvas,
+        image: &image::RgbaImage,
+    ) -> Option<image::RgbaImage> {
         let stroke = Stroke {
             points: self.0.pencil_points.borrow().clone(),
             color: self.0.pencil_color.get(),
@@ -788,19 +805,36 @@ impl ViewerWindow {
             hardness: 1.0,
         };
         if let Ok(preview) =
-            crate::tools::pencil::paint_stroke(&image, &stroke, &CancellationToken::default())
+            crate::tools::pencil::paint_stroke(image, &stroke, &CancellationToken::default())
             && let Ok(texture) = texture_from_rgba(&preview)
         {
-            self.0.canvas.set_texture(Some(&texture));
-            self.update_minimap();
+            canvas.set_texture(Some(&texture));
+            if canvas == &self.0.canvas {
+                self.update_minimap();
+            }
+            return Some(preview);
+        }
+        None
+    }
+
+    fn commit_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
+        let Some(image) = self.0.compare_rendered.borrow().clone() else {
+            return;
+        };
+        if let Some(preview) = self.paint_pencil_preview(canvas, &image) {
+            self.0.compare_rendered.replace(Some(preview));
         }
     }
 
     fn set_edit_active(&self, active: bool) {
         self.0.transform_controls.set_visible(active);
         self.0.zoom_controls.set_visible(!active);
-        if active {
-            self.0.lens_button.set_active(false);
+        self.0.lens_button.set_active(false);
+        self.0.lens_active.set(false);
+        self.0.canvas.set_cursor_from_name(None);
+        self.0.canvas.clear_lens();
+        if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
+            canvas.clear_lens();
         }
         self.0.lens_button.set_sensitive(!active);
         if !active {
@@ -833,6 +867,7 @@ impl ViewerWindow {
         };
         self.0.edit_crop.replace(Some(crop));
         self.0.canvas.set_crop_overlay(Some(crop));
+        self.fit(false);
     }
 
     fn render_document(&self) {
@@ -1893,6 +1928,9 @@ impl ViewerWindow {
             .replace(Some(compare_scrolled.clone()));
         self.0.compare_paned.replace(Some(paned.clone()));
         self.0.compare_locked.set(true);
+        self.0
+            .compare_rendered
+            .replace(rgba_from_texture(&preview.texture));
 
         lock.connect_toggled({
             let this = self.clone();
@@ -1905,6 +1943,7 @@ impl ViewerWindow {
         self.connect_compare_adjustments(&compare_scrolled);
         self.connect_lens(&self.0.canvas, &compare_canvas, &preview.texture);
         self.connect_lens(&compare_canvas, &self.0.canvas, &primary);
+        self.install_comparison_pencil_gestures(&compare_canvas);
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll({
             let this = self.clone();
@@ -1947,8 +1986,11 @@ impl ViewerWindow {
         }
         self.0.compare_scrolled.replace(None);
         self.0.compare_canvas.replace(None);
+        self.0.compare_rendered.replace(None);
         self.0.canvas.set_tooltip_text(Some("Image canvas"));
         self.0.canvas.set_accessible_label("Image canvas");
+        let this = self.clone();
+        glib::idle_add_local_once(move || this.update_minimap());
     }
 
     fn connect_compare_adjustments(&self, compare: &gtk::ScrolledWindow) {
@@ -2047,6 +2089,11 @@ impl ViewerWindow {
             let target = target.clone();
             let target_texture = target_texture.clone();
             move |_, x, y| {
+                if this.0.edit_button.is_active() {
+                    source.clear_lens();
+                    target.clear_lens();
+                    return;
+                }
                 let Some((normalized_x, normalized_y)) = source.normalized_at(x, y) else {
                     source.clear_lens();
                     target.clear_lens();
@@ -2177,18 +2224,22 @@ impl ViewerWindow {
     }
 
     fn pan_from_minimap(&self, x: f64, y: f64) {
-        let width = f64::from(self.0.minimap.width().max(1));
-        let height = f64::from(self.0.minimap.height().max(1));
+        let Some(image_bounds) = self.0.minimap.image_bounds() else {
+            return;
+        };
+        let normalized_x =
+            ((x as f32 - image_bounds.x()) / image_bounds.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        let normalized_y =
+            ((y as f32 - image_bounds.y()) / image_bounds.height().max(1.0)).clamp(0.0, 1.0) as f64;
         let horizontal = self.0.scrolled.hadjustment();
         let vertical = self.0.scrolled.vadjustment();
         let horizontal_range =
             (horizontal.upper() - horizontal.lower() - horizontal.page_size()).max(0.0);
         let vertical_range = (vertical.upper() - vertical.lower() - vertical.page_size()).max(0.0);
-        let horizontal_target = (x / width).clamp(0.0, 1.0)
-            * (horizontal.upper() - horizontal.lower())
-            - horizontal.page_size() / 2.0;
-        let vertical_target = (y / height).clamp(0.0, 1.0) * (vertical.upper() - vertical.lower())
-            - vertical.page_size() / 2.0;
+        let horizontal_target =
+            normalized_x * (horizontal.upper() - horizontal.lower()) - horizontal.page_size() / 2.0;
+        let vertical_target =
+            normalized_y * (vertical.upper() - vertical.lower()) - vertical.page_size() / 2.0;
         horizontal.set_value(horizontal.lower() + horizontal_target.clamp(0.0, horizontal_range));
         vertical.set_value(vertical.lower() + vertical_target.clamp(0.0, vertical_range));
     }
@@ -2569,6 +2620,89 @@ impl ViewerWindow {
         self.0.canvas.add_controller(pan);
     }
 
+    fn install_comparison_pencil_gestures(&self, canvas: &ImageCanvas) {
+        let pencil = gtk::GestureDrag::new();
+        pencil.set_button(1);
+        pencil.connect_drag_begin({
+            let this = self.clone();
+            let canvas = canvas.clone();
+            move |_, x, y| {
+                if !this.0.pencil_active.get() || this.0.compare_rendered.borrow().is_none() {
+                    return;
+                }
+                this.0.pencil_start.set((x, y));
+                let Some((x, y)) = canvas.pixel_at(x, y) else {
+                    return;
+                };
+                this.0.pencil_points.replace(vec![BrushPoint {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                    pressure: 1.0,
+                }]);
+                this.preview_comparison_pencil_stroke(&canvas);
+            }
+        });
+        pencil.connect_drag_update({
+            let this = self.clone();
+            let canvas = canvas.clone();
+            move |_, offset_x, offset_y| {
+                if !this.0.pencil_active.get() {
+                    return;
+                }
+                let (start_x, start_y) = this.0.pencil_start.get();
+                let Some((x, y)) = canvas.pixel_at(start_x + offset_x, start_y + offset_y) else {
+                    return;
+                };
+                this.0.pencil_points.borrow_mut().push(BrushPoint {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                    pressure: 1.0,
+                });
+                this.preview_comparison_pencil_stroke(&canvas);
+            }
+        });
+        pencil.connect_drag_end({
+            let this = self.clone();
+            let canvas = canvas.clone();
+            move |_, _, _| {
+                if !this.0.pencil_active.get() {
+                    return;
+                }
+                if !this.0.pencil_points.borrow().is_empty() {
+                    this.commit_comparison_pencil_stroke(&canvas);
+                }
+                this.0.pencil_points.take();
+            }
+        });
+        canvas.add_controller(pencil);
+
+        let sampler = gtk::GestureClick::new();
+        sampler.set_button(3);
+        sampler.connect_pressed({
+            let this = self.clone();
+            let canvas = canvas.clone();
+            move |gesture, _, x, y| {
+                if !this.0.pencil_active.get() {
+                    return;
+                }
+                let pixel = canvas.pixel_at(x, y).and_then(|(x, y)| {
+                    this.0
+                        .compare_rendered
+                        .borrow()
+                        .as_ref()
+                        .and_then(|image| crate::tools::pencil::sample(image, x, y))
+                });
+                let Some(color) = pixel else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.0.pencil_color.set(color);
+                this.0.color_button.set_rgba(&u8_to_rgba(color));
+            }
+        });
+        canvas.add_controller(sampler);
+    }
+
     fn install_state_persistence(&self) {
         self.0.window.connect_close_request({
             let this = self.clone();
@@ -2772,6 +2906,24 @@ fn texture_from_rgba(image: &image::RgbaImage) -> Result<gtk::gdk::Texture, Stri
     .upcast())
 }
 
+fn rgba_from_texture(texture: &gtk::gdk::Texture) -> Option<image::RgbaImage> {
+    let width = u32::try_from(texture.width()).ok()?;
+    let height = u32::try_from(texture.height()).ok()?;
+    let mut downloader = gtk::gdk::TextureDownloader::new(texture);
+    downloader.set_format(gtk::gdk::MemoryFormat::R8g8b8a8);
+    let (bytes, stride) = downloader.download_bytes();
+    let row_bytes = usize::try_from(u64::from(width).checked_mul(4)?).ok()?;
+    let expected_bytes = stride.checked_mul(usize::try_from(height).ok()?)?;
+    if stride < row_bytes || bytes.len() < expected_bytes {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(row_bytes.checked_mul(usize::try_from(height).ok()?)?);
+    for row in bytes.as_ref().chunks_exact(stride).take(height as usize) {
+        pixels.extend_from_slice(&row[..row_bytes]);
+    }
+    image::RgbaImage::from_raw(width, height, pixels)
+}
+
 fn sync_adjustment(source: &gtk::Adjustment, target: &gtk::Adjustment) {
     let source_range = (source.upper() - source.page_size()).max(0.0);
     let target_range = (target.upper() - target.page_size()).max(0.0);
@@ -2824,5 +2976,13 @@ mod tests {
 
         assert_eq!(corner_scale(drag, -100.0, -20.0), 1.5);
         assert_eq!(corner_scale(drag, 160.0, 80.0), 0.2);
+    }
+
+    #[test]
+    fn downloaded_comparison_texture_keeps_rgba_pixels() {
+        let image = image::RgbaImage::from_raw(1, 1, vec![12, 34, 56, 78]).unwrap();
+        let texture = texture_from_rgba(&image).unwrap();
+
+        assert_eq!(rgba_from_texture(&texture), Some(image));
     }
 }

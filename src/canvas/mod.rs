@@ -502,6 +502,32 @@ struct MiniMapViewport {
     height: f32,
 }
 
+fn aspect_fit_bounds(
+    bounds: gtk::graphene::Rect,
+    image_width: i32,
+    image_height: i32,
+) -> gtk::graphene::Rect {
+    let image_ratio = image_width.max(1) as f32 / image_height.max(1) as f32;
+    let bounds_ratio = bounds.width() / bounds.height().max(1.0);
+    if image_ratio > bounds_ratio {
+        let height = bounds.width() / image_ratio;
+        gtk::graphene::Rect::new(
+            bounds.x(),
+            bounds.y() + (bounds.height() - height) / 2.0,
+            bounds.width(),
+            height,
+        )
+    } else {
+        let width = bounds.height() * image_ratio;
+        gtk::graphene::Rect::new(
+            bounds.x() + (bounds.width() - width) / 2.0,
+            bounds.y(),
+            width,
+            bounds.height(),
+        )
+    }
+}
+
 mod minimap_imp {
     use super::*;
 
@@ -529,21 +555,22 @@ mod minimap_imp {
                 object.width().max(1) as f32,
                 object.height().max(1) as f32,
             );
-            let rounded = gtk::gsk::RoundedRect::from_rect(bounds, 0.0);
             if let Some(texture) = self.texture.borrow().as_ref() {
+                let image_bounds = aspect_fit_bounds(bounds, texture.width(), texture.height());
+                let image_rounded = gtk::gsk::RoundedRect::from_rect(image_bounds, 0.0);
                 if let Some(viewport) = self.viewport.get() {
                     snapshot.push_blend(gtk::gsk::BlendMode::Difference);
                     snapshot.append_scaled_texture(
                         texture,
                         gtk::gsk::ScalingFilter::Linear,
-                        &bounds,
+                        &image_bounds,
                     );
                     snapshot.pop();
                     let viewport = gtk::graphene::Rect::new(
-                        bounds.x() + viewport.x.clamp(0.0, 1.0) * bounds.width(),
-                        bounds.y() + viewport.y.clamp(0.0, 1.0) * bounds.height(),
-                        viewport.width.clamp(0.0, 1.0) * bounds.width(),
-                        viewport.height.clamp(0.0, 1.0) * bounds.height(),
+                        image_bounds.x() + viewport.x.clamp(0.0, 1.0) * image_bounds.width(),
+                        image_bounds.y() + viewport.y.clamp(0.0, 1.0) * image_bounds.height(),
+                        viewport.width.clamp(0.0, 1.0) * image_bounds.width(),
+                        viewport.height.clamp(0.0, 1.0) * image_bounds.height(),
                     );
                     let viewport = gtk::gsk::RoundedRect::from_rect(viewport, 0.0);
                     snapshot.append_border(&viewport, &[1.0; 4], &[gdk::RGBA::WHITE; 4]);
@@ -552,11 +579,11 @@ mod minimap_imp {
                     snapshot.append_scaled_texture(
                         texture,
                         gtk::gsk::ScalingFilter::Linear,
-                        &bounds,
+                        &image_bounds,
                     );
                 }
+                snapshot.append_border(&image_rounded, &[1.0; 4], &[gdk::RGBA::BLACK; 4]);
             }
-            snapshot.append_border(&rounded, &[1.0; 4], &[gdk::RGBA::BLACK; 4]);
         }
     }
 }
@@ -589,5 +616,43 @@ impl MiniMap {
                 height,
             }));
         self.queue_draw();
+    }
+
+    pub fn image_bounds(&self) -> Option<gtk::graphene::Rect> {
+        let texture = self.imp().texture.borrow().clone()?;
+        let bounds = gtk::graphene::Rect::new(
+            0.0,
+            0.0,
+            self.width().max(1) as f32,
+            self.height().max(1) as f32,
+        );
+        Some(aspect_fit_bounds(bounds, texture.width(), texture.height()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimap_bounds_preserve_wide_image_aspect_ratio() {
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 160.0, 120.0);
+        let fitted = aspect_fit_bounds(bounds, 1600, 900);
+
+        assert_eq!(fitted.x(), 0.0);
+        assert_eq!(fitted.y(), 15.0);
+        assert_eq!(fitted.width(), 160.0);
+        assert_eq!(fitted.height(), 90.0);
+    }
+
+    #[test]
+    fn minimap_bounds_preserve_tall_image_aspect_ratio() {
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 160.0, 120.0);
+        let fitted = aspect_fit_bounds(bounds, 800, 1200);
+
+        assert_eq!(fitted.x(), 40.0);
+        assert_eq!(fitted.y(), 0.0);
+        assert_eq!(fitted.width(), 80.0);
+        assert_eq!(fitted.height(), 120.0);
     }
 }
