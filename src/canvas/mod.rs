@@ -7,8 +7,8 @@ use gtk::subclass::prelude::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZoomFilter {
-    #[default]
     Soft,
+    #[default]
     Hard,
 }
 
@@ -633,6 +633,11 @@ impl MiniMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hard_zoom_is_the_default_filter() {
+        assert_eq!(ZoomFilter::default(), ZoomFilter::Hard);
+    }
 
     #[test]
     fn minimap_bounds_preserve_wide_image_aspect_ratio() {

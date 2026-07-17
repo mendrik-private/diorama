@@ -226,24 +226,13 @@ fn apply_operation(
             height,
             resampling,
         } => {
-            if *width == 0 || *height == 0 {
-                return Err(AppError::InvalidDimensions);
-            }
-            if *resampling == super::Resampling::SeamCarving {
-                return tools::scale::seam_carve(
-                    &dynamic.into_rgba8(),
-                    *width,
-                    *height,
-                    cancellation,
-                );
-            }
-            let filter = match resampling {
-                super::Resampling::Nearest => image::imageops::FilterType::Nearest,
-                super::Resampling::Linear => image::imageops::FilterType::Triangle,
-                super::Resampling::Bicubic => image::imageops::FilterType::CatmullRom,
-                super::Resampling::SeamCarving => unreachable!(),
-            };
-            dynamic.resize_exact(*width, *height, filter)
+            return tools::scale::resize(
+                &dynamic.into_rgba8(),
+                *width,
+                *height,
+                *resampling,
+                cancellation,
+            );
         }
         Operation::Palette {
             colors,

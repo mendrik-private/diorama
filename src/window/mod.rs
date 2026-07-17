@@ -2,6 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupExt};
 use gio::prelude::*;
@@ -38,11 +40,6 @@ struct EditDrag {
     crop: CropOverlay,
     start_screen_x: f64,
     start_screen_y: f64,
-    scale: bool,
-    anchor_x: f64,
-    anchor_y: f64,
-    start_width: f64,
-    start_height: f64,
     left: bool,
     right: bool,
     top: bool,
@@ -71,15 +68,63 @@ fn edit_resize_cursor(rect: gtk::graphene::Rect, x: f32, y: f32) -> &'static str
     }
 }
 
-fn corner_scale(drag: EditDrag, x: f64, y: f64) -> f64 {
-    let horizontal = (x - drag.anchor_x).abs() / drag.start_width.max(1.0);
-    let vertical = (y - drag.anchor_y).abs() / drag.start_height.max(1.0);
-    if (horizontal - 1.0).abs() >= (vertical - 1.0).abs() {
-        horizontal
-    } else {
-        vertical
+fn resize_crop(
+    mut crop: CropOverlay,
+    x: u32,
+    y: u32,
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+) -> CropOverlay {
+    if left {
+        let right = crop.x + crop.width;
+        crop.x = x.min(right.saturating_sub(1));
+        crop.width = right - crop.x;
     }
-    .clamp(0.05, 64.0)
+    if right {
+        crop.width = x.saturating_sub(crop.x).clamp(1, crop.image_width - crop.x);
+    }
+    if top {
+        let bottom = crop.y + crop.height;
+        crop.y = y.min(bottom.saturating_sub(1));
+        crop.height = bottom - crop.y;
+    }
+    if bottom {
+        crop.height = y
+            .saturating_sub(crop.y)
+            .clamp(1, crop.image_height - crop.y);
+    }
+    crop
+}
+
+fn scaled_dimensions(width: u32, height: u32, target_width: u32) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let target_width = target_width.max(1);
+    let target_height = (u64::from(height) * u64::from(target_width) / u64::from(width))
+        .max(1)
+        .min(u64::from(u32::MAX)) as u32;
+    (target_width, target_height)
+}
+
+fn scale_preview_zoom(source_width: u32, target_width: u32, source_zoom: f64) -> f64 {
+    source_zoom * f64::from(source_width.max(1)) / f64::from(target_width.max(1))
+}
+
+fn render_scale_preview(
+    image: &image::RgbaImage,
+    target_width: u32,
+    resampling: Resampling,
+) -> crate::error::Result<image::RgbaImage> {
+    let (width, height) = scaled_dimensions(image.width(), image.height(), target_width);
+    crate::tools::scale::resize(
+        image,
+        width,
+        height,
+        resampling,
+        &CancellationToken::default(),
+    )
 }
 
 struct WindowState {
@@ -109,7 +154,6 @@ struct WindowState {
     edit_button: gtk::ToggleButton,
     edit_crop: RefCell<Option<CropOverlay>>,
     edit_drag: Cell<Option<EditDrag>>,
-    edit_scale: Cell<f64>,
     compare_canvas: RefCell<Option<ImageCanvas>>,
     compare_rendered: RefCell<Option<image::RgbaImage>>,
     compare_scrolled: RefCell<Option<gtk::ScrolledWindow>>,
@@ -132,6 +176,13 @@ struct WindowState {
     transform_controls: gtk::Box,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
+    scale_button: gtk::ToggleButton,
+    scale_controls: gtk::Box,
+    scale_slider: gtk::Scale,
+    scale_value_label: gtk::Label,
+    scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
+    scale_source_zoom: Cell<f64>,
+    scale_preview_generation: Cell<u64>,
     minimap: MiniMap,
 }
 
@@ -185,6 +236,16 @@ impl ViewerWindow {
             "Flip Vertically",
             "win.flip-vertical",
         ));
+        transforms.append(&button(
+            "window-close-symbolic",
+            "Abort Crop",
+            "win.cancel-tool",
+        ));
+        transforms.append(&button(
+            "object-select-symbolic",
+            "Apply Crop",
+            "win.confirm-crop",
+        ));
         canvas_overlay.add_overlay(&transforms);
         let zoom_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         zoom_controls.add_css_class("linked");
@@ -223,7 +284,34 @@ impl ViewerWindow {
         zoom_label.set_menu_model(Some(&zoom_menu));
         zoom_controls.append(&zoom_label);
         zoom_controls.append(&button("zoom-in-symbolic", "Zoom In", "win.zoom-in"));
+        let scale_button = toggle_button("view-fullscreen-symbolic", "Scale image");
+        zoom_controls.prepend(&scale_button);
         canvas_overlay.add_overlay(&zoom_controls);
+        let scale_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        scale_controls.add_css_class("linked");
+        scale_controls.set_visible(false);
+        scale_controls.set_halign(gtk::Align::End);
+        scale_controls.set_valign(gtk::Align::End);
+        scale_controls.set_margin_end(26);
+        scale_controls.set_margin_bottom(26);
+        let scale_slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 2.0, 1.0);
+        scale_slider.set_width_request(260);
+        scale_slider.set_draw_value(false);
+        scale_slider.set_tooltip_text(Some("Scaled width in pixels"));
+        let scale_value_label = gtk::Label::new(Some("1 px"));
+        scale_controls.append(&button(
+            "window-close-symbolic",
+            "Cancel Scale",
+            "win.cancel-scale",
+        ));
+        scale_controls.append(&scale_value_label);
+        scale_controls.append(&scale_slider);
+        scale_controls.append(&button(
+            "object-select-symbolic",
+            "Apply Scale",
+            "win.confirm-scale",
+        ));
+        canvas_overlay.add_overlay(&scale_controls);
         let minimap = MiniMap::default();
         minimap.set_size_request(160, 120);
         minimap.set_halign(gtk::Align::Start);
@@ -285,7 +373,6 @@ impl ViewerWindow {
             edit_button: header_widgets.edit_button,
             edit_crop: RefCell::new(None),
             edit_drag: Cell::new(None),
-            edit_scale: Cell::new(1.0),
             compare_canvas: RefCell::new(None),
             compare_rendered: RefCell::new(None),
             compare_scrolled: RefCell::new(None),
@@ -309,11 +396,19 @@ impl ViewerWindow {
             transform_controls: transforms,
             zoom_controls,
             zoom_label,
+            scale_button,
+            scale_controls,
+            scale_slider,
+            scale_value_label,
+            scale_source: RefCell::new(None),
+            scale_source_zoom: Cell::new(1.0),
+            scale_preview_generation: Cell::new(0),
             minimap,
             export_cancellation: RefCell::new(None),
         }));
         this.install_actions();
         this.install_tool_controls();
+        this.install_scale_controls();
         this.install_gestures();
         this.install_minimap();
         this.connect_single_image_lens();
@@ -353,6 +448,7 @@ impl ViewerWindow {
         }
         self.0.animation_frames.borrow_mut().clear();
         self.0.animation_controls.set_visible(false);
+        self.0.scale_button.set_active(false);
         self.exit_compare();
         let cancellable = gio::Cancellable::new();
         self.0.cancellable.replace(Some(cancellable.clone()));
@@ -647,6 +743,26 @@ impl ViewerWindow {
                     .set_active(!this.0.edit_button.is_active())
             }
         });
+        self.add_action("confirm-crop", {
+            let this = self.clone();
+            move || this.confirm_crop()
+        });
+        self.add_action("scale-preview", {
+            let this = self.clone();
+            move || {
+                this.0
+                    .scale_button
+                    .set_active(!this.0.scale_button.is_active())
+            }
+        });
+        self.add_action("confirm-scale", {
+            let this = self.clone();
+            move || this.confirm_scale_preview()
+        });
+        self.add_action("cancel-scale", {
+            let this = self.clone();
+            move || this.0.scale_button.set_active(false)
+        });
         self.add_action("crop-content", {
             let this = self.clone();
             move || this.crop_to_content()
@@ -670,6 +786,14 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.0.edit_button.is_active() {
+                    this.0.edit_button.set_active(false);
+                    return;
+                }
+                if this.0.scale_button.is_active() {
+                    this.0.scale_button.set_active(false);
+                    return;
+                }
                 this.0.pencil_button.set_active(false);
                 this.0.pencil_points.borrow_mut().clear();
                 this.0.canvas.set_accessible_label("Image canvas");
@@ -762,6 +886,138 @@ impl ViewerWindow {
         });
     }
 
+    fn install_scale_controls(&self) {
+        self.0.scale_button.connect_toggled({
+            let this = self.clone();
+            move |button| this.set_scale_preview_active(button.is_active())
+        });
+        self.0.scale_slider.connect_value_changed({
+            let this = self.clone();
+            move |slider| {
+                let width = slider.value().round() as u32;
+                this.0.scale_value_label.set_label(&format!("{width} px"));
+                this.schedule_scale_preview(width);
+            }
+        });
+    }
+
+    fn set_scale_preview_active(&self, active: bool) {
+        if active {
+            let Some(image) = self.0.rendered.borrow().clone() else {
+                self.0.scale_button.set_active(false);
+                self.0
+                    .toasts
+                    .add_toast(adw::Toast::new("Open an editable image first"));
+                return;
+            };
+            self.0.edit_button.set_active(false);
+            let width = image.width().max(1);
+            self.0.scale_source.replace(Some(Arc::new(image)));
+            self.0.scale_source_zoom.set(self.0.canvas.zoom());
+            self.0
+                .scale_slider
+                .set_range(1.0, f64::from(width.saturating_mul(2)));
+            self.0.scale_slider.set_value(f64::from(width));
+            self.0.scale_value_label.set_label(&format!("{width} px"));
+            self.0.scale_controls.set_visible(true);
+            self.0.zoom_controls.set_visible(false);
+            return;
+        }
+        self.0
+            .scale_preview_generation
+            .set(self.0.scale_preview_generation.get().wrapping_add(1));
+        self.0.scale_controls.set_visible(false);
+        self.0
+            .zoom_controls
+            .set_visible(!self.0.edit_button.is_active());
+        self.set_scale_preview_zoom(self.0.scale_source_zoom.get());
+        if let Some(image) = self.0.scale_source.borrow_mut().take()
+            && let Ok(texture) = texture_from_rgba(&image)
+        {
+            self.0.canvas.set_texture(Some(&texture));
+            self.update_minimap();
+        }
+    }
+
+    fn schedule_scale_preview(&self, target_width: u32) {
+        let Some(source) = self.0.scale_source.borrow().clone() else {
+            return;
+        };
+        let generation = self.0.scale_preview_generation.get().wrapping_add(1);
+        self.0.scale_preview_generation.set(generation);
+        let preview_zoom =
+            scale_preview_zoom(source.width(), target_width, self.0.scale_source_zoom.get());
+        if target_width == source.width() {
+            if let Ok(texture) = texture_from_rgba(&source) {
+                self.0.canvas.set_texture(Some(&texture));
+                self.set_scale_preview_zoom(preview_zoom);
+            }
+            return;
+        }
+        let resampling = self.0.settings.scale_resampling();
+        let weak = Rc::downgrade(&self.0);
+        glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.scale_preview_generation.get() != generation {
+                return;
+            }
+            let source = source.clone();
+            let weak = Rc::downgrade(&state);
+            glib::spawn_future_local(async move {
+                let preview = gio::spawn_blocking(move || {
+                    render_scale_preview(source.as_ref(), target_width, resampling)
+                })
+                .await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if state.scale_preview_generation.get() != generation {
+                    return;
+                }
+                match preview {
+                    Ok(Ok(preview)) => match texture_from_rgba(&preview) {
+                        Ok(texture) => {
+                            state.canvas.set_texture(Some(&texture));
+                            ViewerWindow(state).set_scale_preview_zoom(preview_zoom);
+                        }
+                        Err(error) => state.toasts.add_toast(adw::Toast::new(&error)),
+                    },
+                    Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
+                    Err(_) => state
+                        .toasts
+                        .add_toast(adw::Toast::new("Scale preview worker failed")),
+                }
+            });
+        });
+    }
+
+    fn confirm_scale_preview(&self) {
+        let Some(source) = self.0.scale_source.borrow().clone() else {
+            return;
+        };
+        let width = self.0.scale_slider.value().round() as u32;
+        let (_, height) = scaled_dimensions(source.width(), source.height(), width);
+        let preview_zoom =
+            scale_preview_zoom(source.width(), width, self.0.scale_source_zoom.get());
+        self.0.scale_button.set_active(false);
+        self.set_zoom(preview_zoom);
+        self.apply(Operation::Scale {
+            width,
+            height,
+            resampling: self.0.settings.scale_resampling(),
+        });
+    }
+
+    fn set_scale_preview_zoom(&self, zoom: f64) {
+        self.0.canvas.set_zoom(zoom);
+        self.0
+            .zoom_label
+            .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
+        self.update_minimap();
+    }
+
     fn set_pencil_active(&self, active: bool) {
         if active && self.0.rendered.borrow().is_none() {
             self.0.pencil_button.set_active(false);
@@ -827,6 +1083,9 @@ impl ViewerWindow {
     }
 
     fn set_edit_active(&self, active: bool) {
+        if active {
+            self.0.scale_button.set_active(false);
+        }
         self.0.transform_controls.set_visible(active);
         self.0.zoom_controls.set_visible(!active);
         self.0.lens_button.set_active(false);
@@ -837,9 +1096,9 @@ impl ViewerWindow {
             canvas.clear_lens();
         }
         self.0.lens_button.set_sensitive(!active);
+        self.0.scale_button.set_sensitive(!active);
         if !active {
             self.0.canvas.set_preview_scale(1.0);
-            self.0.edit_scale.set(1.0);
             self.0.canvas.set_crop_overlay(None);
             self.0.edit_crop.replace(None);
             return;
@@ -868,6 +1127,22 @@ impl ViewerWindow {
         self.0.edit_crop.replace(Some(crop));
         self.0.canvas.set_crop_overlay(Some(crop));
         self.fit(false);
+    }
+
+    fn confirm_crop(&self) {
+        if !self.0.edit_button.is_active() {
+            return;
+        }
+        let Some(crop) = *self.0.edit_crop.borrow() else {
+            return;
+        };
+        self.apply(Operation::Crop {
+            x: crop.x,
+            y: crop.y,
+            width: crop.width,
+            height: crop.height,
+        });
+        self.0.edit_button.set_active(false);
     }
 
     fn render_document(&self) {
@@ -1548,6 +1823,9 @@ impl ViewerWindow {
                     3 => Resampling::SeamCarving,
                     _ => Resampling::Bicubic,
                 });
+            if this.0.scale_button.is_active() {
+                this.schedule_scale_preview(this.0.scale_slider.value().round() as u32);
+            }
             apply_dialog.close();
         });
         dialog.present(Some(&self.0.window));
@@ -1588,6 +1866,8 @@ impl ViewerWindow {
                     ("Flip Horizontally", "h"),
                     ("Flip Vertically", "v"),
                     ("Crop", "c"),
+                    ("Apply Crop", "Return"),
+                    ("Cancel Crop", "Escape"),
                     ("Pencil", "p"),
                     ("Exit Active Tool", "Escape"),
                 ],
@@ -2394,26 +2674,11 @@ impl ViewerWindow {
                 if !(left || right || top || bottom) {
                     return;
                 }
-                let scale = (left || right) && (top || bottom);
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.0.edit_scale.set(1.0);
                 this.0.edit_drag.set(Some(EditDrag {
                     crop,
                     start_screen_x: screen_x,
                     start_screen_y: screen_y,
-                    scale,
-                    anchor_x: if left {
-                        f64::from(rect.x() + rect.width())
-                    } else {
-                        f64::from(rect.x())
-                    },
-                    anchor_y: if top {
-                        f64::from(rect.y() + rect.height())
-                    } else {
-                        f64::from(rect.y())
-                    },
-                    start_width: f64::from(rect.width()),
-                    start_height: f64::from(rect.height()),
                     left,
                     right,
                     top,
@@ -2427,14 +2692,6 @@ impl ViewerWindow {
                 let Some(drag) = this.0.edit_drag.get() else {
                     return;
                 };
-                if drag.scale {
-                    let x = drag.start_screen_x + dx;
-                    let y = drag.start_screen_y + dy;
-                    let scale = corner_scale(drag, x, y);
-                    this.0.edit_scale.set(scale);
-                    this.0.canvas.set_preview_scale(scale as f32);
-                    return;
-                }
                 let Some((x, y)) = this
                     .0
                     .canvas
@@ -2442,25 +2699,15 @@ impl ViewerWindow {
                 else {
                     return;
                 };
-                let mut crop = drag.crop;
-                if drag.left {
-                    let right = crop.x + crop.width;
-                    crop.x = x.min(right.saturating_sub(1));
-                    crop.width = right - crop.x;
-                }
-                if drag.right {
-                    crop.width = x.saturating_sub(crop.x).clamp(1, crop.image_width - crop.x);
-                }
-                if drag.top {
-                    let bottom = crop.y + crop.height;
-                    crop.y = y.min(bottom.saturating_sub(1));
-                    crop.height = bottom - crop.y;
-                }
-                if drag.bottom {
-                    crop.height = y
-                        .saturating_sub(crop.y)
-                        .clamp(1, crop.image_height - crop.y);
-                }
+                let crop = resize_crop(
+                    drag.crop,
+                    x,
+                    y,
+                    drag.left,
+                    drag.right,
+                    drag.top,
+                    drag.bottom,
+                );
                 this.0.edit_crop.replace(Some(crop));
                 this.0.canvas.set_crop_overlay(Some(crop));
             }
@@ -2468,36 +2715,7 @@ impl ViewerWindow {
         edit_drag.connect_drag_end({
             let this = self.clone();
             move |_, _, _| {
-                let Some(drag) = this.0.edit_drag.take() else {
-                    return;
-                };
-                if drag.scale {
-                    this.0.canvas.set_preview_scale(1.0);
-                    let scale = this.0.edit_scale.replace(1.0);
-                    let width = (f64::from(drag.crop.image_width) * scale)
-                        .round()
-                        .clamp(1.0, f64::from(u32::MAX)) as u32;
-                    let height = (f64::from(drag.crop.image_height) * scale)
-                        .round()
-                        .clamp(1.0, f64::from(u32::MAX)) as u32;
-                    this.apply(Operation::Scale {
-                        width,
-                        height,
-                        resampling: this.0.settings.scale_resampling(),
-                    });
-                    this.0.edit_button.set_active(false);
-                    return;
-                }
-                let Some(crop) = *this.0.edit_crop.borrow() else {
-                    return;
-                };
-                this.apply(Operation::Crop {
-                    x: crop.x,
-                    y: crop.y,
-                    width: crop.width,
-                    height: crop.height,
-                });
-                this.0.edit_button.set_active(false);
+                this.0.edit_drag.take();
             }
         });
         self.0.canvas.add_controller(edit_drag);
@@ -2772,7 +2990,10 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     let next = button("go-next-symbolic", "Next Image", "win.next");
     let pencil_button = toggle_button("xsi-edit-symbolic", "Toggle Pencil");
     let lens_button = toggle_button("edit-find-symbolic", "Toggle 4× Lens");
-    let edit_button = toggle_button("edit-cut-symbolic", "Toggle Edit Mode");
+    let edit_button = toggle_button(
+        "edit-cut-symbolic",
+        "Crop image — Enter to apply, Escape to cancel",
+    );
     let color_button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     color_button.set_rgba(&u8_to_rgba([0, 0, 0, 255]));
     color_button.set_tooltip_text(Some("Pencil color"));
@@ -2951,31 +3172,51 @@ mod tests {
     }
 
     #[test]
-    fn corner_drag_preserves_aspect_ratio_scale() {
-        let drag = EditDrag {
-            crop: CropOverlay {
-                x: 0,
-                y: 0,
-                width: 200,
-                height: 100,
-                image_width: 200,
-                image_height: 100,
-            },
-            start_screen_x: 0.0,
-            start_screen_y: 0.0,
-            scale: true,
-            anchor_x: 200.0,
-            anchor_y: 100.0,
-            start_width: 200.0,
-            start_height: 100.0,
-            left: true,
-            right: false,
-            top: true,
-            bottom: false,
+    fn corner_drag_resizes_both_crop_boundaries() {
+        let crop = CropOverlay {
+            x: 10,
+            y: 20,
+            width: 50,
+            height: 60,
+            image_width: 100,
+            image_height: 100,
         };
 
-        assert_eq!(corner_scale(drag, -100.0, -20.0), 1.5);
-        assert_eq!(corner_scale(drag, 160.0, 80.0), 0.2);
+        let resized = resize_crop(crop, 20, 30, true, false, true, false);
+
+        assert_eq!((resized.x, resized.y), (20, 30));
+        assert_eq!((resized.width, resized.height), (40, 50));
+    }
+
+    #[test]
+    fn scale_preview_resizes_pixels_to_selected_width() {
+        let image = image::RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+
+        let preview = render_scale_preview(&image, 4, Resampling::Nearest).unwrap();
+
+        assert_eq!(preview.dimensions(), (4, 2));
+        assert_eq!(preview.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(preview.get_pixel(3, 0).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn scale_preview_zoom_keeps_the_viewport_width_fixed() {
+        let source_width = 800;
+        let source_zoom = 0.75;
+        let target_width = 1600;
+
+        let preview_zoom = scale_preview_zoom(source_width, target_width, source_zoom);
+
+        assert_eq!(
+            source_zoom * f64::from(source_width),
+            preview_zoom * f64::from(target_width)
+        );
     }
 
     #[test]

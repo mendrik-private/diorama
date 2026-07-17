@@ -59,6 +59,7 @@ fn install_accelerators(application: &adw::Application) {
         ("win.flip-horizontal", &["h"]),
         ("win.flip-vertical", &["v"]),
         ("win.crop", &["c"]),
+        ("win.confirm-crop", &["Return", "KP_Enter"]),
         ("win.compare", &["d"]),
         ("win.pencil", &["p"]),
         ("win.select-object", &["a"]),

@@ -25,8 +25,8 @@ impl Default for Settings {
 impl Settings {
     pub fn zoom_filter(&self) -> ZoomFilter {
         match self.string("zoom-filter").as_deref() {
-            Some("hard") => ZoomFilter::Hard,
-            _ => ZoomFilter::Soft,
+            Some("soft") => ZoomFilter::Soft,
+            _ => ZoomFilter::Hard,
         }
     }
 

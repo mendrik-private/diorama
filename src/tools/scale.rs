@@ -1,7 +1,52 @@
 use image::{Rgba, RgbaImage};
 
-use crate::document::CancellationToken;
+use crate::document::{CancellationToken, Resampling};
 use crate::error::{AppError, Result};
+
+pub fn resize(
+    image: &RgbaImage,
+    target_width: u32,
+    target_height: u32,
+    resampling: Resampling,
+    cancellation: &CancellationToken,
+) -> Result<RgbaImage> {
+    if target_width == 0 || target_height == 0 {
+        return Err(AppError::InvalidDimensions);
+    }
+    if resampling == Resampling::SeamCarving {
+        return seam_carve(image, target_width, target_height, cancellation);
+    }
+    cancellation.check()?;
+    let source = fast_image_resize::images::Image::from_vec_u8(
+        image.width(),
+        image.height(),
+        image.as_raw().clone(),
+        fast_image_resize::PixelType::U8x4,
+    )
+    .map_err(|_| AppError::InvalidDimensions)?;
+    let mut destination = fast_image_resize::images::Image::new(
+        target_width,
+        target_height,
+        fast_image_resize::PixelType::U8x4,
+    );
+    let algorithm = match resampling {
+        Resampling::Nearest => fast_image_resize::ResizeAlg::Nearest,
+        Resampling::Linear => {
+            fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear)
+        }
+        Resampling::Bicubic => {
+            fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::CatmullRom)
+        }
+        Resampling::SeamCarving => unreachable!(),
+    };
+    let options = fast_image_resize::ResizeOptions::new().resize_alg(algorithm);
+    fast_image_resize::Resizer::new()
+        .resize(&source, &mut destination, &options)
+        .map_err(|_| AppError::InvalidDimensions)?;
+    cancellation.check()?;
+    RgbaImage::from_raw(target_width, target_height, destination.into_vec())
+        .ok_or(AppError::InvalidDimensions)
+}
 
 pub fn seam_carve(
     image: &RgbaImage,
@@ -118,13 +163,53 @@ fn gradient(left: &Rgba<u8>, right: &Rgba<u8>) -> u32 {
 mod tests {
     use image::{Rgba, RgbaImage};
 
-    use super::seam_carve;
-    use crate::document::CancellationToken;
+    use super::{resize, seam_carve};
+    use crate::document::{CancellationToken, Resampling};
 
     #[test]
     fn shrinks_both_axes() {
         let image = RgbaImage::from_pixel(5, 4, Rgba([1, 2, 3, 255]));
         let output = seam_carve(&image, 3, 2, &CancellationToken::default()).unwrap();
         assert_eq!(output.dimensions(), (3, 2));
+    }
+
+    #[test]
+    fn nearest_resize_preserves_source_pixels() {
+        let image = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 255])
+            }
+        });
+
+        let output = resize(
+            &image,
+            4,
+            2,
+            Resampling::Nearest,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        assert_eq!(output.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(output.get_pixel(3, 1).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn resampling_method_changes_interpolated_pixels() {
+        let image = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255, 255, 255, 255])
+            }
+        });
+        let cancellation = CancellationToken::default();
+
+        let nearest = resize(&image, 4, 1, Resampling::Nearest, &cancellation).unwrap();
+        let linear = resize(&image, 4, 1, Resampling::Linear, &cancellation).unwrap();
+
+        assert_ne!(nearest.get_pixel(1, 0), linear.get_pixel(1, 0));
     }
 }
