@@ -24,8 +24,17 @@ pub fn export(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     cancellation.check()?;
-    atomic_save(path, |writer| match options {
-        ExportOptions::Png(options) => png::encode(writer, image, options),
-        ExportOptions::Jpeg(options) => jpeg::encode(writer, image, options),
+    atomic_save(path, |writer| {
+        match options {
+            ExportOptions::Png(options) => png::encode(writer, image, options)?,
+            ExportOptions::Jpeg(options) => jpeg::encode(writer, image, options)?,
+        }
+        cancellation.check()
     })
+}
+
+pub(crate) fn normalized_exif(exif: &[u8]) -> Vec<u8> {
+    let mut normalized = exif.strip_prefix(b"Exif\0\0").unwrap_or(exif).to_vec();
+    let _ = image::metadata::Orientation::remove_from_exif_chunk(&mut normalized);
+    normalized
 }

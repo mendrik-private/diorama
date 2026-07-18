@@ -16,9 +16,33 @@ pub enum ZoomFilter {
 pub enum Background {
     #[default]
     Checkerboard,
+    Auto,
     White,
     Gray,
     Black,
+}
+
+fn opposite_grayscale_luminance(image: &image::RgbaImage) -> f32 {
+    let (weighted_luminance, alpha_sum) = image.pixels().fold((0.0_f64, 0.0_f64), |sum, pixel| {
+        let alpha = f64::from(pixel[3]) / 255.0;
+        let luminance = (0.2126 * f64::from(pixel[0])
+            + 0.7152 * f64::from(pixel[1])
+            + 0.0722 * f64::from(pixel[2]))
+            / 255.0;
+        (sum.0 + luminance * alpha, sum.1 + alpha)
+    });
+    if alpha_sum <= f64::EPSILON {
+        0.5
+    } else {
+        let luminance = (1.0 - weighted_luminance / alpha_sum).clamp(0.0, 1.0) as f32;
+        if luminance <= f32::EPSILON {
+            0.0
+        } else if luminance >= 1.0 - f32::EPSILON {
+            1.0
+        } else {
+            luminance
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +62,7 @@ pub(super) struct Lens {
     normalized_y: f32,
     diameter: f32,
     magnification: f32,
+    show_cross: bool,
 }
 
 mod imp {
@@ -49,6 +74,7 @@ mod imp {
         pub zoom: Cell<f64>,
         pub filter: Cell<ZoomFilter>,
         pub background: Cell<Background>,
+        pub auto_background_luminance: Cell<f32>,
         pub preview_scale: Cell<f32>,
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
@@ -71,6 +97,7 @@ mod imp {
             self.parent_constructed();
             self.zoom.set(1.0);
             self.preview_scale.set(1.0);
+            self.auto_background_luminance.set(0.5);
             let object = self.obj();
             object.set_focusable(true);
             object.set_overflow(gtk::Overflow::Hidden);
@@ -100,7 +127,12 @@ mod imp {
                 object.width().max(1) as f32,
                 object.height().max(1) as f32,
             );
-            draw_background(snapshot, bounds, self.background.get());
+            draw_background(
+                snapshot,
+                bounds,
+                self.background.get(),
+                self.auto_background_luminance.get(),
+            );
             if let Some(texture) = self.texture.borrow().as_ref() {
                 let image_bounds =
                     scale_bounds(contain_bounds(bounds, texture), self.preview_scale.get());
@@ -149,15 +181,17 @@ mod imp {
         snapshot.push_blend(gtk::gsk::BlendMode::Difference);
         snapshot.append_scaled_texture(&lens.texture, gtk::gsk::ScalingFilter::Nearest, &scaled);
         snapshot.pop();
-        let cross = gdk::RGBA::WHITE;
-        snapshot.append_color(
-            &cross,
-            &gtk::graphene::Rect::new(center_x - 5.0, center_y - 1.0, 10.0, 2.0),
-        );
-        snapshot.append_color(
-            &cross,
-            &gtk::graphene::Rect::new(center_x - 1.0, center_y - 5.0, 2.0, 10.0),
-        );
+        if lens.show_cross {
+            let cross = gdk::RGBA::WHITE;
+            snapshot.append_color(
+                &cross,
+                &gtk::graphene::Rect::new(center_x - 5.0, center_y - 1.0, 10.0, 2.0),
+            );
+            snapshot.append_color(
+                &cross,
+                &gtk::graphene::Rect::new(center_x - 1.0, center_y - 5.0, 2.0, 10.0),
+            );
+        }
         snapshot.pop();
         snapshot.pop();
         let outline = gdk::RGBA::new(1.0, 1.0, 1.0, 0.9);
@@ -284,8 +318,20 @@ mod imp {
         }
     }
 
-    fn draw_background(snapshot: &gtk::Snapshot, bounds: gtk::graphene::Rect, mode: Background) {
+    fn draw_background(
+        snapshot: &gtk::Snapshot,
+        bounds: gtk::graphene::Rect,
+        mode: Background,
+        auto_luminance: f32,
+    ) {
         match mode {
+            Background::Auto => {
+                let grayscale = auto_luminance.clamp(0.0, 1.0);
+                snapshot.append_color(
+                    &gdk::RGBA::new(grayscale, grayscale, grayscale, 1.0),
+                    &bounds,
+                );
+            }
             Background::White => snapshot.append_color(&gdk::RGBA::WHITE, &bounds),
             Background::Gray => {
                 snapshot.append_color(&gdk::RGBA::new(0.32, 0.32, 0.32, 1.0), &bounds);
@@ -375,6 +421,15 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
+    pub fn set_auto_background_from_image(&self, image: &image::RgbaImage) {
+        self.imp()
+            .auto_background_luminance
+            .set(opposite_grayscale_luminance(image));
+        if self.background() == Background::Auto {
+            self.queue_draw();
+        }
+    }
+
     pub fn set_lens(
         &self,
         texture: &gdk::Texture,
@@ -382,6 +437,7 @@ impl ImageCanvas {
         normalized_y: f32,
         diameter: f32,
         magnification: f32,
+        show_cross: bool,
     ) {
         self.imp().lens.replace(Some(Lens {
             texture: texture.clone(),
@@ -389,6 +445,7 @@ impl ImageCanvas {
             normalized_y,
             diameter,
             magnification,
+            show_cross,
         }));
         self.queue_draw();
     }
@@ -396,6 +453,13 @@ impl ImageCanvas {
     pub fn clear_lens(&self) {
         self.imp().lens.replace(None);
         self.queue_draw();
+    }
+
+    pub fn update_lens_texture(&self, texture: &gdk::Texture) {
+        if let Some(lens) = self.imp().lens.borrow_mut().as_mut() {
+            lens.texture = texture.clone();
+            self.queue_draw();
+        }
     }
 
     pub fn set_marker(&self, marker: Option<(f32, f32)>) {
@@ -637,6 +701,17 @@ mod tests {
     #[test]
     fn hard_zoom_is_the_default_filter() {
         assert_eq!(ZoomFilter::default(), ZoomFilter::Hard);
+    }
+
+    #[test]
+    fn auto_background_uses_opposite_grayscale_luminance() {
+        let black = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 255]));
+        let white = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+        let transparent = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+
+        assert_eq!(opposite_grayscale_luminance(&black), 1.0);
+        assert_eq!(opposite_grayscale_luminance(&white), 0.0);
+        assert_eq!(opposite_grayscale_luminance(&transparent), 0.5);
     }
 
     #[test]

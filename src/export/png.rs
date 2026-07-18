@@ -8,6 +8,8 @@ use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use crate::document::RenderedImage;
 use crate::error::Result;
 
+use super::normalized_exif;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PngOptions {
     pub compression: u8,
@@ -56,7 +58,7 @@ pub(crate) fn encode(
     }
     if options.preserve_metadata {
         if let Some(exif) = &image.metadata.exif {
-            write_chunk(writer, *b"eXIf", strip_exif_prefix(exif))?;
+            write_chunk(writer, *b"eXIf", &normalized_exif(exif))?;
         }
         if let Some(xmp) = &image.metadata.xmp {
             let mut payload = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
@@ -66,10 +68,6 @@ pub(crate) fn encode(
     }
     writer.write_all(&encoded[33..])?;
     Ok(())
-}
-
-fn strip_exif_prefix(exif: &[u8]) -> &[u8] {
-    exif.strip_prefix(b"Exif\0\0").unwrap_or(exif)
 }
 
 fn write_chunk(writer: &mut dyn Write, kind: [u8; 4], payload: &[u8]) -> Result<()> {
@@ -88,6 +86,10 @@ fn write_chunk(writer: &mut dyn Write, kind: [u8; 4], payload: &[u8]) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::ImageDecoder;
+    use image::codecs::png::PngDecoder;
     use image::{Rgba, RgbaImage};
 
     use super::{PngOptions, encode};
@@ -122,5 +124,31 @@ mod tests {
         assert!(!removed.windows(4).any(|window| window == b"eXIf"));
         assert!(!removed.windows(4).any(|window| window == b"iTXt"));
         assert!(!removed.windows(4).any(|window| window == b"iCCP"));
+    }
+
+    #[test]
+    fn exported_exif_cannot_rotate_normalized_pixels_again() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&[
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ]);
+        let image = RenderedImage {
+            pixels: RgbaImage::from_pixel(1, 2, Rgba([1, 2, 3, 255])),
+            metadata: Metadata {
+                exif: Some(exif),
+                ..Metadata::default()
+            },
+        };
+        let mut encoded = Vec::new();
+        encode(&mut encoded, &image, &PngOptions::default()).unwrap();
+
+        let mut decoder = PngDecoder::new(Cursor::new(encoded)).unwrap();
+        let exported_exif = decoder.exif_metadata().unwrap().unwrap();
+
+        assert_eq!(
+            image::metadata::Orientation::from_exif_chunk(&exported_exif),
+            Some(image::metadata::Orientation::NoTransforms)
+        );
     }
 }

@@ -58,7 +58,7 @@ impl CancellationToken {
 pub struct Document {
     source: ImageSource,
     history: History<Operation>,
-    saved_operations: usize,
+    saved_operations: Arc<[Operation]>,
     cache: RenderCache,
 }
 
@@ -72,7 +72,7 @@ impl Clone for Document {
         Self {
             source: self.source.clone(),
             history: self.history.clone(),
-            saved_operations: self.saved_operations,
+            saved_operations: self.saved_operations.clone(),
             // Render candidates can diverge from the live operation stack. Sharing a cache
             // keyed only by operation prefix would allow a cancelled candidate to poison it.
             cache: Arc::new(Mutex::new(cache)),
@@ -85,7 +85,7 @@ impl Document {
         Self {
             source,
             history: History::default(),
-            saved_operations: 0,
+            saved_operations: Vec::new().into(),
             cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -96,6 +96,10 @@ impl Document {
 
     pub fn set_metadata(&mut self, metadata: Metadata) {
         self.source.metadata = metadata;
+    }
+
+    pub(crate) fn set_path(&mut self, path: Option<PathBuf>) {
+        self.source.path = path;
     }
 
     pub fn operations(&self) -> &[Operation] {
@@ -145,11 +149,23 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.operations().len() != self.saved_operations
+        self.operations() != self.saved_operations.as_ref()
     }
 
     pub fn mark_saved(&mut self) {
-        self.saved_operations = self.operations().len();
+        self.saved_operations = self.operations().into();
+    }
+
+    pub(crate) fn mark_saved_at(&mut self, operations: Arc<[Operation]>) {
+        self.saved_operations = operations;
+    }
+
+    pub(crate) fn adopt_render_cache(&mut self, rendered: &Self) -> bool {
+        if self.operations() != rendered.operations() {
+            return false;
+        }
+        self.cache = rendered.cache.clone();
+        true
     }
 
     pub fn render(&self, cancellation: &CancellationToken) -> Result<RenderedImage> {
@@ -323,6 +339,46 @@ mod tests {
     }
 
     #[test]
+    fn dirty_state_compares_history_content_instead_of_length() {
+        let mut document = document();
+        document.apply(Operation::Rotate(Rotation::Clockwise90));
+        document.mark_saved();
+        assert!(!document.is_dirty());
+
+        assert!(document.undo());
+        document.apply(Operation::FlipHorizontal);
+
+        assert_eq!(document.operations().len(), 1);
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn returning_to_the_saved_history_clears_dirty_state() {
+        let mut document = document();
+        document.apply(Operation::Rotate(Rotation::Clockwise90));
+        document.mark_saved();
+
+        assert!(document.undo());
+        assert!(document.is_dirty());
+        assert!(document.redo());
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn marking_an_older_export_state_keeps_newer_edits_dirty() {
+        let mut document = document();
+        document.apply(Operation::Rotate(Rotation::Clockwise90));
+        let exported_operations = document.operations().into();
+        document.apply(Operation::FlipHorizontal);
+
+        document.mark_saved_at(exported_operations);
+
+        assert!(document.is_dirty());
+        assert!(document.undo());
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
     fn cancelled_render_keeps_document_unchanged() {
         let mut document = document();
         document.apply(Operation::FlipHorizontal);
@@ -346,5 +402,19 @@ mod tests {
             .render(&CancellationToken::default())
             .expect("live document should not use candidate cache");
         assert_eq!(rendered.pixels.dimensions(), (1, 2));
+    }
+
+    #[test]
+    fn rendered_cache_is_only_adopted_for_the_same_history() {
+        let mut document = document();
+        document.apply(Operation::FlipHorizontal);
+        let rendered_candidate = document.clone();
+        rendered_candidate
+            .render(&CancellationToken::default())
+            .expect("candidate should render");
+        assert!(document.adopt_render_cache(&rendered_candidate));
+
+        document.apply(Operation::Rotate(Rotation::Clockwise90));
+        assert!(!document.adopt_render_cache(&rendered_candidate));
     }
 }

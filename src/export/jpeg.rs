@@ -6,6 +6,8 @@ use image::{Rgb, RgbImage};
 use crate::document::RenderedImage;
 use crate::error::Result;
 
+use super::normalized_exif;
+
 #[derive(Debug, Clone, Copy)]
 pub struct JpegOptions {
     pub quality: u8,
@@ -46,12 +48,8 @@ pub(crate) fn encode(
     writer.write_all(&encoded[..2])?;
     if options.preserve_metadata {
         if let Some(exif) = &image.metadata.exif {
-            let mut payload = if exif.starts_with(b"Exif\0\0") {
-                Vec::new()
-            } else {
-                b"Exif\0\0".to_vec()
-            };
-            payload.extend(exif);
+            let mut payload = b"Exif\0\0".to_vec();
+            payload.extend(normalized_exif(exif));
             write_segment(writer, 0xE1, &payload)?;
         }
         if let Some(xmp) = &image.metadata.xmp {
@@ -89,6 +87,10 @@ fn write_segment(writer: &mut dyn Write, marker: u8, payload: &[u8]) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::ImageDecoder;
+    use image::codecs::jpeg::JpegDecoder;
     use image::{Rgba, RgbaImage};
 
     use super::{JpegOptions, encode};
@@ -109,5 +111,30 @@ mod tests {
         let decoded = image::load_from_memory(&encoded).unwrap().into_rgb8();
         let pixel = decoded.get_pixel(0, 0).0;
         assert!(pixel.iter().all(|channel| *channel > 240));
+    }
+
+    #[test]
+    fn exported_exif_cannot_rotate_normalized_pixels_again() {
+        let exif = vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let image = RenderedImage {
+            pixels: RgbaImage::from_pixel(1, 2, Rgba([1, 2, 3, 255])),
+            metadata: Metadata {
+                exif: Some(exif),
+                ..Metadata::default()
+            },
+        };
+        let mut encoded = Vec::new();
+        encode(&mut encoded, &image, &JpegOptions::default()).unwrap();
+
+        let mut decoder = JpegDecoder::new(Cursor::new(encoded)).unwrap();
+        let exported_exif = decoder.exif_metadata().unwrap().unwrap();
+
+        assert_eq!(
+            image::metadata::Orientation::from_exif_chunk(&exported_exif),
+            Some(image::metadata::Orientation::NoTransforms)
+        );
     }
 }

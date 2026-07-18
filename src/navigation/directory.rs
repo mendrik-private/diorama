@@ -177,6 +177,46 @@ pub fn is_supported(name: &str) -> bool {
     )
 }
 
+pub fn find_matching_file(reference: &gio::File, target: &gio::File) -> Result<Option<gio::File>> {
+    let Some(target_name) = target.basename() else {
+        return Ok(None);
+    };
+    let target_key = comparable_name(&target_name.to_string_lossy());
+    if target_key.is_empty() {
+        return Ok(None);
+    }
+    let parent = reference
+        .parent()
+        .ok_or_else(|| AppError::FileMissing(reference.uri().into()))?;
+    let enumerator = parent
+        .enumerate_children(
+            ATTRIBUTES,
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    while let Some(info) = enumerator
+        .next_file(gio::Cancellable::NONE)
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?
+    {
+        if info.file_type() == gio::FileType::Regular
+            && is_supported(&info.display_name())
+            && comparable_name(&info.display_name()) == target_key
+        {
+            return Ok(Some(parent.child(info.name())));
+        }
+    }
+    Ok(None)
+}
+
+fn comparable_name(name: &str) -> String {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    stem.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn nautilus_sort(info: &gio::FileInfo) -> Option<(SortOrder, bool)> {
     let column = info
         .attribute_string("metadata::nautilus-list-view-sort-column")
@@ -267,7 +307,9 @@ fn extension(name: &str) -> String {
 mod tests {
     use std::cmp::Ordering;
 
-    use super::{is_supported, natural_compare};
+    use gio::prelude::*;
+
+    use super::{comparable_name, find_matching_file, is_supported, natural_compare};
 
     #[test]
     fn compares_numbers_naturally() {
@@ -279,5 +321,31 @@ mod tests {
         assert!(is_supported("photo.HEIC"));
         assert!(is_supported("vector.svgz"));
         assert!(!is_supported("video.mp4"));
+    }
+
+    #[test]
+    fn comparable_names_ignore_case_separators_and_extensions() {
+        assert_eq!(
+            comparable_name("Frame-001.PNG"),
+            comparable_name("frame_001.webp")
+        );
+    }
+
+    #[test]
+    fn finds_a_matching_image_in_the_comparison_folder() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let reference = directory.path().join("reference.png");
+        let counterpart = directory.path().join("frame_001.webp");
+        let target = directory.path().join("Frame-001.PNG");
+        std::fs::write(&reference, []).expect("reference file");
+        std::fs::write(&counterpart, []).expect("comparison file");
+
+        let found = find_matching_file(
+            &gio::File::for_path(reference),
+            &gio::File::for_path(target),
+        )
+        .expect("directory can be searched");
+
+        assert_eq!(found.and_then(|file| file.path()), Some(counterpart));
     }
 }

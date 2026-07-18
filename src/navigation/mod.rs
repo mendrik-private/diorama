@@ -1,3 +1,3 @@
 mod directory;
 
-pub use directory::{DirectorySequence, SortOrder, is_supported};
+pub use directory::{DirectorySequence, SortOrder, find_matching_file, is_supported};

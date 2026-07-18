@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupExt};
@@ -19,7 +19,7 @@ use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::image::{
     AnimationFrame, DecodeLimits, decode_animation, decode_headless, decode_memory, load_preview,
 };
-use crate::navigation::DirectorySequence;
+use crate::navigation::{DirectorySequence, find_matching_file};
 use crate::settings::Settings;
 
 #[derive(Clone)]
@@ -35,6 +35,14 @@ struct HeaderWidgets {
     edit_button: gtk::ToggleButton,
 }
 
+#[derive(Clone)]
+struct ExportSnapshot {
+    document: Document,
+    operations: Arc<[Operation]>,
+    source_file: Option<gio::File>,
+    load_generation: u64,
+}
+
 #[derive(Clone, Copy)]
 struct EditDrag {
     crop: CropOverlay,
@@ -44,6 +52,12 @@ struct EditDrag {
     right: bool,
     top: bool,
     bottom: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompareLensSource {
+    Primary,
+    Comparison,
 }
 
 fn edit_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bool, bool) {
@@ -66,6 +80,27 @@ fn edit_resize_cursor(rect: gtk::graphene::Rect, x: f32, y: f32) -> &'static str
         (_, _, true, _) | (_, _, _, true) => "ns-resize",
         _ => "default",
     }
+}
+
+fn pencil_can_activate(edit_active: bool, has_image: bool) -> bool {
+    !edit_active && has_image
+}
+
+fn files_equal(left: &Option<gio::File>, right: &Option<gio::File>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.equal(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn export_context_matches(
+    current_load_generation: u64,
+    exported_load_generation: u64,
+    current_file: &Option<gio::File>,
+    exported_file: &Option<gio::File>,
+) -> bool {
+    current_load_generation == exported_load_generation && files_equal(current_file, exported_file)
 }
 
 fn resize_crop(
@@ -108,6 +143,47 @@ fn scaled_dimensions(width: u32, height: u32, target_width: u32) -> (u32, u32) {
     (target_width, target_height)
 }
 
+fn folder_path(file: &gio::File) -> String {
+    let Some(folder) = file.parent() else {
+        return file.uri().to_string();
+    };
+    folder.path().map_or_else(
+        || folder.uri().to_string(),
+        |path| path.display().to_string(),
+    )
+}
+
+fn compare_metadata(file: &gio::File, width: u32, height: u32) -> String {
+    format!("{} · {width} × {height}", folder_path(file))
+}
+
+fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32) -> gtk::Label {
+    let details = compare_metadata(file, width, height);
+    gtk::Label::builder()
+        .label(&details)
+        .tooltip_text(&details)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .selectable(true)
+        .xalign(xalign)
+        .hexpand(true)
+        .margin_start(8)
+        .margin_end(8)
+        .build()
+}
+
+fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
+    (f64::from(size.0.max(1)) / f64::from(dimensions.0.max(1)))
+        .min(f64::from(size.1.max(1)) / f64::from(dimensions.1.max(1)))
+}
+
+fn usable_panel_size(size: (i32, i32)) -> bool {
+    size.0 > 1 && size.1 > 1
+}
+
+fn comparison_zoom(primary_zoom: f64, fit_zooms: (f64, f64)) -> f64 {
+    primary_zoom * fit_zooms.1 / fit_zooms.0.max(0.01)
+}
+
 fn scale_preview_zoom(source_width: u32, target_width: u32, source_zoom: f64) -> f64 {
     source_zoom * f64::from(source_width.max(1)) / f64::from(target_width.max(1))
 }
@@ -131,6 +207,7 @@ struct WindowState {
     window: adw::ApplicationWindow,
     canvas: ImageCanvas,
     scrolled: gtk::ScrolledWindow,
+    canvas_overlay: gtk::Overlay,
     title: adw::WindowTitle,
     toasts: adw::ToastOverlay,
     settings: Settings,
@@ -155,9 +232,16 @@ struct WindowState {
     edit_crop: RefCell<Option<CropOverlay>>,
     edit_drag: Cell<Option<EditDrag>>,
     compare_canvas: RefCell<Option<ImageCanvas>>,
+    compare_fit_zooms: Cell<Option<(f64, f64)>>,
     compare_rendered: RefCell<Option<image::RgbaImage>>,
+    compare_file: RefCell<Option<gio::File>>,
+    pending_comparison: RefCell<Option<gio::File>>,
+    navigation_generation: Cell<u64>,
+    compare_lens_source: Cell<Option<CompareLensSource>>,
     compare_scrolled: RefCell<Option<gtk::ScrolledWindow>>,
     compare_paned: RefCell<Option<gtk::Paned>>,
+    compare_controllers: RefCell<Vec<(ImageCanvas, gtk::EventController)>>,
+    compare_adjustment_handlers: RefCell<Vec<(gtk::Adjustment, glib::SignalHandlerId)>>,
     compare_locked: Cell<bool>,
     syncing_compare: Cell<bool>,
     lens_diameter: Cell<f32>,
@@ -173,6 +257,8 @@ struct WindowState {
     animation_controls: gtk::Box,
     animation_play_button: gtk::Button,
     export_cancellation: RefCell<Option<CancellationToken>>,
+    export_generation: Cell<u64>,
+    export_lock: Arc<Mutex<()>>,
     transform_controls: gtk::Box,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
@@ -182,6 +268,7 @@ struct WindowState {
     scale_value_label: gtk::Label,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_source_zoom: Cell<f64>,
+    scale_resampling: Cell<Resampling>,
     scale_preview_generation: Cell<u64>,
     minimap: MiniMap,
 }
@@ -346,10 +433,12 @@ impl ViewerWindow {
 
         let lens_diameter = settings.compare_lens_size();
         let lens_magnification = settings.compare_lens_magnification();
+        let scale_resampling = settings.scale_resampling();
         let this = Self(Rc::new(WindowState {
             window,
             canvas,
             scrolled,
+            canvas_overlay,
             title,
             toasts,
             settings,
@@ -374,9 +463,16 @@ impl ViewerWindow {
             edit_crop: RefCell::new(None),
             edit_drag: Cell::new(None),
             compare_canvas: RefCell::new(None),
+            compare_fit_zooms: Cell::new(None),
             compare_rendered: RefCell::new(None),
+            compare_file: RefCell::new(None),
+            pending_comparison: RefCell::new(None),
+            navigation_generation: Cell::new(0),
+            compare_lens_source: Cell::new(None),
             compare_scrolled: RefCell::new(None),
             compare_paned: RefCell::new(None),
+            compare_controllers: RefCell::new(Vec::new()),
+            compare_adjustment_handlers: RefCell::new(Vec::new()),
             compare_locked: Cell::new(true),
             syncing_compare: Cell::new(false),
             lens_diameter: Cell::new(lens_diameter),
@@ -402,9 +498,12 @@ impl ViewerWindow {
             scale_value_label,
             scale_source: RefCell::new(None),
             scale_source_zoom: Cell::new(1.0),
+            scale_resampling: Cell::new(scale_resampling),
             scale_preview_generation: Cell::new(0),
             minimap,
             export_cancellation: RefCell::new(None),
+            export_generation: Cell::new(0),
+            export_lock: Arc::new(Mutex::new(())),
         }));
         this.install_actions();
         this.install_tool_controls();
@@ -424,6 +523,9 @@ impl ViewerWindow {
     }
 
     fn load(&self, file: gio::File) {
+        self.0
+            .navigation_generation
+            .set(self.0.navigation_generation.get().wrapping_add(1));
         if self
             .0
             .document
@@ -446,6 +548,12 @@ impl ViewerWindow {
         if let Some(previous) = self.0.animation_cancellable.borrow_mut().take() {
             previous.cancel();
         }
+        if let Some(previous) = self.0.render_cancellation.borrow_mut().take() {
+            previous.cancel();
+        }
+        self.0
+            .render_generation
+            .set(self.0.render_generation.get().wrapping_add(1));
         self.0.animation_frames.borrow_mut().clear();
         self.0.animation_controls.set_visible(false);
         self.0.scale_button.set_active(false);
@@ -538,6 +646,9 @@ impl ViewerWindow {
                             ));
                         }
                         Err(_) => tracing::warn!("Editable decode worker panicked"),
+                    }
+                    if let Some(compare_file) = state.pending_comparison.borrow_mut().take() {
+                        ViewerWindow(state.clone()).load_comparison(compare_file);
                     }
                     let fallback = state.settings.folder_sort();
                     let sequence_file = file.clone();
@@ -797,9 +908,6 @@ impl ViewerWindow {
                 this.0.pencil_button.set_active(false);
                 this.0.pencil_points.borrow_mut().clear();
                 this.0.canvas.set_accessible_label("Image canvas");
-                if let Some(cancellation) = this.0.render_cancellation.borrow_mut().take() {
-                    cancellation.cancel();
-                }
                 this.0
                     .toasts
                     .add_toast(adw::Toast::new("Active tool cancelled"));
@@ -857,14 +965,17 @@ impl ViewerWindow {
     }
 
     fn apply(&self, operation: Operation) {
-        let Some(mut document) = self.0.document.borrow().clone() else {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
-            return;
-        };
-        document.apply(operation);
-        self.render_candidate(document, true);
+        {
+            let mut document = self.0.document.borrow_mut();
+            let Some(document) = document.as_mut() else {
+                self.0
+                    .toasts
+                    .add_toast(adw::Toast::new("Open an editable image first"));
+                return;
+            };
+            document.apply(operation);
+        }
+        self.render_document();
     }
 
     fn install_tool_controls(&self) {
@@ -954,7 +1065,7 @@ impl ViewerWindow {
             }
             return;
         }
-        let resampling = self.0.settings.scale_resampling();
+        let resampling = self.0.scale_resampling.get();
         let weak = Rc::downgrade(&self.0);
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
             let Some(state) = weak.upgrade() else {
@@ -1006,7 +1117,7 @@ impl ViewerWindow {
         self.apply(Operation::Scale {
             width,
             height,
-            resampling: self.0.settings.scale_resampling(),
+            resampling: self.0.scale_resampling.get(),
         });
     }
 
@@ -1019,11 +1130,18 @@ impl ViewerWindow {
     }
 
     fn set_pencil_active(&self, active: bool) {
-        if active && self.0.rendered.borrow().is_none() {
+        if active
+            && !pencil_can_activate(
+                self.0.edit_button.is_active(),
+                self.0.rendered.borrow().is_some(),
+            )
+        {
             self.0.pencil_button.set_active(false);
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+            if self.0.rendered.borrow().is_none() {
+                self.0
+                    .toasts
+                    .add_toast(adw::Toast::new("Open an editable image first"));
+            }
             return;
         }
         self.0.pencil_active.set(active);
@@ -1065,6 +1183,7 @@ impl ViewerWindow {
             && let Ok(texture) = texture_from_rgba(&preview)
         {
             canvas.set_texture(Some(&texture));
+            canvas.update_lens_texture(&texture);
             if canvas == &self.0.canvas {
                 self.update_minimap();
             }
@@ -1085,6 +1204,7 @@ impl ViewerWindow {
     fn set_edit_active(&self, active: bool) {
         if active {
             self.0.scale_button.set_active(false);
+            self.0.pencil_button.set_active(false);
         }
         self.0.transform_controls.set_visible(active);
         self.0.zoom_controls.set_visible(!active);
@@ -1097,6 +1217,7 @@ impl ViewerWindow {
         }
         self.0.lens_button.set_sensitive(!active);
         self.0.scale_button.set_sensitive(!active);
+        self.0.pencil_button.set_sensitive(!active);
         if !active {
             self.0.canvas.set_preview_scale(1.0);
             self.0.canvas.set_crop_overlay(None);
@@ -1149,10 +1270,10 @@ impl ViewerWindow {
         let Some(document) = self.0.document.borrow().clone() else {
             return;
         };
-        self.render_candidate(document, false);
+        self.render_candidate(document);
     }
 
-    fn render_candidate(&self, document: Document, commit_on_success: bool) {
+    fn render_candidate(&self, document: Document) {
         if let Some(previous) = self.0.render_cancellation.borrow_mut().take() {
             previous.cancel();
         }
@@ -1162,9 +1283,7 @@ impl ViewerWindow {
             .replace(Some(cancellation.clone()));
         let generation = self.0.render_generation.get().wrapping_add(1);
         self.0.render_generation.set(generation);
-        if !commit_on_success {
-            self.update_title();
-        }
+        self.update_title();
 
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
@@ -1181,13 +1300,20 @@ impl ViewerWindow {
             }
             match result {
                 Ok((document, Ok(rendered))) => {
+                    let matches_live_document = state
+                        .document
+                        .borrow_mut()
+                        .as_mut()
+                        .is_some_and(|live| live.adopt_render_cache(&document));
+                    if !matches_live_document {
+                        return;
+                    }
                     let dimensions = rendered.pixels.dimensions();
                     match texture_from_rgba(&rendered.pixels) {
                         Ok(texture) => {
-                            state.document.replace(Some(document));
-                            if commit_on_success {
-                                ViewerWindow(state.clone()).update_title();
-                            }
+                            state
+                                .canvas
+                                .set_auto_background_from_image(&rendered.pixels);
                             state.canvas.set_texture(Some(&texture));
                             state.rendered.replace(Some(rendered.pixels));
                             ViewerWindow(state.clone()).update_minimap();
@@ -1238,6 +1364,12 @@ impl ViewerWindow {
             return;
         };
         let current = self.0.current_file.borrow().clone();
+        let snapshot = ExportSnapshot {
+            operations: document.operations().into(),
+            document,
+            source_file: current.clone(),
+            load_generation: self.0.load_generation.get(),
+        };
         let direct_path = (!force_dialog)
             .then(|| current.as_ref().and_then(gio::File::path))
             .flatten()
@@ -1250,7 +1382,7 @@ impl ViewerWindow {
                 ));
                 return;
             }
-            self.export_document(document, path);
+            self.export_document(snapshot, path);
             return;
         }
 
@@ -1264,7 +1396,7 @@ impl ViewerWindow {
         glib::spawn_future_local(async move {
             if let Ok(file) = dialog.save_future(Some(&parent)).await {
                 if let Some(path) = file.path() {
-                    this.show_export_options(document, path);
+                    this.show_export_options(snapshot, path);
                 } else {
                     this.0.toasts.add_toast(adw::Toast::new(
                         "This location does not support atomic export",
@@ -1274,17 +1406,17 @@ impl ViewerWindow {
         });
     }
 
-    fn export_document(&self, document: Document, path: PathBuf) {
+    fn export_document(&self, snapshot: ExportSnapshot, path: PathBuf) {
         let Some(options) = export_options(&path, &self.0.settings) else {
             self.0.toasts.add_toast(adw::Toast::new(
                 "Choose a file name ending in .png, .jpg, or .jpeg",
             ));
             return;
         };
-        self.export_document_with_options(document, path, options);
+        self.export_document_with_options(snapshot, path, options, false);
     }
 
-    fn show_export_options(&self, document: Document, path: PathBuf) {
+    fn show_export_options(&self, snapshot: ExportSnapshot, path: PathBuf) {
         let Some(defaults) = export_options(&path, &self.0.settings) else {
             self.0.toasts.add_toast(adw::Toast::new(
                 "Choose a file name ending in .png, .jpg, or .jpeg",
@@ -1395,7 +1527,7 @@ impl ViewerWindow {
                 }
             };
             this.0.settings.set_preserve_metadata(preserve_metadata);
-            this.export_document_with_options(document.clone(), path.clone(), options);
+            this.export_document_with_options(snapshot.clone(), path.clone(), options, true);
             export_dialog.close();
         });
         dialog.present(Some(&self.0.window));
@@ -1403,9 +1535,10 @@ impl ViewerWindow {
 
     fn export_document_with_options(
         &self,
-        document: Document,
+        snapshot: ExportSnapshot,
         path: PathBuf,
         options: ExportOptions,
+        replace_current_file: bool,
     ) {
         if let Some(previous) = self.0.export_cancellation.borrow_mut().take() {
             previous.cancel();
@@ -1414,8 +1547,17 @@ impl ViewerWindow {
         self.0
             .export_cancellation
             .replace(Some(cancellation.clone()));
+        let generation = self.0.export_generation.get().wrapping_add(1);
+        self.0.export_generation.set(generation);
         let worker_cancellation = cancellation.clone();
         let worker_path = path.clone();
+        let export_lock = self.0.export_lock.clone();
+        let ExportSnapshot {
+            document,
+            operations,
+            source_file,
+            load_generation,
+        } = snapshot;
         self.0.toasts.add_toast(
             adw::Toast::builder()
                 .title("Exporting image…")
@@ -1426,6 +1568,10 @@ impl ViewerWindow {
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || {
+                let _export_guard = export_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                worker_cancellation.check()?;
                 let rendered = document.render(&worker_cancellation)?;
                 crate::export::export(&rendered, &worker_path, &options, &worker_cancellation)
             })
@@ -1433,27 +1579,50 @@ impl ViewerWindow {
             let Some(state) = weak.upgrade() else {
                 return;
             };
+            if state.export_generation.get() != generation {
+                return;
+            }
+            state.export_cancellation.borrow_mut().take();
+            if !export_context_matches(
+                state.load_generation.get(),
+                load_generation,
+                &state.current_file.borrow(),
+                &source_file,
+            ) {
+                return;
+            }
             match result {
                 Ok(Ok(())) => {
                     if let Some(document) = state.document.borrow_mut().as_mut() {
-                        document.mark_saved();
+                        document.mark_saved_at(operations);
+                        if replace_current_file {
+                            document.set_path(Some(path.clone()));
+                        }
+                    }
+                    if replace_current_file {
+                        let target = gio::File::for_path(&path);
+                        if let Some(parent) = target.parent() {
+                            state.settings.set_last_open_folder(&parent);
+                        }
+                        state.current_file.replace(Some(target.clone()));
+                        ViewerWindow(state.clone()).rebuild_navigation(target);
                     }
                     state.source_modified.replace(
                         std::fs::metadata(&path)
                             .ok()
                             .and_then(|metadata| metadata.modified().ok()),
                     );
-                    state.toasts.add_toast(adw::Toast::new("Image saved"));
-                    let title = state
-                        .current_file
+                    let has_newer_edits = state
+                        .document
                         .borrow()
                         .as_ref()
-                        .and_then(gio::File::basename)
-                        .map_or_else(
-                            || "Image Viewer".to_owned(),
-                            |name| name.to_string_lossy().into_owned(),
-                        );
-                    state.title.set_title(&title);
+                        .is_some_and(Document::is_dirty);
+                    state.toasts.add_toast(adw::Toast::new(if has_newer_edits {
+                        "Image exported; newer edits remain unsaved"
+                    } else {
+                        "Image saved"
+                    }));
+                    ViewerWindow(state.clone()).update_title();
                 }
                 Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                 Err(_) => state
@@ -1747,15 +1916,17 @@ impl ViewerWindow {
             .title("Transparency background")
             .model(&gtk::StringList::new(&[
                 "Checkerboard",
+                "Auto",
                 "White",
                 "Gray",
                 "Black",
             ]))
             .selected(match self.0.canvas.background() {
                 Background::Checkerboard => 0,
-                Background::White => 1,
-                Background::Gray => 2,
-                Background::Black => 3,
+                Background::Auto => 1,
+                Background::White => 2,
+                Background::Gray => 3,
+                Background::Black => 4,
             })
             .build();
         group.add(&background);
@@ -1774,7 +1945,7 @@ impl ViewerWindow {
                 "Bicubic",
                 "Seam carving",
             ]))
-            .selected(match self.0.settings.scale_resampling() {
+            .selected(match self.0.scale_resampling.get() {
                 Resampling::Nearest => 0,
                 Resampling::Linear => 1,
                 Resampling::Bicubic => 2,
@@ -1795,9 +1966,10 @@ impl ViewerWindow {
                 ZoomFilter::Soft
             };
             let background = match background.selected() {
-                1 => Background::White,
-                2 => Background::Gray,
-                3 => Background::Black,
+                1 => Background::Auto,
+                2 => Background::White,
+                3 => Background::Gray,
+                4 => Background::Black,
                 _ => Background::Checkerboard,
             };
             let lens_diameter = match lens_size.selected() {
@@ -1815,14 +1987,14 @@ impl ViewerWindow {
             this.0.settings.set_zoom_filter(zoom_filter);
             this.0.settings.set_background(background);
             this.0.settings.set_compare_lens_size(lens_diameter);
-            this.0
-                .settings
-                .set_scale_resampling(match resampling.selected() {
-                    0 => Resampling::Nearest,
-                    1 => Resampling::Linear,
-                    3 => Resampling::SeamCarving,
-                    _ => Resampling::Bicubic,
-                });
+            let scale_resampling = match resampling.selected() {
+                0 => Resampling::Nearest,
+                1 => Resampling::Linear,
+                3 => Resampling::SeamCarving,
+                _ => Resampling::Bicubic,
+            };
+            this.0.scale_resampling.set(scale_resampling);
+            this.0.settings.set_scale_resampling(scale_resampling);
             if this.0.scale_button.is_active() {
                 this.schedule_scale_preview(this.0.scale_slider.value().round() as u32);
             }
@@ -2050,6 +2222,37 @@ impl ViewerWindow {
         }
     }
 
+    fn rebuild_navigation(&self, file: gio::File) {
+        self.0.sequence.replace(None);
+        self.0.directory_monitor.replace(None);
+        self.prefetch_neighbors();
+        let fallback = self.0.settings.folder_sort();
+        let expected_file = file.clone();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            let sequence =
+                gio::spawn_blocking(move || DirectorySequence::build(&file, fallback)).await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if !files_equal(&state.current_file.borrow(), &Some(expected_file)) {
+                return;
+            }
+            match sequence {
+                Ok(Ok(sequence)) => {
+                    state.sequence.replace(Some(sequence));
+                    let this = ViewerWindow(state);
+                    this.prefetch_neighbors();
+                    this.monitor_directory();
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "Directory navigation unavailable after Save As")
+                }
+                Err(_) => tracing::warn!("Directory navigation worker panicked after Save As"),
+            }
+        });
+    }
+
     fn monitor_directory(&self) {
         self.0.directory_monitor.replace(None);
         let Some(parent) = self
@@ -2126,20 +2329,24 @@ impl ViewerWindow {
 
     fn load_comparison(&self, file: gio::File) {
         let cancellable = gio::Cancellable::new();
+        let primary_generation = self.0.load_generation.get();
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
             let preview = load_preview(&file, DecodeLimits::default(), &cancellable).await;
             let Some(state) = weak.upgrade() else {
                 return;
             };
+            if state.load_generation.get() != primary_generation {
+                return;
+            }
             match preview {
-                Ok(preview) => ViewerWindow(state).enter_compare(preview),
+                Ok(preview) => ViewerWindow(state).enter_compare(file, preview),
                 Err(error) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
             }
         });
     }
 
-    fn enter_compare(&self, preview: crate::image::LoadedPreview) {
+    fn enter_compare(&self, file: gio::File, preview: crate::image::LoadedPreview) {
         self.exit_compare();
         let Some(primary) = self.0.canvas.texture() else {
             return;
@@ -2149,6 +2356,8 @@ impl ViewerWindow {
         compare_canvas.set_filter(self.0.canvas.filter());
         compare_canvas.set_background(self.0.canvas.background());
         compare_canvas.set_zoom(self.0.canvas.zoom());
+        compare_canvas.set_halign(gtk::Align::Center);
+        compare_canvas.set_valign(gtk::Align::Center);
         compare_canvas.set_tooltip_text(Some("Comparison image panel"));
         self.0.canvas.set_tooltip_text(Some("Primary image panel"));
         compare_canvas.set_accessible_label("Comparison image B");
@@ -2174,17 +2383,16 @@ impl ViewerWindow {
             .shrink_end_child(false)
             .build();
 
+        self.0.canvas_overlay.set_child(None::<&gtk::Widget>);
         self.0.toasts.set_child(None::<&gtk::Widget>);
         paned.set_start_child(Some(&self.0.scrolled));
         paned.set_end_child(Some(&compare_scrolled));
-        let toolbar = gtk::Box::builder()
+        let toolbar = gtk::CenterBox::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
             .margin_start(6)
             .margin_end(6)
-            .halign(gtk::Align::Center)
             .build();
         toolbar.add_css_class("toolbar");
         let lock = gtk::ToggleButton::builder()
@@ -2196,21 +2404,41 @@ impl ViewerWindow {
             .icon_name("window-close-symbolic")
             .tooltip_text("Exit Compare Mode")
             .build();
-        toolbar.append(&lock);
-        toolbar.append(&close);
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        controls.append(&lock);
+        controls.append(&close);
+        toolbar.set_center_widget(Some(&controls));
+        if let Some(primary_file) = self.0.current_file.borrow().as_ref() {
+            toolbar.set_start_widget(Some(&compare_metadata_label(
+                primary_file,
+                primary.width() as u32,
+                primary.height() as u32,
+                0.0,
+            )));
+        }
+        toolbar.set_end_widget(Some(&compare_metadata_label(
+            &file,
+            preview.width,
+            preview.height,
+            1.0,
+        )));
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&toolbar);
         root.append(&paned);
         self.0.toasts.set_child(Some(&root));
         self.0.compare_canvas.replace(Some(compare_canvas.clone()));
+        self.0.compare_file.replace(Some(file));
         self.0
             .compare_scrolled
             .replace(Some(compare_scrolled.clone()));
         self.0.compare_paned.replace(Some(paned.clone()));
         self.0.compare_locked.set(true);
-        self.0
-            .compare_rendered
-            .replace(rgba_from_texture(&preview.texture));
+        compare_canvas.set_zoom(self.0.canvas.zoom());
+        let compare_rendered = rgba_from_texture(&preview.texture);
+        if let Some(image) = compare_rendered.as_ref() {
+            compare_canvas.set_auto_background_from_image(image);
+        }
+        self.0.compare_rendered.replace(compare_rendered);
 
         lock.connect_toggled({
             let this = self.clone();
@@ -2221,8 +2449,14 @@ impl ViewerWindow {
             move |_| this.exit_compare()
         });
         self.connect_compare_adjustments(&compare_scrolled);
-        self.connect_lens(&self.0.canvas, &compare_canvas, &preview.texture);
-        self.connect_lens(&compare_canvas, &self.0.canvas, &primary);
+        self.0.canvas.set_cursor_from_name(Some("none"));
+        compare_canvas.set_cursor_from_name(Some("none"));
+        self.connect_lens(&self.0.canvas, &compare_canvas, CompareLensSource::Primary);
+        self.connect_lens(
+            &compare_canvas,
+            &self.0.canvas,
+            CompareLensSource::Comparison,
+        );
         self.install_comparison_pencil_gestures(&compare_canvas);
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll({
@@ -2240,19 +2474,89 @@ impl ViewerWindow {
                 }
             }
         });
-        compare_canvas.add_controller(scroll);
-        paned.connect_map(move |paned| {
-            let available = if paned.orientation() == gtk::Orientation::Horizontal {
-                paned.width()
+        compare_canvas.add_controller(scroll.clone());
+        self.0
+            .compare_controllers
+            .borrow_mut()
+            .push((compare_canvas.clone(), scroll.upcast()));
+        let this = self.clone();
+        self.0.window.add_tick_callback(move |_, _| {
+            if this.layout_compare_panels() {
+                glib::ControlFlow::Break
             } else {
-                paned.height()
-            };
-            paned.set_position(available / 2);
+                glib::ControlFlow::Continue
+            }
         });
     }
 
+    fn layout_compare_panels(&self) -> bool {
+        let Some(paned) = self.0.compare_paned.borrow().clone() else {
+            return true;
+        };
+        let paned_size = (paned.width(), paned.height());
+        if !usable_panel_size(paned_size) {
+            return false;
+        }
+        let available = if paned.orientation() == gtk::Orientation::Horizontal {
+            paned_size.0
+        } else {
+            paned_size.1
+        };
+        let centered_position = available / 2;
+        if paned.position() != centered_position {
+            paned.set_position(centered_position);
+            return false;
+        }
+        self.fit_compare_panels()
+    }
+
+    fn fit_compare_panels(&self) -> bool {
+        let Some(comparison) = self.0.compare_canvas.borrow().clone() else {
+            return true;
+        };
+        let Some(primary_texture) = self.0.canvas.texture() else {
+            return true;
+        };
+        let Some(comparison_texture) = comparison.texture() else {
+            return true;
+        };
+        let Some(comparison_scrolled) = self.0.compare_scrolled.borrow().clone() else {
+            return true;
+        };
+        let primary_size = (self.0.scrolled.width(), self.0.scrolled.height());
+        let comparison_size = (comparison_scrolled.width(), comparison_scrolled.height());
+        if !usable_panel_size(primary_size) || !usable_panel_size(comparison_size) {
+            return false;
+        }
+        let fit_zooms = (
+            panel_fit_zoom(
+                primary_size,
+                (primary_texture.width(), primary_texture.height()),
+            ),
+            panel_fit_zoom(
+                comparison_size,
+                (comparison_texture.width(), comparison_texture.height()),
+            ),
+        );
+        self.0.compare_fit_zooms.set(Some(fit_zooms));
+        self.set_zoom(fit_zooms.0);
+        true
+    }
+
     fn exit_compare(&self) {
+        self.0.compare_lens_source.set(None);
+        self.0.compare_locked.set(false);
+        self.0.syncing_compare.set(false);
+        for (canvas, controller) in self.0.compare_controllers.borrow_mut().drain(..) {
+            canvas.remove_controller(&controller);
+        }
+        for (adjustment, handler) in self.0.compare_adjustment_handlers.borrow_mut().drain(..) {
+            adjustment.disconnect(handler);
+        }
         self.0.canvas.clear_lens();
+        self.0
+            .canvas
+            .set_cursor_from_name(self.0.lens_active.get().then_some("none"));
         self.0.canvas.set_marker(None);
         if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
             canvas.clear_lens();
@@ -2262,11 +2566,14 @@ impl ViewerWindow {
             self.0.toasts.set_child(None::<&gtk::Widget>);
             paned.set_start_child(None::<&gtk::Widget>);
             paned.set_end_child(None::<&gtk::Widget>);
-            self.0.toasts.set_child(Some(&self.0.scrolled));
+            self.0.canvas_overlay.set_child(Some(&self.0.scrolled));
+            self.0.toasts.set_child(Some(&self.0.canvas_overlay));
         }
         self.0.compare_scrolled.replace(None);
         self.0.compare_canvas.replace(None);
+        self.0.compare_fit_zooms.set(None);
         self.0.compare_rendered.replace(None);
+        self.0.compare_file.replace(None);
         self.0.canvas.set_tooltip_text(Some("Image canvas"));
         self.0.canvas.set_accessible_label("Image canvas");
         let this = self.clone();
@@ -2281,13 +2588,17 @@ impl ViewerWindow {
             (compare.vadjustment(), self.0.scrolled.vadjustment()),
         ] {
             let this = self.clone();
-            source.connect_value_changed(move |source| {
+            let handler = source.connect_value_changed(move |source| {
                 if !this.0.compare_locked.get() || this.0.syncing_compare.replace(true) {
                     return;
                 }
                 sync_adjustment(source, &target);
                 this.0.syncing_compare.set(false);
             });
+            self.0
+                .compare_adjustment_handlers
+                .borrow_mut()
+                .push((source, handler));
         }
     }
 
@@ -2342,6 +2653,7 @@ impl ViewerWindow {
                     normalized_y,
                     this.0.lens_diameter.get(),
                     4.0,
+                    true,
                 );
             }
         });
@@ -2356,24 +2668,31 @@ impl ViewerWindow {
         &self,
         source: &ImageCanvas,
         target: &ImageCanvas,
-        target_texture: &gtk::gdk::Texture,
+        source_id: CompareLensSource,
     ) {
-        let Some(source_texture) = source.texture() else {
-            return;
-        };
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion({
             let this = self.clone();
             let source = source.clone();
-            let source_texture = source_texture.clone();
             let target = target.clone();
-            let target_texture = target_texture.clone();
             move |_, x, y| {
-                if this.0.edit_button.is_active() {
+                if this.0.compare_canvas.borrow().is_none() || this.0.edit_button.is_active() {
                     source.clear_lens();
                     target.clear_lens();
                     return;
                 }
+                this.0.compare_lens_source.set(Some(source_id));
+                source.set_cursor_from_name(Some("none"));
+                let Some(source_texture) = source.texture() else {
+                    source.clear_lens();
+                    target.clear_lens();
+                    return;
+                };
+                let Some(target_texture) = target.texture() else {
+                    source.clear_lens();
+                    target.clear_lens();
+                    return;
+                };
                 let Some((normalized_x, normalized_y)) = source.normalized_at(x, y) else {
                     source.clear_lens();
                     target.clear_lens();
@@ -2386,6 +2705,7 @@ impl ViewerWindow {
                     normalized_y,
                     this.0.lens_diameter.get(),
                     magnification,
+                    true,
                 );
                 target.set_lens(
                     &target_texture,
@@ -2393,23 +2713,35 @@ impl ViewerWindow {
                     normalized_y,
                     this.0.lens_diameter.get(),
                     magnification,
+                    false,
                 );
             }
         });
         motion.connect_leave({
+            let this = self.clone();
             let source = source.clone();
             let target = target.clone();
             move |_| {
-                source.clear_lens();
-                target.clear_lens();
+                if this.0.compare_lens_source.get() == Some(source_id) {
+                    this.0.compare_lens_source.set(None);
+                    source.clear_lens();
+                    target.clear_lens();
+                }
             }
         });
-        source.add_controller(motion);
+        source.add_controller(motion.clone());
+        self.0
+            .compare_controllers
+            .borrow_mut()
+            .push((source.clone(), motion.upcast()));
 
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll({
             let this = self.clone();
             move |controller, _, dy| {
+                if this.0.compare_canvas.borrow().is_none() {
+                    return glib::Propagation::Proceed;
+                }
                 let state = controller.current_event_state();
                 if state.contains(gtk::gdk::ModifierType::ALT_MASK) {
                     let next = (this.0.lens_magnification.get()
@@ -2429,7 +2761,11 @@ impl ViewerWindow {
                 }
             }
         });
-        source.add_controller(scroll);
+        source.add_controller(scroll.clone());
+        self.0
+            .compare_controllers
+            .borrow_mut()
+            .push((source.clone(), scroll.upcast()));
     }
 
     fn set_zoom(&self, zoom: f64) {
@@ -2441,6 +2777,13 @@ impl ViewerWindow {
         if self.0.compare_locked.get()
             && let Some(compare) = self.0.compare_canvas.borrow().as_ref()
         {
+            let zoom = self
+                .0
+                .compare_fit_zooms
+                .get()
+                .map_or(self.0.canvas.zoom(), |fit_zooms| {
+                    comparison_zoom(self.0.canvas.zoom(), fit_zooms)
+                });
             compare.set_zoom(zoom);
         }
         self.update_minimap();
@@ -2568,7 +2911,32 @@ impl ViewerWindow {
             }
         });
         if let Some(file) = next {
-            self.load(file);
+            let Some(compare_file) = self.0.compare_file.borrow().clone() else {
+                self.load(file);
+                return;
+            };
+            let generation = self.0.navigation_generation.get().wrapping_add(1);
+            self.0.navigation_generation.set(generation);
+            let weak = Rc::downgrade(&self.0);
+            let target_for_match = file.clone();
+            let comparison_for_match = compare_file.clone();
+            glib::spawn_future_local(async move {
+                let matching_file = gio::spawn_blocking(move || {
+                    find_matching_file(&comparison_for_match, &target_for_match)
+                        .ok()
+                        .flatten()
+                })
+                .await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if state.navigation_generation.get() != generation {
+                    return;
+                }
+                let comparison = matching_file.unwrap_or(Some(compare_file));
+                state.pending_comparison.replace(comparison);
+                ViewerWindow(state).load(file);
+            });
         }
     }
 
@@ -2892,7 +3260,11 @@ impl ViewerWindow {
                 this.0.pencil_points.take();
             }
         });
-        canvas.add_controller(pencil);
+        canvas.add_controller(pencil.clone());
+        self.0
+            .compare_controllers
+            .borrow_mut()
+            .push((canvas.clone(), pencil.upcast()));
 
         let sampler = gtk::GestureClick::new();
         sampler.set_button(3);
@@ -2918,7 +3290,11 @@ impl ViewerWindow {
                 this.0.color_button.set_rgba(&u8_to_rgba(color));
             }
         });
-        canvas.add_controller(sampler);
+        canvas.add_controller(sampler.clone());
+        self.0
+            .compare_controllers
+            .borrow_mut()
+            .push((canvas.clone(), sampler.upcast()));
     }
 
     fn install_state_persistence(&self) {
@@ -3172,6 +3548,64 @@ mod tests {
     }
 
     #[test]
+    fn folder_path_uses_the_file_parent() {
+        let file = gio::File::for_path("/images/comparison/frame.png");
+
+        assert_eq!(folder_path(&file), "/images/comparison");
+    }
+
+    #[test]
+    fn compare_metadata_includes_folder_and_resolution() {
+        let file = gio::File::for_path("/images/comparison/frame.png");
+
+        assert_eq!(
+            compare_metadata(&file, 1920, 1080),
+            "/images/comparison · 1920 × 1080"
+        );
+    }
+
+    #[test]
+    fn compare_zoom_keeps_each_image_at_its_relative_fit_level() {
+        let primary_fit = panel_fit_zoom((800, 600), (1600, 900));
+        let comparison_fit = panel_fit_zoom((400, 300), (400, 200));
+
+        assert_eq!(primary_fit, 0.5);
+        assert_eq!(comparison_fit, 1.0);
+        assert_eq!(
+            comparison_zoom(primary_fit, (primary_fit, comparison_fit)),
+            1.0
+        );
+        assert_eq!(
+            comparison_zoom(primary_fit * 2.0, (primary_fit, comparison_fit)),
+            2.0
+        );
+    }
+
+    #[test]
+    fn compare_layout_rejects_placeholder_allocations() {
+        assert!(!usable_panel_size((1, 600)));
+        assert!(!usable_panel_size((800, 1)));
+        assert!(usable_panel_size((800, 600)));
+    }
+
+    #[test]
+    fn pencil_is_unavailable_while_crop_is_active() {
+        assert!(!pencil_can_activate(true, true));
+        assert!(!pencil_can_activate(false, false));
+        assert!(pencil_can_activate(false, true));
+    }
+
+    #[test]
+    fn export_completion_only_matches_its_originating_file_generation() {
+        let original = Some(gio::File::for_path("/images/original.png"));
+        let replacement = Some(gio::File::for_path("/images/replacement.png"));
+
+        assert!(export_context_matches(7, 7, &original, &original));
+        assert!(!export_context_matches(8, 7, &original, &original));
+        assert!(!export_context_matches(7, 7, &replacement, &original));
+    }
+
+    #[test]
     fn corner_drag_resizes_both_crop_boundaries() {
         let crop = CropOverlay {
             x: 10,
@@ -3225,5 +3659,70 @@ mod tests {
         let texture = texture_from_rgba(&image).unwrap();
 
         assert_eq!(rgba_from_texture(&texture), Some(image));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn compare_mode_round_trip_restores_overlay_and_disconnects_session_state() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.CompareLifecycleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window
+            .0
+            .current_file
+            .replace(Some(gio::File::for_path("/images/primary.png")));
+        let preview = crate::image::LoadedPreview {
+            texture,
+            width: 2,
+            height: 1,
+            metadata: crate::document::Metadata::default(),
+            animation_delay: None,
+        };
+        let comparison = gio::File::for_path("/images/comparison.png");
+
+        for _ in 0..2 {
+            window.enter_compare(comparison.clone(), preview.clone());
+            assert_eq!(window.0.compare_controllers.borrow().len(), 7);
+            assert_eq!(window.0.compare_adjustment_handlers.borrow().len(), 4);
+
+            window.exit_compare();
+
+            assert_eq!(
+                window.0.toasts.child(),
+                Some(window.0.canvas_overlay.clone().upcast())
+            );
+            assert_eq!(
+                window.0.canvas_overlay.child(),
+                Some(window.0.scrolled.clone().upcast())
+            );
+            assert_eq!(
+                window.0.zoom_controls.parent(),
+                Some(window.0.canvas_overlay.clone().upcast())
+            );
+            assert_eq!(
+                window.0.transform_controls.parent(),
+                Some(window.0.canvas_overlay.clone().upcast())
+            );
+            assert_eq!(
+                window.0.scale_controls.parent(),
+                Some(window.0.canvas_overlay.clone().upcast())
+            );
+            assert_eq!(
+                window.0.minimap.parent(),
+                Some(window.0.canvas_overlay.clone().upcast())
+            );
+            assert!(window.0.canvas.cursor().is_none());
+            assert!(window.0.compare_controllers.borrow().is_empty());
+            assert!(window.0.compare_adjustment_handlers.borrow().is_empty());
+        }
     }
 }

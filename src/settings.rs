@@ -42,6 +42,7 @@ impl Settings {
 
     pub fn background(&self) -> Background {
         match self.string("transparency-background").as_deref() {
+            Some("auto") => Background::Auto,
             Some("white") => Background::White,
             Some("gray") => Background::Gray,
             Some("black") => Background::Black,
@@ -54,6 +55,7 @@ impl Settings {
             "transparency-background",
             match background {
                 Background::Checkerboard => "checkerboard",
+                Background::Auto => "auto",
                 Background::White => "white",
                 Background::Gray => "gray",
                 Background::Black => "black",
