@@ -9,6 +9,7 @@ use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupEx
 use gio::prelude::*;
 use gtk::prelude::*;
 use libadwaita as adw;
+use object_detector::{DetectorType, ModelScale, ObjectDetector};
 
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
@@ -29,6 +30,7 @@ struct HeaderWidgets {
     header: adw::HeaderBar,
     animation_controls: gtk::Box,
     animation_play_button: gtk::Button,
+    selection_button: gtk::ToggleButton,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
     color_button: gtk::ColorDialogButton,
@@ -52,6 +54,14 @@ struct EditDrag {
     right: bool,
     top: bool,
     bottom: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionDrag {
+    start: (u32, u32),
+    current: (u32, u32),
+    start_screen: (f64, f64),
+    image_dimensions: (u32, u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,6 +141,24 @@ fn resize_crop(
             .clamp(1, crop.image_height - crop.y);
     }
     crop
+}
+
+fn selection_overlay(drag: SelectionDrag) -> Option<CropOverlay> {
+    let bounds = crate::tools::selection::bounds_between(
+        drag.start,
+        drag.current,
+        drag.image_dimensions.0,
+        drag.image_dimensions.1,
+    )
+    .ok()?;
+    Some(CropOverlay {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        image_width: drag.image_dimensions.0,
+        image_height: drag.image_dimensions.1,
+    })
 }
 
 fn scaled_dimensions(width: u32, height: u32, target_width: u32) -> (u32, u32) {
@@ -225,6 +253,11 @@ struct WindowState {
     pencil_points: RefCell<Vec<BrushPoint>>,
     pencil_start: Cell<(f64, f64)>,
     pencil_color: Cell<[u8; 4]>,
+    selection_button: gtk::ToggleButton,
+    selection_drag: Cell<Option<SelectionDrag>>,
+    object_detector: Arc<Mutex<Option<ObjectDetector>>>,
+    object_detection_running: Cell<bool>,
+    mask_flash_generation: Cell<u64>,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
     color_button: gtk::ColorDialogButton,
@@ -456,6 +489,11 @@ impl ViewerWindow {
             pencil_points: RefCell::new(Vec::new()),
             pencil_start: Cell::new((0.0, 0.0)),
             pencil_color: Cell::new([0, 0, 0, 255]),
+            selection_button: header_widgets.selection_button,
+            selection_drag: Cell::new(None),
+            object_detector: Arc::new(Mutex::new(None)),
+            object_detection_running: Cell::new(false),
+            mask_flash_generation: Cell::new(0),
             pencil_button: header_widgets.pencil_button,
             lens_button: header_widgets.lens_button,
             color_button: header_widgets.color_button,
@@ -556,6 +594,8 @@ impl ViewerWindow {
             .set(self.0.render_generation.get().wrapping_add(1));
         self.0.animation_frames.borrow_mut().clear();
         self.0.animation_controls.set_visible(false);
+        self.0.selection_button.set_active(false);
+        self.clear_mask_flash();
         self.0.scale_button.set_active(false);
         self.exit_compare();
         let cancellable = gio::Cancellable::new();
@@ -897,6 +937,10 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.0.selection_button.is_active() {
+                    this.0.selection_button.set_active(false);
+                    return;
+                }
                 if this.0.edit_button.is_active() {
                     this.0.edit_button.set_active(false);
                     return;
@@ -949,11 +993,11 @@ impl ViewerWindow {
             move || this.toggle_single_image_lens()
         });
         self.add_action("select-object", {
-            let toasts = self.0.toasts.clone();
+            let this = self.clone();
             move || {
-                toasts.add_toast(adw::Toast::new(
-                    "The optional local object-selection model is not installed",
-                ))
+                this.0
+                    .selection_button
+                    .set_active(!this.0.selection_button.is_active())
             }
         });
     }
@@ -979,6 +1023,10 @@ impl ViewerWindow {
     }
 
     fn install_tool_controls(&self) {
+        self.0.selection_button.connect_toggled({
+            let this = self.clone();
+            move |button| this.set_selection_active(button.is_active())
+        });
         self.0.pencil_button.connect_toggled({
             let this = self.clone();
             move |button| this.set_pencil_active(button.is_active())
@@ -1014,6 +1062,7 @@ impl ViewerWindow {
 
     fn set_scale_preview_active(&self, active: bool) {
         if active {
+            self.0.selection_button.set_active(false);
             let Some(image) = self.0.rendered.borrow().clone() else {
                 self.0.scale_button.set_active(false);
                 self.0
@@ -1130,6 +1179,9 @@ impl ViewerWindow {
     }
 
     fn set_pencil_active(&self, active: bool) {
+        if active {
+            self.0.selection_button.set_active(false);
+        }
         if active
             && !pencil_can_activate(
                 self.0.edit_button.is_active(),
@@ -1150,6 +1202,192 @@ impl ViewerWindow {
         } else {
             "Image canvas"
         });
+    }
+
+    fn set_selection_active(&self, active: bool) {
+        if active && self.0.rendered.borrow().is_none() {
+            self.0.selection_button.set_active(false);
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an editable image first"));
+            return;
+        }
+        if active {
+            self.0.scale_button.set_active(false);
+            self.0.edit_button.set_active(false);
+            self.0.pencil_button.set_active(false);
+            self.0.lens_button.set_active(false);
+            self.0.canvas.clear_lens();
+            if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
+                canvas.clear_lens();
+                canvas.set_cursor_from_name(None);
+            }
+        } else {
+            self.0.selection_drag.set(None);
+            self.0.canvas.set_crop_overlay(None);
+        }
+        self.0
+            .canvas
+            .set_cursor_from_name(active.then_some("crosshair"));
+        self.0.canvas.set_accessible_label(if active {
+            "Image canvas, Select and Copy tool active"
+        } else {
+            "Image canvas"
+        });
+    }
+
+    fn complete_selection(&self, drag: SelectionDrag) {
+        if drag.start == drag.current {
+            let Some(image) = self.0.rendered.borrow().clone() else {
+                return;
+            };
+            self.detect_and_copy_object(image, drag.start);
+            return;
+        }
+        let image = self.0.rendered.borrow();
+        let Some(image) = image.as_ref() else {
+            return;
+        };
+        let result = crate::tools::selection::bounds_between(
+            drag.start,
+            drag.current,
+            image.width(),
+            image.height(),
+        )
+        .and_then(|bounds| {
+            crate::tools::selection::crop(image, bounds).map(|selected| (bounds, selected))
+        });
+        match result {
+            Ok((bounds, selected)) => self.copy_image_to_clipboard(
+                &selected,
+                &format!("Copied {} × {} selection", bounds.width, bounds.height),
+            ),
+            Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error.to_string())),
+        }
+    }
+
+    fn detect_and_copy_object(&self, image: image::RgbaImage, point: (u32, u32)) {
+        if self.0.object_detection_running.replace(true) {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Object detection is already running"));
+            return;
+        }
+        let first_use = self
+            .0
+            .object_detector
+            .lock()
+            .map_or(true, |detector| detector.is_none());
+        self.0.toasts.add_toast(adw::Toast::new(if first_use {
+            "Preparing object detector — first use downloads the Medium model"
+        } else {
+            "Detecting object…"
+        }));
+        let detector = Arc::clone(&self.0.object_detector);
+        let generation = self.0.load_generation.get();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let mut detector = detector
+                    .lock()
+                    .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
+                if detector.is_none() {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
+                    let loaded = runtime
+                        .block_on(
+                            ObjectDetector::from_hf(DetectorType::PromptFree)
+                                .scale(ModelScale::Medium)
+                                .include_mask(true)
+                                .build(),
+                        )
+                        .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
+                    *detector = Some(loaded);
+                }
+                let detector = detector
+                    .as_ref()
+                    .ok_or(crate::error::AppError::AiModelUnavailable)?;
+                crate::ai::select_object_at(detector, image, point.0, point.1)
+            })
+            .await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            state.object_detection_running.set(false);
+            if state.load_generation.get() != generation {
+                return;
+            }
+            let this = ViewerWindow(state.clone());
+            match result {
+                Ok(Ok(Some(selected))) => {
+                    this.flash_object_mask(&selected);
+                    this.copy_image_to_clipboard(
+                        &selected.image,
+                        &format!(
+                            "Copied {} object ({:.0}% confidence)",
+                            selected.tag,
+                            selected.score * 100.0
+                        ),
+                    );
+                }
+                Ok(Ok(None)) => state
+                    .toasts
+                    .add_toast(adw::Toast::new("No detected object contains that pixel")),
+                Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&format!(
+                    "Object detection failed: {error}"
+                ))),
+                Err(_) => state
+                    .toasts
+                    .add_toast(adw::Toast::new("Object detection worker failed")),
+            }
+        });
+    }
+
+    fn copy_image_to_clipboard(&self, image: &image::RgbaImage, message: &str) {
+        match texture_from_rgba(image) {
+            Ok(texture) => {
+                self.0.window.clipboard().set_texture(&texture);
+                self.0.toasts.add_toast(adw::Toast::new(message));
+            }
+            Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error)),
+        }
+    }
+
+    fn flash_object_mask(&self, selected: &crate::ai::SelectedObject) {
+        let Ok(texture) = texture_from_rgba(&selected.flash) else {
+            return;
+        };
+        let generation = self.0.mask_flash_generation.get().wrapping_add(1);
+        self.0.mask_flash_generation.set(generation);
+        self.0.canvas.set_mask_flash(
+            Some(&texture),
+            CropOverlay {
+                x: selected.bounds.x,
+                y: selected.bounds.y,
+                width: selected.bounds.width,
+                height: selected.bounds.height,
+                image_width: selected.image_dimensions.0,
+                image_height: selected.image_dimensions.1,
+            },
+        );
+        let weak = Rc::downgrade(&self.0);
+        glib::timeout_add_local_once(Duration::from_millis(350), move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.mask_flash_generation.get() == generation {
+                state.canvas.clear_mask_flash();
+            }
+        });
+    }
+
+    fn clear_mask_flash(&self) {
+        self.0
+            .mask_flash_generation
+            .set(self.0.mask_flash_generation.get().wrapping_add(1));
+        self.0.canvas.clear_mask_flash();
     }
 
     fn preview_pencil_stroke(&self) {
@@ -1203,6 +1441,7 @@ impl ViewerWindow {
 
     fn set_edit_active(&self, active: bool) {
         if active {
+            self.0.selection_button.set_active(false);
             self.0.scale_button.set_active(false);
             self.0.pencil_button.set_active(false);
         }
@@ -1217,6 +1456,7 @@ impl ViewerWindow {
         }
         self.0.lens_button.set_sensitive(!active);
         self.0.scale_button.set_sensitive(!active);
+        self.0.selection_button.set_sensitive(!active);
         self.0.pencil_button.set_sensitive(!active);
         if !active {
             self.0.canvas.set_preview_scale(1.0);
@@ -2554,9 +2794,14 @@ impl ViewerWindow {
             adjustment.disconnect(handler);
         }
         self.0.canvas.clear_lens();
-        self.0
-            .canvas
-            .set_cursor_from_name(self.0.lens_active.get().then_some("none"));
+        let cursor = if self.0.lens_active.get() {
+            Some("none")
+        } else if self.0.selection_button.is_active() {
+            Some("crosshair")
+        } else {
+            None
+        };
+        self.0.canvas.set_cursor_from_name(cursor);
         self.0.canvas.set_marker(None);
         if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
             canvas.clear_lens();
@@ -2612,6 +2857,9 @@ impl ViewerWindow {
     }
 
     fn set_single_image_lens_active(&self, active: bool) {
+        if active {
+            self.0.selection_button.set_active(false);
+        }
         if active && self.0.edit_button.is_active() {
             self.0.lens_button.set_active(false);
             return;
@@ -2676,9 +2924,16 @@ impl ViewerWindow {
             let source = source.clone();
             let target = target.clone();
             move |_, x, y| {
-                if this.0.compare_canvas.borrow().is_none() || this.0.edit_button.is_active() {
+                if this.0.compare_canvas.borrow().is_none()
+                    || this.0.edit_button.is_active()
+                    || this.0.selection_button.is_active()
+                {
                     source.clear_lens();
                     target.clear_lens();
+                    source.set_cursor_from_name(
+                        (source == this.0.canvas && this.0.selection_button.is_active())
+                            .then_some("crosshair"),
+                    );
                     return;
                 }
                 this.0.compare_lens_source.set(Some(source_id));
@@ -2990,6 +3245,72 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(scroll);
 
+        let selection = gtk::GestureDrag::new();
+        selection.set_button(1);
+        selection.connect_drag_begin({
+            let this = self.clone();
+            move |gesture, x, y| {
+                if !this.0.selection_button.is_active() {
+                    return;
+                }
+                let Some(start) = this.0.canvas.pixel_at(x, y) else {
+                    return;
+                };
+                let Some(image_dimensions) = this
+                    .0
+                    .rendered
+                    .borrow()
+                    .as_ref()
+                    .map(image::GenericImageView::dimensions)
+                else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let drag = SelectionDrag {
+                    start,
+                    current: start,
+                    start_screen: (x, y),
+                    image_dimensions,
+                };
+                this.0.selection_drag.set(Some(drag));
+                this.0.canvas.set_crop_overlay(selection_overlay(drag));
+            }
+        });
+        selection.connect_drag_update({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.selection_drag.get() else {
+                    return;
+                };
+                let Some(current) = this.0.canvas.pixel_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) else {
+                    return;
+                };
+                drag.current = current;
+                this.0.selection_drag.set(Some(drag));
+                this.0.canvas.set_crop_overlay(selection_overlay(drag));
+            }
+        });
+        selection.connect_drag_end({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.selection_drag.take() else {
+                    return;
+                };
+                if let Some(current) = this.0.canvas.pixel_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) {
+                    drag.current = current;
+                }
+                this.0.canvas.set_crop_overlay(None);
+                this.complete_selection(drag);
+            }
+        });
+        self.0.canvas.add_controller(selection);
+
         let edit_cursor = gtk::EventControllerMotion::new();
         edit_cursor.connect_motion({
             let this = self.clone();
@@ -3015,9 +3336,14 @@ impl ViewerWindow {
         edit_cursor.connect_leave({
             let this = self.clone();
             move |_| {
-                this.0
-                    .canvas
-                    .set_cursor_from_name(this.0.lens_active.get().then_some("none"))
+                let cursor = if this.0.lens_active.get() {
+                    Some("none")
+                } else if this.0.selection_button.is_active() {
+                    Some("crosshair")
+                } else {
+                    None
+                };
+                this.0.canvas.set_cursor_from_name(cursor)
             }
         });
         self.0.canvas.add_controller(edit_cursor);
@@ -3364,6 +3690,10 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     animation_controls.append(&next_frame);
     let previous = button("go-previous-symbolic", "Previous Image", "win.previous");
     let next = button("go-next-symbolic", "Next Image", "win.next");
+    let selection_button = toggle_button(
+        "edit-select-all-symbolic",
+        "Select and Copy — drag a rectangle or click an object",
+    );
     let pencil_button = toggle_button("xsi-edit-symbolic", "Toggle Pencil");
     let lens_button = toggle_button("edit-find-symbolic", "Toggle 4× Lens");
     let edit_button = toggle_button(
@@ -3379,6 +3709,7 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     header.pack_end(&menu_button());
     header.pack_end(&button("media-floppy-symbolic", "Save As", "win.save-as"));
     header.pack_end(&edit_button);
+    header.pack_end(&selection_button);
     header.pack_end(&color_button);
     header.pack_end(&pencil_button);
     header.pack_end(&lens_button);
@@ -3391,6 +3722,7 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
         header,
         animation_controls,
         animation_play_button: play,
+        selection_button,
         pencil_button,
         lens_button,
         color_button,

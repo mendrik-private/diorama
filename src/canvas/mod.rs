@@ -56,6 +56,12 @@ pub struct CropOverlay {
 }
 
 #[derive(Debug, Clone)]
+struct MaskFlash {
+    texture: gdk::Texture,
+    bounds: CropOverlay,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct Lens {
     texture: gdk::Texture,
     normalized_x: f32,
@@ -79,6 +85,7 @@ mod imp {
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
         pub crop_overlay: RefCell<Option<CropOverlay>>,
+        pub(super) mask_flash: RefCell<Option<MaskFlash>>,
     }
 
     #[glib::object_subclass]
@@ -147,6 +154,9 @@ mod imp {
             }
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
+            }
+            if let Some(flash) = self.mask_flash.borrow().as_ref() {
+                draw_mask_flash(snapshot, bounds, flash, self.preview_scale.get());
             }
             if let Some(overlay) = self.crop_overlay.borrow().as_ref() {
                 draw_crop_overlay(snapshot, bounds, overlay, self.preview_scale.get());
@@ -247,6 +257,27 @@ mod imp {
         overlay: &CropOverlay,
         preview_scale: f32,
     ) {
+        draw_dashed_crop_border(snapshot, overlay_rect(bounds, overlay, preview_scale));
+    }
+
+    fn draw_mask_flash(
+        snapshot: &gtk::Snapshot,
+        bounds: gtk::graphene::Rect,
+        flash: &MaskFlash,
+        preview_scale: f32,
+    ) {
+        snapshot.append_scaled_texture(
+            &flash.texture,
+            gtk::gsk::ScalingFilter::Nearest,
+            &overlay_rect(bounds, &flash.bounds, preview_scale),
+        );
+    }
+
+    fn overlay_rect(
+        bounds: gtk::graphene::Rect,
+        overlay: &CropOverlay,
+        preview_scale: f32,
+    ) -> gtk::graphene::Rect {
         let width = overlay.image_width.max(1) as f32;
         let height = overlay.image_height.max(1) as f32;
         let image_ratio = width / height;
@@ -269,13 +300,12 @@ mod imp {
             )
         };
         let image_bounds = scale_bounds(image_bounds, preview_scale);
-        let rect = gtk::graphene::Rect::new(
+        gtk::graphene::Rect::new(
             image_bounds.x() + image_bounds.width() * overlay.x as f32 / width,
             image_bounds.y() + image_bounds.height() * overlay.y as f32 / height,
             image_bounds.width() * overlay.width as f32 / width,
             image_bounds.height() * overlay.height as f32 / height,
-        );
-        draw_dashed_crop_border(snapshot, rect);
+        )
     }
 
     fn draw_dashed_crop_border(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
@@ -469,6 +499,21 @@ impl ImageCanvas {
 
     pub fn set_crop_overlay(&self, overlay: Option<CropOverlay>) {
         self.imp().crop_overlay.replace(overlay);
+        self.queue_draw();
+    }
+
+    pub fn set_mask_flash(&self, texture: Option<&gdk::Texture>, bounds: CropOverlay) {
+        self.imp()
+            .mask_flash
+            .replace(texture.map(|texture| MaskFlash {
+                texture: texture.clone(),
+                bounds,
+            }));
+        self.queue_draw();
+    }
+
+    pub fn clear_mask_flash(&self) {
+        self.imp().mask_flash.replace(None);
         self.queue_draw();
     }
 
