@@ -39,6 +39,11 @@ jobs:
           grep -Fq '"app-id": "io.github.mendrik.Diorama.Devel"' \
             build-aux/io.github.mendrik.Diorama.Devel.json
 
+      - name: Install image codec extension
+        run: >-
+          flatpak install --system --noninteractive --assumeyes flathub
+          org.freedesktop.Platform.codecs-extra//25.08-extra
+
       - name: Build and test Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
         with:
