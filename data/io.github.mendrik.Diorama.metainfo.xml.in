@@ -3,9 +3,15 @@
   <id>io.github.mendrik.Diorama</id>
   <name>Diorama</name>
   <summary>View, compare, and edit images</summary>
+  <developer id="io.github.mendrik">
+    <name>Mendrik</name>
+  </developer>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-or-later</project_license>
-  <description><p>A fast native GNOME image viewer with non-destructive editing.</p></description>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Diorama is a fast native GNOME image viewer for browsing, comparing, and making focused non-destructive edits to images.</p>
+  </description>
+  <url type="homepage">https://github.com/mendrik-private/diorama</url>
   <launchable type="desktop-id">io.github.mendrik.Diorama.desktop</launchable>
   <content_rating type="oars-1.1" />
   <releases><release version="0.1.0" date="2026-07-17" /></releases>

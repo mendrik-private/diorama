@@ -3,6 +3,9 @@
   "runtime": "org.gnome.Platform",
   "runtime-version": "50",
   "sdk": "org.gnome.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
   "command": "diorama",
   "finish-args": [
     "--share=ipc",
@@ -13,16 +16,74 @@
   ],
   "modules": [
     {
+      "name": "glycin-heif-codec-path",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 diorama-glycin-heif /app/libexec/diorama-glycin-heif",
+        "install -Dm644 diorama-glycin-heif.conf /app/share/glycin-loaders/2+/conf.d/diorama-glycin-heif.conf"
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "path": "diorama-glycin-heif"
+        },
+        {
+          "type": "file",
+          "path": "diorama-glycin-heif.conf"
+        }
+      ]
+    },
+    {
+      "name": "onnxruntime",
+      "buildsystem": "simple",
+      "only-arches": [
+        "x86_64"
+      ],
+      "build-commands": [
+        "install -Dm755 lib/libonnxruntime.so.1.24.2 /app/lib/libonnxruntime.so.1.24.2",
+        "ln -s libonnxruntime.so.1.24.2 /app/lib/libonnxruntime.so.1",
+        "ln -s libonnxruntime.so.1 /app/lib/libonnxruntime.so",
+        "install -Dm755 lib/libonnxruntime_providers_shared.so /app/lib/libonnxruntime_providers_shared.so",
+        "install -Dm644 LICENSE /app/share/licenses/diorama/onnxruntime-LICENSE",
+        "install -Dm644 ThirdPartyNotices.txt /app/share/licenses/diorama/onnxruntime-ThirdPartyNotices.txt"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
+          "sha256": "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+          "strip-components": 1
+        }
+      ]
+    },
+    {
       "name": "diorama",
       "buildsystem": "meson",
+      "only-arches": [
+        "x86_64"
+      ],
       "build-options": {
-        "append-path": "/usr/lib/sdk/rust-stable/bin"
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+          "CARGO_HOME": "/run/build/diorama/cargo",
+          "CARGO_NET_OFFLINE": "true",
+          "ORT_LIB_PATH": "/app/lib",
+          "ORT_PREFER_DYNAMIC_LINK": "true"
+        }
       },
       "sources": [
         {
           "type": "dir",
-          "path": ".."
-        }
+          "path": "..",
+          "skip": [
+            ".git",
+            ".github",
+            ".flatpak-builder",
+            "build",
+            "target"
+          ]
+        },
+        "cargo-sources.json"
       ]
     }
   ]
