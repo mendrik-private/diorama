@@ -142,6 +142,17 @@ impl DirectorySequence {
         }
         neighbors
     }
+
+    pub fn replacement_after_current_removed(&self) -> Option<gio::File> {
+        self.entries
+            .get(self.current + 1)
+            .or_else(|| {
+                self.current
+                    .checked_sub(1)
+                    .and_then(|index| self.entries.get(index))
+            })
+            .cloned()
+    }
 }
 
 pub fn is_supported(name: &str) -> bool {
@@ -309,7 +320,10 @@ mod tests {
 
     use gio::prelude::*;
 
-    use super::{comparable_name, find_matching_file, is_supported, natural_compare};
+    use super::{
+        DirectorySequence, SortOrder, comparable_name, find_matching_file, is_supported,
+        natural_compare,
+    };
 
     #[test]
     fn compares_numbers_naturally() {
@@ -347,5 +361,42 @@ mod tests {
         .expect("directory can be searched");
 
         assert_eq!(found.and_then(|file| file.path()), Some(counterpart));
+    }
+
+    #[test]
+    fn replacement_after_removal_prefers_next_then_previous() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for name in ["a.png", "b.png", "c.png"] {
+            std::fs::write(directory.path().join(name), []).expect("image fixture");
+        }
+
+        let middle = DirectorySequence::build(
+            &gio::File::for_path(directory.path().join("b.png")),
+            SortOrder::Name,
+        )
+        .expect("middle sequence");
+        let last = DirectorySequence::build(
+            &gio::File::for_path(directory.path().join("c.png")),
+            SortOrder::Name,
+        )
+        .expect("last sequence");
+        let single_directory = tempfile::tempdir().expect("single-image directory");
+        let single_path = single_directory.path().join("only.png");
+        std::fs::write(&single_path, []).expect("single image fixture");
+        let single = DirectorySequence::build(&gio::File::for_path(single_path), SortOrder::Name)
+            .expect("single sequence");
+
+        assert_eq!(
+            middle
+                .replacement_after_current_removed()
+                .and_then(|file| file.basename()),
+            Some("c.png".into())
+        );
+        assert_eq!(
+            last.replacement_after_current_removed()
+                .and_then(|file| file.basename()),
+            Some("b.png".into())
+        );
+        assert!(single.replacement_after_current_removed().is_none());
     }
 }

@@ -30,6 +30,8 @@ struct HeaderWidgets {
     header: adw::HeaderBar,
     animation_controls: gtk::Box,
     animation_play_button: gtk::Button,
+    scale_button: gtk::ToggleButton,
+    measurement_button: gtk::ToggleButton,
     selection_button: gtk::ToggleButton,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
@@ -62,6 +64,15 @@ struct SelectionDrag {
     current: (u32, u32),
     start_screen: (f64, f64),
     image_dimensions: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct ZoomGestureAnchor {
+    start_zoom: f64,
+    content_x: f64,
+    content_y: f64,
+    horizontal_value: f64,
+    vertical_value: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +227,11 @@ fn scale_preview_zoom(source_width: u32, target_width: u32, source_zoom: f64) ->
     source_zoom * f64::from(source_width.max(1)) / f64::from(target_width.max(1))
 }
 
+fn anchored_adjustment_value(value: f64, content_position: f64, factor: f64) -> f64 {
+    let viewport_position = content_position - value;
+    content_position * factor - viewport_position
+}
+
 fn render_scale_preview(
     image: &image::RgbaImage,
     target_width: u32,
@@ -253,6 +269,8 @@ struct WindowState {
     pencil_points: RefCell<Vec<BrushPoint>>,
     pencil_start: Cell<(f64, f64)>,
     pencil_color: Cell<[u8; 4]>,
+    measurement_button: gtk::ToggleButton,
+    measurement_drag: Cell<Option<SelectionDrag>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     object_detector: Arc<Mutex<Option<ObjectDetector>>>,
@@ -292,6 +310,7 @@ struct WindowState {
     export_cancellation: RefCell<Option<CancellationToken>>,
     export_generation: Cell<u64>,
     export_lock: Arc<Mutex<()>>,
+    deletion_running: Cell<bool>,
     transform_controls: gtk::Box,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
@@ -404,8 +423,6 @@ impl ViewerWindow {
         zoom_label.set_menu_model(Some(&zoom_menu));
         zoom_controls.append(&zoom_label);
         zoom_controls.append(&button("zoom-in-symbolic", "Zoom In", "win.zoom-in"));
-        let scale_button = toggle_button("view-fullscreen-symbolic", "Scale image");
-        zoom_controls.prepend(&scale_button);
         canvas_overlay.add_overlay(&zoom_controls);
         let scale_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         scale_controls.add_css_class("linked");
@@ -489,6 +506,8 @@ impl ViewerWindow {
             pencil_points: RefCell::new(Vec::new()),
             pencil_start: Cell::new((0.0, 0.0)),
             pencil_color: Cell::new([0, 0, 0, 255]),
+            measurement_button: header_widgets.measurement_button,
+            measurement_drag: Cell::new(None),
             selection_button: header_widgets.selection_button,
             selection_drag: Cell::new(None),
             object_detector: Arc::new(Mutex::new(None)),
@@ -530,7 +549,7 @@ impl ViewerWindow {
             transform_controls: transforms,
             zoom_controls,
             zoom_label,
-            scale_button,
+            scale_button: header_widgets.scale_button,
             scale_controls,
             scale_slider,
             scale_value_label,
@@ -542,6 +561,7 @@ impl ViewerWindow {
             export_cancellation: RefCell::new(None),
             export_generation: Cell::new(0),
             export_lock: Arc::new(Mutex::new(())),
+            deletion_running: Cell::new(false),
         }));
         this.install_actions();
         this.install_tool_controls();
@@ -594,6 +614,7 @@ impl ViewerWindow {
             .set(self.0.render_generation.get().wrapping_add(1));
         self.0.animation_frames.borrow_mut().clear();
         self.0.animation_controls.set_visible(false);
+        self.0.measurement_button.set_active(false);
         self.0.selection_button.set_active(false);
         self.clear_mask_flash();
         self.0.scale_button.set_active(false);
@@ -803,6 +824,10 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.navigate(true)
         });
+        self.add_action("delete-file", {
+            let this = self.clone();
+            move || this.confirm_delete_current_file()
+        });
         self.add_action("fullscreen", {
             let window = self.0.window.clone();
             move || {
@@ -937,6 +962,10 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.0.measurement_button.is_active() {
+                    this.0.measurement_button.set_active(false);
+                    return;
+                }
                 if this.0.selection_button.is_active() {
                     this.0.selection_button.set_active(false);
                     return;
@@ -1023,6 +1052,10 @@ impl ViewerWindow {
     }
 
     fn install_tool_controls(&self) {
+        self.0.measurement_button.connect_toggled({
+            let this = self.clone();
+            move |button| this.set_measurement_active(button.is_active())
+        });
         self.0.selection_button.connect_toggled({
             let this = self.clone();
             move |button| this.set_selection_active(button.is_active())
@@ -1062,6 +1095,7 @@ impl ViewerWindow {
 
     fn set_scale_preview_active(&self, active: bool) {
         if active {
+            self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             let Some(image) = self.0.rendered.borrow().clone() else {
                 self.0.scale_button.set_active(false);
@@ -1180,6 +1214,7 @@ impl ViewerWindow {
 
     fn set_pencil_active(&self, active: bool) {
         if active {
+            self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
         }
         if active
@@ -1213,6 +1248,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.0.measurement_button.set_active(false);
             self.0.scale_button.set_active(false);
             self.0.edit_button.set_active(false);
             self.0.pencil_button.set_active(false);
@@ -1231,6 +1267,38 @@ impl ViewerWindow {
             .set_cursor_from_name(active.then_some("crosshair"));
         self.0.canvas.set_accessible_label(if active {
             "Image canvas, Select and Copy tool active"
+        } else {
+            "Image canvas"
+        });
+    }
+
+    fn set_measurement_active(&self, active: bool) {
+        if active && self.0.rendered.borrow().is_none() {
+            self.0.measurement_button.set_active(false);
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an editable image first"));
+            return;
+        }
+        if active {
+            self.0.selection_button.set_active(false);
+            self.0.scale_button.set_active(false);
+            self.0.edit_button.set_active(false);
+            self.0.pencil_button.set_active(false);
+            self.0.lens_button.set_active(false);
+            self.0.canvas.clear_lens();
+            if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
+                canvas.clear_lens();
+                canvas.set_cursor_from_name(None);
+            }
+        } else {
+            self.0.measurement_drag.set(None);
+            self.0.canvas.set_measurement_cursor(None);
+            self.0.canvas.set_measurement_overlay(None);
+        }
+        self.0.canvas.set_cursor_from_name(active.then_some("none"));
+        self.0.canvas.set_accessible_label(if active {
+            "Image canvas, Measuring tool active"
         } else {
             "Image canvas"
         });
@@ -1441,6 +1509,7 @@ impl ViewerWindow {
 
     fn set_edit_active(&self, active: bool) {
         if active {
+            self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.scale_button.set_active(false);
             self.0.pencil_button.set_active(false);
@@ -1456,6 +1525,7 @@ impl ViewerWindow {
         }
         self.0.lens_button.set_sensitive(!active);
         self.0.scale_button.set_sensitive(!active);
+        self.0.measurement_button.set_sensitive(!active);
         self.0.selection_button.set_sensitive(!active);
         self.0.pencil_button.set_sensitive(!active);
         if !active {
@@ -2266,6 +2336,7 @@ impl ViewerWindow {
                     ("Toggle Soft/Hard Zoom", "x"),
                     ("Previous Image", "Left"),
                     ("Next Image", "Right"),
+                    ("Delete Image", "Delete"),
                 ],
             ),
             (
@@ -2794,7 +2865,7 @@ impl ViewerWindow {
             adjustment.disconnect(handler);
         }
         self.0.canvas.clear_lens();
-        let cursor = if self.0.lens_active.get() {
+        let cursor = if self.0.lens_active.get() || self.0.measurement_button.is_active() {
             Some("none")
         } else if self.0.selection_button.is_active() {
             Some("crosshair")
@@ -2858,6 +2929,7 @@ impl ViewerWindow {
 
     fn set_single_image_lens_active(&self, active: bool) {
         if active {
+            self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
         }
         if active && self.0.edit_button.is_active() {
@@ -2926,14 +2998,20 @@ impl ViewerWindow {
             move |_, x, y| {
                 if this.0.compare_canvas.borrow().is_none()
                     || this.0.edit_button.is_active()
+                    || this.0.measurement_button.is_active()
                     || this.0.selection_button.is_active()
                 {
                     source.clear_lens();
                     target.clear_lens();
-                    source.set_cursor_from_name(
-                        (source == this.0.canvas && this.0.selection_button.is_active())
-                            .then_some("crosshair"),
-                    );
+                    let cursor = if source == this.0.canvas && this.0.measurement_button.is_active()
+                    {
+                        Some("none")
+                    } else if source == this.0.canvas && this.0.selection_button.is_active() {
+                        Some("crosshair")
+                    } else {
+                        None
+                    };
+                    source.set_cursor_from_name(cursor);
                     return;
                 }
                 this.0.compare_lens_source.set(Some(source_id));
@@ -3132,12 +3210,14 @@ impl ViewerWindow {
             horizontal.value() + horizontal.page_size() / 2.0,
             vertical.value() + vertical.page_size() / 2.0,
         ));
-        let viewport_x = content_x - horizontal.value();
-        let viewport_y = content_y - vertical.value();
+        let horizontal_target =
+            anchored_adjustment_value(horizontal.value(), content_x, applied_factor);
+        let vertical_target =
+            anchored_adjustment_value(vertical.value(), content_y, applied_factor);
         self.set_zoom(new_zoom);
         glib::idle_add_local_once(move || {
-            horizontal.set_value(content_x * applied_factor - viewport_x);
-            vertical.set_value(content_y * applied_factor - viewport_y);
+            horizontal.set_value(horizontal_target);
+            vertical.set_value(vertical_target);
         });
     }
 
@@ -3195,6 +3275,120 @@ impl ViewerWindow {
         }
     }
 
+    fn confirm_delete_current_file(&self) {
+        if self.0.export_cancellation.borrow().is_some() {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Wait for the current export to finish"));
+            return;
+        }
+        if self.0.deletion_running.get() {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Image deletion is already in progress"));
+            return;
+        }
+        let Some(file) = self.0.current_file.borrow().clone() else {
+            self.0.toasts.add_toast(adw::Toast::new("No image is open"));
+            return;
+        };
+        let name = file.basename().map_or_else(
+            || file.uri().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let has_unsaved_edits = self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(Document::is_dirty);
+        let body = if has_unsaved_edits {
+            format!(
+                "“{name}” and its unsaved edits will be permanently deleted. This cannot be undone."
+            )
+        } else {
+            format!("“{name}” will be permanently deleted. This cannot be undone.")
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Delete this image?")
+            .body(body)
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let this = self.clone();
+        dialog.connect_response(Some("delete"), move |_, _| {
+            this.delete_current_file(file.clone());
+        });
+        dialog.present(Some(&self.0.window));
+    }
+
+    fn delete_current_file(&self, file: gio::File) {
+        if self.0.deletion_running.replace(true) {
+            return;
+        }
+        let known_replacement = self
+            .0
+            .sequence
+            .borrow()
+            .as_ref()
+            .and_then(DirectorySequence::replacement_after_current_removed);
+        let fallback = self.0.settings.folder_sort();
+        if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
+            monitor.cancel();
+        }
+        let generation = self.0.load_generation.get();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            let replacement = if known_replacement.is_some() {
+                known_replacement
+            } else {
+                let sequence_file = file.clone();
+                gio::spawn_blocking(move || {
+                    DirectorySequence::build(&sequence_file, fallback)
+                        .ok()
+                        .and_then(|sequence| sequence.replacement_after_current_removed())
+                })
+                .await
+                .ok()
+                .flatten()
+            };
+            let result = file.delete_future(glib::Priority::DEFAULT).await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let this = ViewerWindow(state.clone());
+            if let Err(error) = result {
+                state.deletion_running.set(false);
+                state
+                    .toasts
+                    .add_toast(adw::Toast::new(&format!("Could not delete image: {error}")));
+                this.monitor_directory();
+                return;
+            }
+            if state.load_generation.get() != generation
+                || !files_equal(&state.current_file.borrow(), &Some(file))
+            {
+                state.deletion_running.set(false);
+                this.monitor_directory();
+                return;
+            }
+            if let Some(document) = state.document.borrow_mut().as_mut() {
+                document.restore_original();
+            }
+            state.deletion_running.set(false);
+            state.toasts.add_toast(adw::Toast::new("Image deleted"));
+            if let Some(replacement) = replacement {
+                this.load(replacement);
+            } else {
+                state.close_approved.set(true);
+                state.window.close();
+            }
+        });
+    }
+
     fn fit(&self, fill: bool) {
         let Some(texture) = self.0.canvas.texture() else {
             return;
@@ -3212,15 +3406,78 @@ impl ViewerWindow {
 
     fn install_gestures(&self) {
         let zoom = gtk::GestureZoom::new();
-        let start_zoom = Rc::new(Cell::new(1.0));
+        let zoom_anchor = Rc::new(Cell::new(None::<ZoomGestureAnchor>));
+        let zoom_adjustment_target = Rc::new(Cell::new(None::<(f64, f64)>));
+        self.0.scrolled.hadjustment().connect_changed({
+            let zoom_adjustment_target = zoom_adjustment_target.clone();
+            move |adjustment| {
+                if let Some((target, _)) = zoom_adjustment_target.get() {
+                    adjustment.set_value(target);
+                }
+            }
+        });
+        self.0.scrolled.vadjustment().connect_changed({
+            let zoom_adjustment_target = zoom_adjustment_target.clone();
+            move |adjustment| {
+                if let Some((_, target)) = zoom_adjustment_target.get() {
+                    adjustment.set_value(target);
+                }
+            }
+        });
         zoom.connect_begin({
-            let canvas = self.0.canvas.clone();
-            let start_zoom = start_zoom.clone();
-            move |_, _| start_zoom.set(canvas.zoom())
+            let this = self.clone();
+            let zoom_anchor = zoom_anchor.clone();
+            move |gesture, _| {
+                let horizontal = this.0.scrolled.hadjustment();
+                let vertical = this.0.scrolled.vadjustment();
+                let (content_x, content_y) = gesture.bounding_box_center().unwrap_or((
+                    horizontal.value() + horizontal.page_size() / 2.0,
+                    vertical.value() + vertical.page_size() / 2.0,
+                ));
+                zoom_anchor.set(Some(ZoomGestureAnchor {
+                    start_zoom: this.0.canvas.zoom(),
+                    content_x,
+                    content_y,
+                    horizontal_value: horizontal.value(),
+                    vertical_value: vertical.value(),
+                }));
+            }
         });
         zoom.connect_scale_changed({
             let this = self.clone();
-            move |_, scale| this.set_zoom(start_zoom.get() * scale)
+            let zoom_anchor = zoom_anchor.clone();
+            let zoom_adjustment_target = zoom_adjustment_target.clone();
+            move |_, scale| {
+                let Some(anchor) = zoom_anchor.get() else {
+                    return;
+                };
+                let target_zoom = (anchor.start_zoom * scale).clamp(0.01, 64.0);
+                let applied_factor = target_zoom / anchor.start_zoom;
+                let horizontal_target = anchored_adjustment_value(
+                    anchor.horizontal_value,
+                    anchor.content_x,
+                    applied_factor,
+                );
+                let vertical_target = anchored_adjustment_value(
+                    anchor.vertical_value,
+                    anchor.content_y,
+                    applied_factor,
+                );
+                zoom_adjustment_target.set(Some((horizontal_target, vertical_target)));
+                this.set_zoom(target_zoom);
+                let horizontal = this.0.scrolled.hadjustment();
+                let vertical = this.0.scrolled.vadjustment();
+                horizontal.set_value(horizontal_target);
+                vertical.set_value(vertical_target);
+            }
+        });
+        zoom.connect_end({
+            let zoom_adjustment_target = zoom_adjustment_target.clone();
+            move |_, _| zoom_adjustment_target.set(None)
+        });
+        zoom.connect_cancel({
+            let zoom_adjustment_target = zoom_adjustment_target.clone();
+            move |_, _| zoom_adjustment_target.set(None)
         });
         self.0.canvas.add_controller(zoom);
 
@@ -3244,6 +3501,100 @@ impl ViewerWindow {
             }
         });
         self.0.canvas.add_controller(scroll);
+
+        let measurement_motion = gtk::EventControllerMotion::new();
+        measurement_motion.connect_motion({
+            let this = self.clone();
+            move |_, x, y| {
+                if !this.0.measurement_button.is_active() {
+                    return;
+                }
+                this.0
+                    .canvas
+                    .set_measurement_cursor(this.0.canvas.normalized_at(x, y));
+                this.0.canvas.set_cursor_from_name(Some("none"));
+            }
+        });
+        measurement_motion.connect_leave({
+            let this = self.clone();
+            move |_| {
+                if this.0.measurement_button.is_active() {
+                    this.0.canvas.set_measurement_cursor(None);
+                }
+            }
+        });
+        self.0.canvas.add_controller(measurement_motion);
+
+        let measurement = gtk::GestureDrag::new();
+        measurement.set_button(1);
+        measurement.connect_drag_begin({
+            let this = self.clone();
+            move |gesture, x, y| {
+                if !this.0.measurement_button.is_active() {
+                    return;
+                }
+                let Some(start) = this.0.canvas.pixel_at(x, y) else {
+                    return;
+                };
+                let Some(image_dimensions) = this
+                    .0
+                    .rendered
+                    .borrow()
+                    .as_ref()
+                    .map(image::GenericImageView::dimensions)
+                else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let drag = SelectionDrag {
+                    start,
+                    current: start,
+                    start_screen: (x, y),
+                    image_dimensions,
+                };
+                this.0.measurement_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_measurement_overlay(selection_overlay(drag));
+            }
+        });
+        measurement.connect_drag_update({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.measurement_drag.get() else {
+                    return;
+                };
+                let Some(current) = this.0.canvas.pixel_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) else {
+                    return;
+                };
+                drag.current = current;
+                this.0.measurement_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_measurement_overlay(selection_overlay(drag));
+            }
+        });
+        measurement.connect_drag_end({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.measurement_drag.take() else {
+                    return;
+                };
+                if let Some(current) = this.0.canvas.pixel_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) {
+                    drag.current = current;
+                }
+                this.0
+                    .canvas
+                    .set_measurement_overlay(selection_overlay(drag));
+            }
+        });
+        self.0.canvas.add_controller(measurement);
 
         let selection = gtk::GestureDrag::new();
         selection.set_button(1);
@@ -3336,7 +3687,7 @@ impl ViewerWindow {
         edit_cursor.connect_leave({
             let this = self.clone();
             move |_| {
-                let cursor = if this.0.lens_active.get() {
+                let cursor = if this.0.lens_active.get() || this.0.measurement_button.is_active() {
                     Some("none")
                 } else if this.0.selection_button.is_active() {
                     Some("crosshair")
@@ -3690,9 +4041,14 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     animation_controls.append(&next_frame);
     let previous = button("go-previous-symbolic", "Previous Image", "win.previous");
     let next = button("go-next-symbolic", "Next Image", "win.next");
+    let scale_button = toggle_button("view-fullscreen-symbolic", "Scale image");
     let selection_button = toggle_button(
         "edit-select-all-symbolic",
         "Select and Copy — drag a rectangle or click an object",
+    );
+    let measurement_button = toggle_button(
+        "ruler-measure-symbolic",
+        "Measure pixels — click or drag a rectangle",
     );
     let pencil_button = toggle_button("xsi-edit-symbolic", "Toggle Pencil");
     let lens_button = toggle_button("edit-find-symbolic", "Toggle 4× Lens");
@@ -3709,19 +4065,18 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     header.pack_end(&menu_button());
     header.pack_end(&button("media-floppy-symbolic", "Save As", "win.save-as"));
     header.pack_end(&edit_button);
+    header.pack_end(&scale_button);
+    header.pack_end(&measurement_button);
     header.pack_end(&selection_button);
     header.pack_end(&color_button);
     header.pack_end(&pencil_button);
     header.pack_end(&lens_button);
-    header.pack_end(&button(
-        "view-dual-symbolic",
-        "Compare Images",
-        "win.compare",
-    ));
     HeaderWidgets {
         header,
         animation_controls,
         animation_play_button: play,
+        scale_button,
+        measurement_button,
         selection_button,
         pencil_button,
         lens_button,
@@ -3750,6 +4105,7 @@ fn menu_button() -> gtk::MenuButton {
     menu.append(Some("Open…"), Some("win.open"));
     menu.append(Some("Save"), Some("win.save"));
     menu.append(Some("Save As…"), Some("win.save-as"));
+    menu.append(Some("Compare Images…"), Some("win.compare"));
     menu.append(Some("Image Properties"), Some("win.properties"));
     menu.append(Some("Preferences"), Some("win.preferences"));
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
@@ -3983,6 +4339,18 @@ mod tests {
             source_zoom * f64::from(source_width),
             preview_zoom * f64::from(target_width)
         );
+    }
+
+    #[test]
+    fn anchored_zoom_keeps_the_content_point_at_the_same_viewport_position() {
+        let old_adjustment = 320.0;
+        let content_position = 500.0;
+        let factor = 1.75;
+
+        let new_adjustment = anchored_adjustment_value(old_adjustment, content_position, factor);
+
+        assert_eq!(content_position - old_adjustment, 180.0);
+        assert_eq!(content_position * factor - new_adjustment, 180.0);
     }
 
     #[test]

@@ -18,3 +18,7 @@ install_data(
   'icons/hicolor/scalable/apps/io.github.mendrik.Diorama.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
 )
+install_data(
+  'icons/hicolor/scalable/actions/ruler-measure-symbolic.svg',
+  install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'actions',
+)

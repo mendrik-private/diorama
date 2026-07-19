@@ -85,6 +85,8 @@ mod imp {
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
         pub crop_overlay: RefCell<Option<CropOverlay>>,
+        pub measurement_overlay: Cell<Option<CropOverlay>>,
+        pub measurement_cursor: Cell<Option<(f32, f32)>>,
         pub(super) mask_flash: RefCell<Option<MaskFlash>>,
     }
 
@@ -147,7 +149,25 @@ mod imp {
                     ZoomFilter::Soft => gtk::gsk::ScalingFilter::Linear,
                     ZoomFilter::Hard => gtk::gsk::ScalingFilter::Nearest,
                 };
-                snapshot.append_scaled_texture(texture, filter, &image_bounds);
+                let measurement = self.measurement_overlay.get();
+                let measurement_cursor = self.measurement_cursor.get();
+                if measurement.is_some() || measurement_cursor.is_some() {
+                    snapshot.push_blend(gtk::gsk::BlendMode::Difference);
+                    snapshot.append_scaled_texture(texture, filter, &image_bounds);
+                    snapshot.pop();
+                    draw_measurement_layer(
+                        snapshot,
+                        &object,
+                        bounds,
+                        image_bounds,
+                        measurement,
+                        measurement_cursor,
+                        self.preview_scale.get(),
+                    );
+                    snapshot.pop();
+                } else {
+                    snapshot.append_scaled_texture(texture, filter, &image_bounds);
+                }
             }
             if let Some(lens) = self.lens.borrow().as_ref() {
                 draw_lens(snapshot, bounds, lens);
@@ -271,6 +291,106 @@ mod imp {
             gtk::gsk::ScalingFilter::Nearest,
             &overlay_rect(bounds, &flash.bounds, preview_scale),
         );
+    }
+
+    fn draw_measurement_layer(
+        snapshot: &gtk::Snapshot,
+        canvas: &super::ImageCanvas,
+        bounds: gtk::graphene::Rect,
+        image_bounds: gtk::graphene::Rect,
+        measurement: Option<CropOverlay>,
+        cursor: Option<(f32, f32)>,
+        preview_scale: f32,
+    ) {
+        let white = gdk::RGBA::WHITE;
+        if let Some((normalized_x, normalized_y)) = cursor {
+            let x = image_bounds.x() + normalized_x.clamp(0.0, 1.0) * image_bounds.width();
+            let y = image_bounds.y() + normalized_y.clamp(0.0, 1.0) * image_bounds.height();
+            snapshot.append_color(
+                &white,
+                &gtk::graphene::Rect::new(x - 0.5, image_bounds.y(), 1.0, image_bounds.height()),
+            );
+            snapshot.append_color(
+                &white,
+                &gtk::graphene::Rect::new(image_bounds.x(), y - 0.5, image_bounds.width(), 1.0),
+            );
+        }
+        let Some(measurement) = measurement else {
+            return;
+        };
+        let rect = overlay_rect(bounds, &measurement, preview_scale);
+        let rounded = gtk::gsk::RoundedRect::from_rect(rect, 0.0);
+        snapshot.append_border(&rounded, &[1.0; 4], &[white; 4]);
+        let (width_label, height_label) = measurement_labels(measurement);
+        append_measurement_label(
+            snapshot,
+            canvas,
+            &width_label,
+            rect.x() + rect.width() / 2.0,
+            rect.y() - 3.0,
+            true,
+            image_bounds,
+        );
+        append_measurement_label(
+            snapshot,
+            canvas,
+            &height_label,
+            rect.x() + rect.width() + 4.0,
+            rect.y() + rect.height() / 2.0,
+            false,
+            image_bounds,
+        );
+    }
+
+    fn append_measurement_label(
+        snapshot: &gtk::Snapshot,
+        canvas: &super::ImageCanvas,
+        text: &str,
+        anchor_x: f32,
+        anchor_y: f32,
+        above: bool,
+        image_bounds: gtk::graphene::Rect,
+    ) {
+        let layout = canvas.create_pango_layout(Some(text));
+        layout.set_font_description(Some(&gtk::pango::FontDescription::from_string("Sans 9")));
+        let (width, height) = layout.pixel_size();
+        let width = width as f32;
+        let height = height as f32;
+        let x = if above {
+            anchor_x - width / 2.0
+        } else if anchor_x + width <= image_bounds.x() + image_bounds.width() {
+            anchor_x
+        } else {
+            anchor_x - width - 8.0
+        }
+        .clamp(
+            image_bounds.x(),
+            (image_bounds.x() + image_bounds.width() - width).max(image_bounds.x()),
+        );
+        let y = if above {
+            if anchor_y - height >= image_bounds.y() {
+                anchor_y - height
+            } else {
+                anchor_y + 6.0
+            }
+        } else {
+            anchor_y - height / 2.0
+        }
+        .clamp(
+            image_bounds.y(),
+            (image_bounds.y() + image_bounds.height() - height).max(image_bounds.y()),
+        );
+        snapshot.save();
+        snapshot.translate(&gtk::graphene::Point::new(x, y));
+        snapshot.append_layout(&layout, &gdk::RGBA::WHITE);
+        snapshot.restore();
+    }
+
+    pub(super) fn measurement_labels(measurement: CropOverlay) -> (String, String) {
+        (
+            format!("W {} px", measurement.width),
+            format!("H {} px", measurement.height),
+        )
     }
 
     fn overlay_rect(
@@ -499,6 +619,16 @@ impl ImageCanvas {
 
     pub fn set_crop_overlay(&self, overlay: Option<CropOverlay>) {
         self.imp().crop_overlay.replace(overlay);
+        self.queue_draw();
+    }
+
+    pub fn set_measurement_overlay(&self, overlay: Option<CropOverlay>) {
+        self.imp().measurement_overlay.set(overlay);
+        self.queue_draw();
+    }
+
+    pub fn set_measurement_cursor(&self, cursor: Option<(f32, f32)>) {
+        self.imp().measurement_cursor.set(cursor);
         self.queue_draw();
     }
 
@@ -779,5 +909,22 @@ mod tests {
         assert_eq!(fitted.y(), 0.0);
         assert_eq!(fitted.width(), 80.0);
         assert_eq!(fitted.height(), 120.0);
+    }
+
+    #[test]
+    fn measurement_labels_report_source_pixel_dimensions() {
+        let measurement = CropOverlay {
+            x: 10,
+            y: 20,
+            width: 31,
+            height: 17,
+            image_width: 100,
+            image_height: 80,
+        };
+
+        assert_eq!(
+            imp::measurement_labels(measurement),
+            ("W 31 px".to_owned(), "H 17 px".to_owned())
+        );
     }
 }

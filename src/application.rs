@@ -54,6 +54,7 @@ fn install_accelerators(application: &adw::Application) {
         ("win.toggle-filter", &["x"]),
         ("win.previous", &["Left", "Page_Up"]),
         ("win.next", &["Right", "Page_Down"]),
+        ("win.delete-file", &["Delete"]),
         ("win.rotate-clockwise", &["r"]),
         ("win.rotate-counterclockwise", &["<Shift>r"]),
         ("win.flip-horizontal", &["h"]),
