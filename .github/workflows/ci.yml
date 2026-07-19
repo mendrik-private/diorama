@@ -31,6 +31,14 @@ jobs:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Use development application ID
+        run: |
+          sed -i \
+            's/"app-id": "io.github.mendrik.Diorama"/"app-id": "io.github.mendrik.Diorama.Devel"/' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+          grep -Fq '"app-id": "io.github.mendrik.Diorama.Devel"' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+
       - name: Build and test Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
         with:

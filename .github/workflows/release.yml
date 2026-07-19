@@ -34,13 +34,37 @@ jobs:
           grep -Fq "<release version=\"${package_version}\"" \
             data/io.github.mendrik.Diorama.metainfo.xml.in
 
-      - name: Build and test Flatpak
+      - name: Use development application ID
+        run: |
+          sed -i \
+            's/"app-id": "io.github.mendrik.Diorama"/"app-id": "io.github.mendrik.Diorama.Devel"/' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+          grep -Fq '"app-id": "io.github.mendrik.Diorama.Devel"' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+
+      - name: Build and test development Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
+        with:
+          manifest-path: build-aux/io.github.mendrik.Diorama.Devel.json
+          build-bundle: false
+          run-tests: true
+          upload-artifact: false
+          cache: false
+
+      - name: Restore release application ID
+        run: |
+          sed -i \
+            's/"app-id": "io.github.mendrik.Diorama.Devel"/"app-id": "io.github.mendrik.Diorama"/' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+          grep -Fq '"app-id": "io.github.mendrik.Diorama"' \
+            build-aux/io.github.mendrik.Diorama.Devel.json
+
+      - name: Build release Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
         with:
           bundle: Diorama.flatpak
           manifest-path: build-aux/io.github.mendrik.Diorama.Devel.json
           branch: stable
-          run-tests: true
           upload-artifact: false
           cache-key: flatpak-release-${{ hashFiles('Cargo.lock', 'build-aux/io.github.mendrik.Diorama.Devel.json', 'build-aux/cargo-sources.json') }}
 
