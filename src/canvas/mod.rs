@@ -22,6 +22,15 @@ pub enum Background {
     Black,
 }
 
+fn normalized_pixel_center(pixel: (u32, u32), image_dimensions: (u32, u32)) -> (f32, f32) {
+    let width = image_dimensions.0.max(1);
+    let height = image_dimensions.1.max(1);
+    (
+        (pixel.0.min(width - 1) as f32 + 0.5) / width as f32,
+        (pixel.1.min(height - 1) as f32 + 0.5) / height as f32,
+    )
+}
+
 fn opposite_grayscale_luminance(image: &image::RgbaImage) -> f32 {
     let (weighted_luminance, alpha_sum) = image.pixels().fold((0.0_f64, 0.0_f64), |sum, pixel| {
         let alpha = f64::from(pixel[3]) / 255.0;
@@ -728,6 +737,15 @@ impl ImageCanvas {
         ))
     }
 
+    pub fn snapped_normalized_at(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let texture = self.texture()?;
+        let pixel = self.pixel_at(x, y)?;
+        Some(normalized_pixel_center(
+            pixel,
+            (texture.width() as u32, texture.height() as u32),
+        ))
+    }
+
     pub fn set_accessible_label(&self, label: &str) {
         self.update_property(&[gtk::accessible::Property::Label(label)]);
     }
@@ -926,5 +944,18 @@ mod tests {
             imp::measurement_labels(measurement),
             ("W 31 px".to_owned(), "H 17 px".to_owned())
         );
+    }
+
+    #[test]
+    fn normalized_pixel_center_snaps_first_interior_and_last_pixels() {
+        assert_eq!(normalized_pixel_center((0, 0), (4, 8)), (0.125, 0.0625));
+        assert_eq!(normalized_pixel_center((2, 3), (4, 8)), (0.625, 0.4375));
+        assert_eq!(normalized_pixel_center((3, 7), (4, 8)), (0.875, 0.9375));
+    }
+
+    #[test]
+    fn normalized_pixel_center_clamps_to_valid_pixel_bounds() {
+        assert_eq!(normalized_pixel_center((9, 9), (1, 1)), (0.5, 0.5));
+        assert_eq!(normalized_pixel_center((9, 9), (0, 0)), (0.5, 0.5));
     }
 }

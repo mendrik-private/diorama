@@ -3511,7 +3511,7 @@ impl ViewerWindow {
                 }
                 this.0
                     .canvas
-                    .set_measurement_cursor(this.0.canvas.normalized_at(x, y));
+                    .set_measurement_cursor(this.0.canvas.snapped_normalized_at(x, y));
                 this.0.canvas.set_cursor_from_name(Some("none"));
             }
         });
