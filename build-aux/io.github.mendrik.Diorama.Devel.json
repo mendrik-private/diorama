@@ -3,6 +3,9 @@
   "runtime": "org.gnome.Platform",
   "runtime-version": "50",
   "sdk": "org.gnome.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
   "command": "diorama",
   "finish-args": [
     "--share=ipc",
@@ -16,13 +19,25 @@
       "name": "diorama",
       "buildsystem": "meson",
       "build-options": {
-        "append-path": "/usr/lib/sdk/rust-stable/bin"
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+          "CARGO_HOME": "/run/build/diorama/cargo",
+          "CARGO_NET_OFFLINE": "true"
+        }
       },
       "sources": [
         {
           "type": "dir",
-          "path": ".."
-        }
+          "path": "..",
+          "skip": [
+            ".git",
+            ".github",
+            ".flatpak-builder",
+            "build",
+            "target"
+          ]
+        },
+        "cargo-sources.json"
       ]
     }
   ]

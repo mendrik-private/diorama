@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release Flatpak
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify release versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          package_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$package_version"
+          test "v${package_version}" = "$GITHUB_REF_NAME"
+          grep -Fq "version: '${package_version}'" meson.build
+          grep -Fq "<release version=\"${package_version}\"" \
+            data/io.github.mendrik.Diorama.metainfo.xml.in
+
+      - name: Build and test Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
+        with:
+          bundle: Diorama.flatpak
+          manifest-path: build-aux/io.github.mendrik.Diorama.Devel.json
+          branch: stable
+          run-tests: true
+          upload-artifact: false
+          cache-key: flatpak-release-${{ hashFiles('Cargo.lock', 'build-aux/io.github.mendrik.Diorama.Devel.json', 'build-aux/cargo-sources.json') }}
+
+      - name: Create checksum
+        run: sha256sum Diorama.flatpak > Diorama.flatpak.sha256
+
+      - name: Store release artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: diorama-flatpak
+          path: |
+            Diorama.flatpak
+            Diorama.flatpak.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: diorama-flatpak
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/Diorama.flatpak \
+            dist/Diorama.flatpak.sha256 \
+            --generate-notes \
+            --title "Diorama $GITHUB_REF_NAME" \
+            --verify-tag

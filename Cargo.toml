@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, native GNOME image viewer"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [dependencies]
 fast_image_resize = "6.0.0"
