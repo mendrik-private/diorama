@@ -412,7 +412,7 @@ impl ViewerWindow {
         toasts.set_child(Some(&canvas_overlay));
 
         let title = adw::WindowTitle::builder()
-            .title("Image Viewer")
+            .title("Diorama")
             .subtitle("Open an image to begin")
             .build();
         let header_widgets = build_header(&title);
@@ -422,7 +422,7 @@ impl ViewerWindow {
         let (width, height) = settings.window_size();
         let window = adw::ApplicationWindow::builder()
             .application(application)
-            .title("Image Viewer")
+            .title("Diorama")
             .default_width(width)
             .default_height(height)
             .content(&content)
@@ -929,7 +929,7 @@ impl ViewerWindow {
             let window = self.0.window.clone();
             move || {
                 adw::AboutDialog::builder()
-                    .application_name("Image Viewer")
+                    .application_name("Diorama")
                     .application_icon(crate::APP_ID)
                     .version(env!("CARGO_PKG_VERSION"))
                     .developer_name("Diorama contributors")
@@ -3421,7 +3421,7 @@ fn menu_button() -> gtk::MenuButton {
     menu.append(Some("Image Properties"), Some("win.properties"));
     menu.append(Some("Preferences"), Some("win.preferences"));
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-    menu.append(Some("About Image Viewer"), Some("win.about"));
+    menu.append(Some("About Diorama"), Some("win.about"));
     gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("Main Menu")

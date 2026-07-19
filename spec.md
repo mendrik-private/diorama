@@ -2,7 +2,7 @@ Below is a development-ready specification. It interprets “soft/hard zoom” a
 
 # Application Specification: High-Performance GNOME Image Viewer
 
-**Working title:** Image Viewer
+**Working title:** Diorama
 **Platform:** Linux desktop, optimized for GNOME and Wayland
 **Implementation:** Rust, GTK 4, libadwaita
 **Document status:** Initial product and engineering specification

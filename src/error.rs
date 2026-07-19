@@ -20,7 +20,7 @@ pub enum AppError {
     InvalidCrop,
     #[error("The requested dimensions are invalid")]
     InvalidDimensions,
-    #[error("The file changed outside Image Viewer: {0}")]
+    #[error("The file changed outside Diorama: {0}")]
     ExternallyChanged(PathBuf),
     #[error("The file was deleted or moved: {0}")]
     FileMissing(PathBuf),

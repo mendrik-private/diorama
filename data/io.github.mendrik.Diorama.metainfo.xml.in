@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.mendrik.Diorama</id>
-  <name>Image Viewer</name>
+  <name>Diorama</name>
   <summary>View, compare, and edit images</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
@@ -10,4 +10,3 @@
   <content_rating type="oars-1.1" />
   <releases><release version="0.1.0" date="2026-07-17" /></releases>
 </component>
-
