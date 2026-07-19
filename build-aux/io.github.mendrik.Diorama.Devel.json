@@ -16,6 +16,24 @@
   ],
   "modules": [
     {
+      "name": "glycin-heif-codec-path",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 diorama-glycin-heif /app/libexec/diorama-glycin-heif",
+        "install -Dm644 diorama-glycin-heif.conf /app/share/glycin-loaders/2+/conf.d/diorama-glycin-heif.conf"
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "path": "diorama-glycin-heif"
+        },
+        {
+          "type": "file",
+          "path": "diorama-glycin-heif.conf"
+        }
+      ]
+    },
+    {
       "name": "onnxruntime",
       "buildsystem": "simple",
       "only-arches": [
