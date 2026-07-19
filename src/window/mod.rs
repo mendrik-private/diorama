@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupExt};
 use gio::prelude::*;
@@ -60,6 +60,14 @@ struct EditDrag {
 
 #[derive(Clone, Copy)]
 struct SelectionDrag {
+    start: (u32, u32),
+    current: (u32, u32),
+    start_screen: (f64, f64),
+    image_dimensions: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct MeasurementDrag {
     start: (u32, u32),
     current: (u32, u32),
     start_screen: (f64, f64),
@@ -172,6 +180,17 @@ fn selection_overlay(drag: SelectionDrag) -> Option<CropOverlay> {
     })
 }
 
+fn measurement_overlay(drag: MeasurementDrag) -> CropOverlay {
+    CropOverlay {
+        x: drag.start.0.min(drag.current.0),
+        y: drag.start.1.min(drag.current.1),
+        width: drag.start.0.abs_diff(drag.current.0),
+        height: drag.start.1.abs_diff(drag.current.1),
+        image_width: drag.image_dimensions.0,
+        image_height: drag.image_dimensions.1,
+    }
+}
+
 fn scaled_dimensions(width: u32, height: u32, target_width: u32) -> (u32, u32) {
     let width = width.max(1);
     let height = height.max(1);
@@ -208,6 +227,52 @@ fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32
         .margin_start(8)
         .margin_end(8)
         .build()
+}
+
+fn relative_modified_time(modified: SystemTime, now: SystemTime) -> String {
+    let (elapsed, is_past) = match now.duration_since(modified) {
+        Ok(elapsed) => (elapsed, true),
+        Err(error) => (error.duration(), false),
+    };
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return "just now".to_owned();
+    }
+
+    let (value, unit) = if seconds < 60 * 60 {
+        (seconds / 60, "minute")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "hour")
+    } else if seconds < 30 * 24 * 60 * 60 {
+        (seconds / (24 * 60 * 60), "day")
+    } else if seconds < 365 * 24 * 60 * 60 {
+        (seconds / (30 * 24 * 60 * 60), "month")
+    } else {
+        (seconds / (365 * 24 * 60 * 60), "year")
+    };
+    let unit = if value == 1 {
+        unit.to_owned()
+    } else {
+        format!("{unit}s")
+    };
+    if is_past {
+        format!("{value} {unit} ago")
+    } else {
+        format!("in {value} {unit}")
+    }
+}
+
+fn image_subtitle(
+    dimensions: (u32, u32),
+    zoom: f64,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+) -> String {
+    let details = format!("{} × {} · {:.0}%", dimensions.0, dimensions.1, zoom * 100.0);
+    match modified {
+        Some(modified) => format!("{details} · {}", relative_modified_time(modified, now)),
+        None => details,
+    }
 }
 
 fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
@@ -263,14 +328,15 @@ struct WindowState {
     render_generation: Cell<u64>,
     document: RefCell<Option<Document>>,
     rendered: RefCell<Option<image::RgbaImage>>,
-    source_modified: RefCell<Option<std::time::SystemTime>>,
+    source_modified: RefCell<Option<SystemTime>>,
+    subtitle_ready: Cell<bool>,
     close_approved: Cell<bool>,
     pencil_active: Cell<bool>,
     pencil_points: RefCell<Vec<BrushPoint>>,
     pencil_start: Cell<(f64, f64)>,
     pencil_color: Cell<[u8; 4]>,
     measurement_button: gtk::ToggleButton,
-    measurement_drag: Cell<Option<SelectionDrag>>,
+    measurement_drag: Cell<Option<MeasurementDrag>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     object_detector: Arc<Mutex<Option<ObjectDetector>>>,
@@ -501,6 +567,7 @@ impl ViewerWindow {
             document: RefCell::new(None),
             rendered: RefCell::new(None),
             source_modified: RefCell::new(None),
+            subtitle_ready: Cell::new(false),
             close_approved: Cell::new(false),
             pencil_active: Cell::new(false),
             pencil_points: RefCell::new(Vec::new()),
@@ -570,6 +637,7 @@ impl ViewerWindow {
         this.install_minimap();
         this.connect_single_image_lens();
         this.install_state_persistence();
+        this.install_subtitle_clock();
         if let Some(file) = file {
             this.load(file);
         }
@@ -629,6 +697,7 @@ impl ViewerWindow {
         }
         self.0.document.replace(None);
         self.0.rendered.replace(None);
+        self.0.subtitle_ready.set(false);
         self.0.source_modified.replace(
             file.path()
                 .and_then(|path| std::fs::metadata(path).ok())
@@ -660,11 +729,9 @@ impl ViewerWindow {
             }
             match preview {
                 Ok(preview) => {
+                    state.subtitle_ready.set(true);
                     state.canvas.set_texture(Some(&preview.texture));
                     ViewerWindow(state.clone()).fit(false);
-                    state
-                        .title
-                        .set_subtitle(&format!("{} × {} · 100%", preview.width, preview.height));
                     if preview.animation_delay.is_some() {
                         ViewerWindow(state.clone()).start_animation(file.clone(), generation);
                     }
@@ -1130,6 +1197,7 @@ impl ViewerWindow {
         {
             self.0.canvas.set_texture(Some(&texture));
             self.update_minimap();
+            self.update_subtitle();
         }
     }
 
@@ -1209,6 +1277,7 @@ impl ViewerWindow {
         self.0
             .zoom_label
             .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
+        self.update_subtitle();
         self.update_minimap();
     }
 
@@ -1618,7 +1687,6 @@ impl ViewerWindow {
                     if !matches_live_document {
                         return;
                     }
-                    let dimensions = rendered.pixels.dimensions();
                     match texture_from_rgba(&rendered.pixels) {
                         Ok(texture) => {
                             state
@@ -1627,12 +1695,7 @@ impl ViewerWindow {
                             state.canvas.set_texture(Some(&texture));
                             state.rendered.replace(Some(rendered.pixels));
                             ViewerWindow(state.clone()).update_minimap();
-                            state.title.set_subtitle(&format!(
-                                "{} × {} · {:.0}%",
-                                dimensions.0,
-                                dimensions.1,
-                                state.canvas.zoom() * 100.0
-                            ));
+                            ViewerWindow(state.clone()).update_subtitle();
                         }
                         Err(error) => state.toasts.add_toast(adw::Toast::new(&error)),
                     }
@@ -1664,6 +1727,35 @@ impl ViewerWindow {
             title.push_str(" •");
         }
         self.0.title.set_title(&title);
+        self.update_subtitle();
+    }
+
+    fn update_subtitle(&self) {
+        if !self.0.subtitle_ready.get() {
+            return;
+        }
+        let Some(texture) = self.0.canvas.texture() else {
+            return;
+        };
+        let dimensions = (texture.width() as u32, texture.height() as u32);
+        let modified = *self.0.source_modified.borrow();
+        self.0.title.set_subtitle(&image_subtitle(
+            dimensions,
+            self.0.canvas.zoom(),
+            modified,
+            SystemTime::now(),
+        ));
+    }
+
+    fn install_subtitle_clock(&self) {
+        let weak = Rc::downgrade(&self.0);
+        glib::timeout_add_local(Duration::from_secs(30), move || {
+            let Some(state) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            ViewerWindow(state).update_subtitle();
+            glib::ControlFlow::Continue
+        });
     }
 
     fn save(&self, force_dialog: bool) {
@@ -2452,7 +2544,9 @@ impl ViewerWindow {
                 state.animation_index.set(next);
                 if let Some(frame) = state.animation_frames.borrow().get(next) {
                     state.canvas.set_texture(Some(&frame.texture));
-                    ViewerWindow(state.clone()).update_minimap();
+                    let window = ViewerWindow(state.clone());
+                    window.update_minimap();
+                    window.update_subtitle();
                 }
             }
         });
@@ -2474,6 +2568,7 @@ impl ViewerWindow {
         self.0.animation_index.set(next);
         self.0.canvas.set_texture(Some(&frames[next].texture));
         self.update_minimap();
+        self.update_subtitle();
     }
 
     fn toggle_animation(&self) {
@@ -3106,6 +3201,7 @@ impl ViewerWindow {
         self.0
             .zoom_label
             .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
+        self.update_subtitle();
         self.0.settings.set_last_zoom(self.0.canvas.zoom());
         if self.0.compare_locked.get()
             && let Some(compare) = self.0.compare_canvas.borrow().as_ref()
@@ -3533,7 +3629,7 @@ impl ViewerWindow {
                 if !this.0.measurement_button.is_active() {
                     return;
                 }
-                let Some(start) = this.0.canvas.pixel_at(x, y) else {
+                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
                     return;
                 };
                 let Some(image_dimensions) = this
@@ -3546,7 +3642,7 @@ impl ViewerWindow {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                let drag = SelectionDrag {
+                let drag = MeasurementDrag {
                     start,
                     current: start,
                     start_screen: (x, y),
@@ -3555,7 +3651,7 @@ impl ViewerWindow {
                 this.0.measurement_drag.set(Some(drag));
                 this.0
                     .canvas
-                    .set_measurement_overlay(selection_overlay(drag));
+                    .set_measurement_overlay(Some(measurement_overlay(drag)));
             }
         });
         measurement.connect_drag_update({
@@ -3564,7 +3660,7 @@ impl ViewerWindow {
                 let Some(mut drag) = this.0.measurement_drag.get() else {
                     return;
                 };
-                let Some(current) = this.0.canvas.pixel_at(
+                let Some(current) = this.0.canvas.pixel_boundary_at(
                     drag.start_screen.0 + offset_x,
                     drag.start_screen.1 + offset_y,
                 ) else {
@@ -3574,7 +3670,7 @@ impl ViewerWindow {
                 this.0.measurement_drag.set(Some(drag));
                 this.0
                     .canvas
-                    .set_measurement_overlay(selection_overlay(drag));
+                    .set_measurement_overlay(Some(measurement_overlay(drag)));
             }
         });
         measurement.connect_drag_end({
@@ -3583,7 +3679,7 @@ impl ViewerWindow {
                 let Some(mut drag) = this.0.measurement_drag.take() else {
                     return;
                 };
-                if let Some(current) = this.0.canvas.pixel_at(
+                if let Some(current) = this.0.canvas.pixel_boundary_at(
                     drag.start_screen.0 + offset_x,
                     drag.start_screen.1 + offset_y,
                 ) {
@@ -3591,7 +3687,7 @@ impl ViewerWindow {
                 }
                 this.0
                     .canvas
-                    .set_measurement_overlay(selection_overlay(drag));
+                    .set_measurement_overlay(Some(measurement_overlay(drag)));
             }
         });
         self.0.canvas.add_controller(measurement);
@@ -4253,6 +4349,59 @@ mod tests {
     }
 
     #[test]
+    fn modified_time_is_formatted_relative_to_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(30), now),
+            "just now"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(60), now),
+            "1 minute ago"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(3 * 60), now),
+            "3 minutes ago"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(2 * 60 * 60), now),
+            "2 hours ago"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(2 * 24 * 60 * 60), now),
+            "2 days ago"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(60 * 24 * 60 * 60), now),
+            "2 months ago"
+        );
+        assert_eq!(
+            relative_modified_time(now - Duration::from_secs(2 * 365 * 24 * 60 * 60), now),
+            "2 years ago"
+        );
+        assert_eq!(
+            relative_modified_time(now + Duration::from_secs(3 * 60), now),
+            "in 3 minutes"
+        );
+    }
+
+    #[test]
+    fn image_subtitle_places_modified_time_after_zoom() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let modified = now - Duration::from_secs(3 * 60);
+
+        assert_eq!(
+            image_subtitle((1920, 1080), 1.25, Some(modified), now),
+            "1920 × 1080 · 125% · 3 minutes ago"
+        );
+        assert_eq!(
+            image_subtitle((640, 480), 0.5, None, now),
+            "640 × 480 · 50%"
+        );
+    }
+
+    #[test]
     fn compare_zoom_keeps_each_image_at_its_relative_fit_level() {
         let primary_fit = panel_fit_zoom((800, 600), (1600, 900));
         let comparison_fit = panel_fit_zoom((400, 300), (400, 200));
@@ -4351,6 +4500,36 @@ mod tests {
 
         assert_eq!(content_position - old_adjustment, 180.0);
         assert_eq!(content_position * factor - new_adjustment, 180.0);
+    }
+
+    #[test]
+    fn measurement_overlay_uses_grid_intersections_in_both_drag_directions() {
+        let forward = measurement_overlay(MeasurementDrag {
+            start: (2, 3),
+            current: (8, 9),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (16, 12),
+        });
+        let reverse = measurement_overlay(MeasurementDrag {
+            start: (8, 9),
+            current: (2, 3),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (16, 12),
+        });
+
+        assert_eq!(
+            (forward.x, forward.y, forward.width, forward.height),
+            (2, 3, 6, 6)
+        );
+        assert_eq!(
+            (reverse.x, reverse.y, reverse.width, reverse.height),
+            (2, 3, 6, 6)
+        );
+        assert_eq!(forward.x as f32 / forward.image_width as f32, 2.0 / 16.0);
+        assert_eq!(
+            (forward.x + forward.width) as f32 / forward.image_width as f32,
+            8.0 / 16.0
+        );
     }
 
     #[test]

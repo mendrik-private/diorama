@@ -22,12 +22,30 @@ pub enum Background {
     Black,
 }
 
-fn normalized_pixel_center(pixel: (u32, u32), image_dimensions: (u32, u32)) -> (f32, f32) {
-    let width = image_dimensions.0.max(1);
-    let height = image_dimensions.1.max(1);
+fn normalized_pixel_boundary(boundary: (u32, u32), image_dimensions: (u32, u32)) -> (f32, f32) {
     (
-        (pixel.0.min(width - 1) as f32 + 0.5) / width as f32,
-        (pixel.1.min(height - 1) as f32 + 0.5) / height as f32,
+        if image_dimensions.0 == 0 {
+            0.0
+        } else {
+            boundary.0.min(image_dimensions.0) as f32 / image_dimensions.0 as f32
+        },
+        if image_dimensions.1 == 0 {
+            0.0
+        } else {
+            boundary.1.min(image_dimensions.1) as f32 / image_dimensions.1 as f32
+        },
+    )
+}
+
+fn pixel_boundary_from_normalized(
+    normalized: (f32, f32),
+    image_dimensions: (u32, u32),
+) -> (u32, u32) {
+    let width = image_dimensions.0 as f32;
+    let height = image_dimensions.1 as f32;
+    (
+        (normalized.0 * width).round().clamp(0.0, width) as u32,
+        (normalized.1 * height).round().clamp(0.0, height) as u32,
     )
 }
 
@@ -739,9 +757,18 @@ impl ImageCanvas {
 
     pub fn snapped_normalized_at(&self, x: f64, y: f64) -> Option<(f32, f32)> {
         let texture = self.texture()?;
-        let pixel = self.pixel_at(x, y)?;
-        Some(normalized_pixel_center(
-            pixel,
+        let boundary = self.pixel_boundary_at(x, y)?;
+        Some(normalized_pixel_boundary(
+            boundary,
+            (texture.width() as u32, texture.height() as u32),
+        ))
+    }
+
+    pub fn pixel_boundary_at(&self, x: f64, y: f64) -> Option<(u32, u32)> {
+        let texture = self.texture()?;
+        let normalized = self.normalized_at(x, y)?;
+        Some(pixel_boundary_from_normalized(
+            normalized,
             (texture.width() as u32, texture.height() as u32),
         ))
     }
@@ -947,15 +974,28 @@ mod tests {
     }
 
     #[test]
-    fn normalized_pixel_center_snaps_first_interior_and_last_pixels() {
-        assert_eq!(normalized_pixel_center((0, 0), (4, 8)), (0.125, 0.0625));
-        assert_eq!(normalized_pixel_center((2, 3), (4, 8)), (0.625, 0.4375));
-        assert_eq!(normalized_pixel_center((3, 7), (4, 8)), (0.875, 0.9375));
+    fn normalized_pixel_boundary_uses_the_source_grid_phase() {
+        assert_eq!(normalized_pixel_boundary((0, 0), (4, 8)), (0.0, 0.0));
+        assert_eq!(normalized_pixel_boundary((2, 3), (4, 8)), (0.5, 0.375));
+        assert_eq!(normalized_pixel_boundary((4, 8), (4, 8)), (1.0, 1.0));
     }
 
     #[test]
-    fn normalized_pixel_center_clamps_to_valid_pixel_bounds() {
-        assert_eq!(normalized_pixel_center((9, 9), (1, 1)), (0.5, 0.5));
-        assert_eq!(normalized_pixel_center((9, 9), (0, 0)), (0.5, 0.5));
+    fn normalized_pixel_boundary_clamps_to_valid_grid_bounds() {
+        assert_eq!(normalized_pixel_boundary((9, 9), (1, 1)), (1.0, 1.0));
+        assert_eq!(normalized_pixel_boundary((9, 9), (0, 0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn normalized_position_snaps_to_the_nearest_grid_intersection() {
+        assert_eq!(
+            pixel_boundary_from_normalized((0.124, 0.124), (4, 4)),
+            (0, 0)
+        );
+        assert_eq!(
+            pixel_boundary_from_normalized((0.126, 0.126), (4, 4)),
+            (1, 1)
+        );
+        assert_eq!(pixel_boundary_from_normalized((1.0, 1.0), (4, 4)), (4, 4));
     }
 }
