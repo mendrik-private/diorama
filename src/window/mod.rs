@@ -493,12 +493,14 @@ impl ViewerWindow {
         let scale_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         scale_controls.add_css_class("linked");
         scale_controls.set_visible(false);
-        scale_controls.set_halign(gtk::Align::End);
+        scale_controls.set_halign(gtk::Align::Fill);
         scale_controls.set_valign(gtk::Align::End);
+        scale_controls.set_hexpand(true);
+        scale_controls.set_margin_start(26);
         scale_controls.set_margin_end(26);
         scale_controls.set_margin_bottom(26);
         let scale_slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 2.0, 1.0);
-        scale_slider.set_width_request(260);
+        scale_slider.set_hexpand(true);
         scale_slider.set_draw_value(false);
         scale_slider.set_tooltip_text(Some("Scaled width in pixels"));
         let scale_value_label = gtk::Label::new(Some("1 px"));
@@ -4538,6 +4540,32 @@ mod tests {
         let texture = texture_from_rgba(&image).unwrap();
 
         assert_eq!(rgba_from_texture(&texture), Some(image));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn scale_controls_use_the_available_overlay_width() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ScaleLayoutTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+
+        assert_eq!(window.0.scale_controls.halign(), gtk::Align::Fill);
+        assert!(window.0.scale_controls.hexpands());
+        assert_eq!(window.0.scale_controls.margin_start(), 26);
+        assert_eq!(window.0.scale_controls.margin_end(), 26);
+        assert!(window.0.scale_slider.hexpands());
+        assert_eq!(window.0.scale_slider.width_request(), -1);
+
+        window.0.scale_controls.set_visible(true);
+        window.0.canvas_overlay.allocate(1000, 600, -1, None);
+        assert_eq!(window.0.scale_controls.width(), 948);
+        assert!(window.0.scale_slider.width() > 260);
     }
 
     #[test]

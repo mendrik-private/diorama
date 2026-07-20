@@ -12,6 +12,7 @@
     "--socket=wayland",
     "--socket=fallback-x11",
     "--device=dri",
+    "--filesystem=host",
     "--talk-name=org.freedesktop.portal.Desktop"
   ],
   "modules": [
