@@ -20,4 +20,6 @@ diorama = custom_target(
 
 subdir('data')
 
+gnome.post_install(glib_compile_schemas: true)
+
 test('cargo-tests', cargo_script, args: [meson.project_source_root(), '', 'test'])

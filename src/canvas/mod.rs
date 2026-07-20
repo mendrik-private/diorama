@@ -348,25 +348,53 @@ mod imp {
         let rect = overlay_rect(bounds, &measurement, preview_scale);
         let rounded = gtk::gsk::RoundedRect::from_rect(rect, 0.0);
         snapshot.append_border(&rounded, &[1.0; 4], &[white; 4]);
-        let (width_label, height_label) = measurement_labels(measurement);
+        let (origin_label, width_label, height_label) = measurement_labels(measurement);
+        let [origin_anchor, width_anchor, height_anchor] = measurement_label_anchors(rect);
+        append_measurement_label(
+            snapshot,
+            canvas,
+            &origin_label,
+            origin_anchor.0,
+            origin_anchor.1,
+            MeasurementLabelPlacement::InsideTopLeft,
+            image_bounds,
+        );
         append_measurement_label(
             snapshot,
             canvas,
             &width_label,
-            rect.x() + rect.width() / 2.0,
-            rect.y() - 3.0,
-            true,
+            width_anchor.0,
+            width_anchor.1,
+            MeasurementLabelPlacement::AboveCenter,
             image_bounds,
         );
         append_measurement_label(
             snapshot,
             canvas,
             &height_label,
-            rect.x() + rect.width() + 4.0,
-            rect.y() + rect.height() / 2.0,
-            false,
+            height_anchor.0,
+            height_anchor.1,
+            MeasurementLabelPlacement::RightCenter,
             image_bounds,
         );
+    }
+
+    pub(super) fn measurement_label_anchors(rect: gtk::graphene::Rect) -> [(f32, f32); 3] {
+        [
+            (rect.x(), rect.y()),
+            (rect.x() + rect.width() / 2.0, rect.y() - 3.0),
+            (
+                rect.x() + rect.width() + 4.0,
+                rect.y() + rect.height() / 2.0,
+            ),
+        ]
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MeasurementLabelPlacement {
+        InsideTopLeft,
+        AboveCenter,
+        RightCenter,
     }
 
     fn append_measurement_label(
@@ -375,7 +403,7 @@ mod imp {
         text: &str,
         anchor_x: f32,
         anchor_y: f32,
-        above: bool,
+        placement: MeasurementLabelPlacement,
         image_bounds: gtk::graphene::Rect,
     ) {
         let layout = canvas.create_pango_layout(Some(text));
@@ -383,29 +411,11 @@ mod imp {
         let (width, height) = layout.pixel_size();
         let width = width as f32;
         let height = height as f32;
-        let x = if above {
-            anchor_x - width / 2.0
-        } else if anchor_x + width <= image_bounds.x() + image_bounds.width() {
-            anchor_x
-        } else {
-            anchor_x - width - 8.0
-        }
-        .clamp(
-            image_bounds.x(),
-            (image_bounds.x() + image_bounds.width() - width).max(image_bounds.x()),
-        );
-        let y = if above {
-            if anchor_y - height >= image_bounds.y() {
-                anchor_y - height
-            } else {
-                anchor_y + 6.0
-            }
-        } else {
-            anchor_y - height / 2.0
-        }
-        .clamp(
-            image_bounds.y(),
-            (image_bounds.y() + image_bounds.height() - height).max(image_bounds.y()),
+        let (x, y) = measurement_label_position(
+            (anchor_x, anchor_y),
+            (width, height),
+            placement,
+            image_bounds,
         );
         snapshot.save();
         snapshot.translate(&gtk::graphene::Point::new(x, y));
@@ -413,8 +423,47 @@ mod imp {
         snapshot.restore();
     }
 
-    pub(super) fn measurement_labels(measurement: CropOverlay) -> (String, String) {
+    fn measurement_label_position(
+        anchor: (f32, f32),
+        label_size: (f32, f32),
+        placement: MeasurementLabelPlacement,
+        image_bounds: gtk::graphene::Rect,
+    ) -> (f32, f32) {
+        let (width, height) = label_size;
+        let (x, y) = match placement {
+            MeasurementLabelPlacement::InsideTopLeft => (anchor.0 + 4.0, anchor.1 + 4.0),
+            MeasurementLabelPlacement::AboveCenter => (
+                anchor.0 - width / 2.0,
+                if anchor.1 - height >= image_bounds.y() {
+                    anchor.1 - height
+                } else {
+                    anchor.1 + 6.0
+                },
+            ),
+            MeasurementLabelPlacement::RightCenter => {
+                let x = if anchor.0 + width <= image_bounds.x() + image_bounds.width() {
+                    anchor.0
+                } else {
+                    anchor.0 - width - 8.0
+                };
+                (x, anchor.1 - height / 2.0)
+            }
+        };
         (
+            x.clamp(
+                image_bounds.x(),
+                (image_bounds.x() + image_bounds.width() - width).max(image_bounds.x()),
+            ),
+            y.clamp(
+                image_bounds.y(),
+                (image_bounds.y() + image_bounds.height() - height).max(image_bounds.y()),
+            ),
+        )
+    }
+
+    pub(super) fn measurement_labels(measurement: CropOverlay) -> (String, String, String) {
+        (
+            format!("X {} · Y {}", measurement.x, measurement.y),
             format!("W {} px", measurement.width),
             format!("H {} px", measurement.height),
         )
@@ -957,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn measurement_labels_report_source_pixel_dimensions() {
+    fn measurement_labels_report_source_pixel_position_and_dimensions() {
         let measurement = CropOverlay {
             x: 10,
             y: 20,
@@ -969,8 +1018,24 @@ mod tests {
 
         assert_eq!(
             imp::measurement_labels(measurement),
-            ("W 31 px".to_owned(), "H 17 px".to_owned())
+            (
+                "X 10 · Y 20".to_owned(),
+                "W 31 px".to_owned(),
+                "H 17 px".to_owned()
+            )
         );
+    }
+
+    #[test]
+    fn measurement_origin_label_stays_at_the_rectangle_top_left() {
+        let narrow = gtk::graphene::Rect::new(30.0, 40.0, 50.0, 60.0);
+        let wide = gtk::graphene::Rect::new(30.0, 40.0, 200.0, 60.0);
+        let [narrow_origin, narrow_width, _] = imp::measurement_label_anchors(narrow);
+        let [wide_origin, wide_width, _] = imp::measurement_label_anchors(wide);
+
+        assert_eq!(narrow_origin, (30.0, 40.0));
+        assert_eq!(wide_origin, narrow_origin);
+        assert_ne!(wide_width, narrow_width);
     }
 
     #[test]
