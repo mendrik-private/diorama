@@ -64,12 +64,17 @@ impl DirectorySequence {
             .next_file(gio::Cancellable::NONE)
             .map_err(|error| AppError::Io(std::io::Error::other(error)))?
         {
-            if info.file_type() != gio::FileType::Regular {
+            let name = info.name();
+            let file = parent.child(&name);
+            let is_regular = info.file_type() == gio::FileType::Regular
+                || (info.file_type() == gio::FileType::SymbolicLink
+                    && file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                        == gio::FileType::Regular);
+            if !is_regular {
                 continue;
             }
-            let name = info.name();
             entries.push(Entry {
-                file: parent.child(&name),
+                file,
                 name: info.display_name().to_string(),
                 size: info.size().max(0) as u64,
                 modified: info
@@ -92,7 +97,7 @@ impl DirectorySequence {
         let current_uri = current.uri();
         let current_index = entries
             .iter()
-            .position(|file| file.uri() == current_uri)
+            .position(|file| file.equal(current))
             .ok_or_else(|| AppError::FileMissing(current_uri.into()))?;
         Ok(Self {
             entries,
@@ -144,13 +149,13 @@ impl DirectorySequence {
     }
 
     pub fn replacement_after_current_removed(&self) -> Option<gio::File> {
-        self.entries
-            .get(self.current + 1)
-            .or_else(|| {
-                self.current
-                    .checked_sub(1)
-                    .and_then(|index| self.entries.get(index))
-            })
+        self.replacements_after_current_removed().next()
+    }
+
+    pub fn replacements_after_current_removed(&self) -> impl Iterator<Item = gio::File> + '_ {
+        self.entries[self.current + 1..]
+            .iter()
+            .chain(self.entries[..self.current].iter().rev())
             .cloned()
     }
 }
@@ -398,5 +403,81 @@ mod tests {
             Some("b.png".into())
         );
         assert!(single.replacement_after_current_removed().is_none());
+    }
+
+    #[test]
+    fn replacement_candidates_continue_past_other_removed_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for name in ["a.png", "b.png", "c.png", "d.png"] {
+            std::fs::write(directory.path().join(name), []).expect("image fixture");
+        }
+        let sequence = DirectorySequence::build(
+            &gio::File::for_path(directory.path().join("b.png")),
+            SortOrder::Name,
+        )
+        .expect("directory sequence");
+
+        let candidates = sequence
+            .replacements_after_current_removed()
+            .filter_map(|file| {
+                file.basename()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, ["c.png", "d.png", "a.png"]);
+    }
+
+    #[test]
+    fn rebuilding_after_file_creation_and_deletion_updates_the_sequence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let current = directory.path().join("b.png");
+        std::fs::write(directory.path().join("a.png"), []).expect("first image");
+        std::fs::write(&current, []).expect("current image");
+        assert_eq!(
+            DirectorySequence::build(&gio::File::for_path(&current), SortOrder::Name)
+                .expect("initial sequence")
+                .len(),
+            2
+        );
+
+        std::fs::write(directory.path().join("c.png"), []).expect("new image");
+        std::fs::remove_file(directory.path().join("a.png")).expect("remove old image");
+
+        let rebuilt = DirectorySequence::build(&gio::File::for_path(current), SortOrder::Name)
+            .expect("rebuilt sequence");
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(
+            rebuilt
+                .replacement_after_current_removed()
+                .and_then(|file| file.basename()),
+            Some("c.png".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_symlinks_are_navigable_but_broken_symlinks_are_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source.png");
+        let current = directory.path().join("linked.png");
+        std::fs::write(&source, []).expect("source image");
+        symlink(&source, &current).expect("image symlink");
+        symlink(
+            directory.path().join("missing.png"),
+            directory.path().join("broken.png"),
+        )
+        .expect("broken image symlink");
+
+        let sequence = DirectorySequence::build(&gio::File::for_path(current), SortOrder::Name)
+            .expect("symlink sequence");
+
+        assert_eq!(sequence.len(), 2);
+        assert_eq!(
+            sequence.current().basename().as_deref(),
+            Some(std::path::Path::new("linked.png"))
+        );
     }
 }

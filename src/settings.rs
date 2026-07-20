@@ -5,6 +5,15 @@ use crate::canvas::{Background, ZoomFilter};
 use crate::document::Resampling;
 use crate::navigation::SortOrder;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ColorFormat {
+    #[default]
+    Hex,
+    Rgb,
+    Oklab,
+    Hsl,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     inner: Option<gio::Settings>,
@@ -105,6 +114,27 @@ impl Settings {
                 Resampling::Linear => "linear",
                 Resampling::Bicubic => "bicubic",
                 Resampling::SeamCarving => "seam-carving",
+            },
+        );
+    }
+
+    pub fn color_picker_format(&self) -> ColorFormat {
+        match self.string("color-picker-format").as_deref() {
+            Some("rgb") => ColorFormat::Rgb,
+            Some("oklab") => ColorFormat::Oklab,
+            Some("hsl") => ColorFormat::Hsl,
+            _ => ColorFormat::Hex,
+        }
+    }
+
+    pub fn set_color_picker_format(&self, format: ColorFormat) {
+        self.set_string(
+            "color-picker-format",
+            match format {
+                ColorFormat::Hex => "hex",
+                ColorFormat::Rgb => "rgb",
+                ColorFormat::Oklab => "oklab",
+                ColorFormat::Hsl => "hsl",
             },
         );
     }
@@ -247,5 +277,15 @@ impl Settings {
         {
             tracing::warn!(%error, key, "Could not save setting");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColorFormat;
+
+    #[test]
+    fn color_format_defaults_to_hex() {
+        assert_eq!(ColorFormat::default(), ColorFormat::Hex);
     }
 }

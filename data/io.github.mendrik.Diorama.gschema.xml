@@ -10,6 +10,7 @@
     <key name="last-zoom" type="d"><default>1.0</default></key>
     <key name="last-open-folder-uri" type="s"><default>''</default></key>
     <key name="scale-resampling" type="s"><default>'bicubic'</default></key>
+    <key name="color-picker-format" type="s"><default>'hex'</default></key>
     <key name="folder-sort" type="s"><default>'name'</default></key>
     <key name="preserve-metadata" type="b"><default>true</default></key>
     <key name="png-compression" type="i"><default>6</default></key>

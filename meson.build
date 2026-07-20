@@ -1,7 +1,7 @@
 project(
   'diorama',
   'rust',
-  version: '0.1.0',
+  version: '0.2.0',
   meson_version: '>= 1.3.0',
   default_options: ['warning_level=2'],
 )
@@ -19,5 +19,7 @@ diorama = custom_target(
 )
 
 subdir('data')
+
+gnome.post_install(glib_compile_schemas: true)
 
 test('cargo-tests', cargo_script, args: [meson.project_source_root(), '', 'test'])
