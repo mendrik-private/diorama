@@ -246,9 +246,13 @@ fn nautilus_sort(info: &gio::FileInfo) -> Option<(SortOrder, bool)> {
         "atime" | "date_accessed" => SortOrder::Accessed,
         _ => return None,
     };
-    let reversed = info.boolean("metadata::nautilus-list-view-sort-reversed")
-        || info.boolean("metadata::nautilus-icon-view-sort-reversed");
+    let reversed = boolean_attribute(info, "metadata::nautilus-list-view-sort-reversed")
+        || boolean_attribute(info, "metadata::nautilus-icon-view-sort-reversed");
     Some((order, reversed))
+}
+
+fn boolean_attribute(info: &gio::FileInfo, attribute: &str) -> bool {
+    info.attribute_type(attribute) == gio::FileAttributeType::Boolean && info.boolean(attribute)
 }
 
 fn compare_entry(left: &Entry, right: &Entry, order: SortOrder) -> Ordering {
@@ -326,8 +330,8 @@ mod tests {
     use gio::prelude::*;
 
     use super::{
-        DirectorySequence, SortOrder, comparable_name, find_matching_file, is_supported,
-        natural_compare,
+        DirectorySequence, SortOrder, boolean_attribute, comparable_name, find_matching_file,
+        is_supported, natural_compare,
     };
 
     #[test]
@@ -348,6 +352,23 @@ mod tests {
             comparable_name("Frame-001.PNG"),
             comparable_name("frame_001.webp")
         );
+    }
+
+    #[test]
+    fn only_reads_boolean_file_attributes_as_booleans() {
+        let info = gio::FileInfo::new();
+        info.set_attribute_string("metadata::nautilus-list-view-sort-reversed", "true");
+        info.set_attribute_boolean("metadata::nautilus-icon-view-sort-reversed", true);
+
+        assert!(!boolean_attribute(
+            &info,
+            "metadata::nautilus-list-view-sort-reversed"
+        ));
+        assert!(boolean_attribute(
+            &info,
+            "metadata::nautilus-icon-view-sort-reversed"
+        ));
+        assert!(!boolean_attribute(&info, "metadata::missing"));
     }
 
     #[test]

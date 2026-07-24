@@ -187,6 +187,14 @@ fn is_regular_file(file: &gio::File) -> bool {
         == gio::FileType::Regular
 }
 
+fn navigation_direction(key: gtk::gdk::Key) -> Option<bool> {
+    match key {
+        gtk::gdk::Key::Left | gtk::gdk::Key::Page_Up => Some(false),
+        gtk::gdk::Key::Right | gtk::gdk::Key::Page_Down => Some(true),
+        _ => None,
+    }
+}
+
 fn is_directory(file: &gio::File) -> bool {
     file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
         == gio::FileType::Directory
@@ -747,6 +755,7 @@ impl ViewerWindow {
             deletion_running: Cell::new(false),
         }));
         this.install_actions();
+        this.install_navigation_keys();
         this.install_tool_controls();
         this.install_scale_controls();
         this.install_gestures();
@@ -783,6 +792,14 @@ impl ViewerWindow {
     }
 
     fn load(&self, file: gio::File) {
+        self.load_with_fit(file, true);
+    }
+
+    fn load_preserving_zoom(&self, file: gio::File) {
+        self.load_with_fit(file, false);
+    }
+
+    fn load_with_fit(&self, file: gio::File, fit: bool) {
         self.0
             .navigation_generation
             .set(self.0.navigation_generation.get().wrapping_add(1));
@@ -801,7 +818,7 @@ impl ViewerWindow {
                 if let Some(document) = this.0.document.borrow_mut().as_mut() {
                     document.restore_original();
                 }
-                this.load(file.clone());
+                this.load_with_fit(file.clone(), fit);
             });
             return;
         }
@@ -884,7 +901,9 @@ impl ViewerWindow {
                 Ok(preview) => {
                     state.subtitle_ready.set(true);
                     state.canvas.set_texture(Some(&preview.texture));
-                    ViewerWindow(state.clone()).fit(false);
+                    if fit {
+                        ViewerWindow(state.clone()).fit(false);
+                    }
                     if preview.animation_delay.is_some() {
                         ViewerWindow(state.clone()).start_animation(file.clone(), generation);
                     }
@@ -1240,6 +1259,26 @@ impl ViewerWindow {
                     .set_active(!this.0.selection_button.is_active())
             }
         });
+    }
+
+    fn install_navigation_keys(&self) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| {
+                if !modifiers.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(forward) = navigation_direction(key) {
+                    this.navigate(forward);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        self.0.window.add_controller(keys);
     }
 
     fn add_action(&self, name: &str, callback: impl Fn() + 'static) {
@@ -3845,6 +3884,34 @@ impl ViewerWindow {
             }?;
             Some((next_sequence, file))
         });
+        if next.is_none() && self.0.sequence.borrow().is_none() {
+            let Some(current) = self.0.current_file.borrow().clone() else {
+                return;
+            };
+            let fallback = self.0.settings.folder_sort();
+            let generation = self.0.directory_refresh_generation.get().wrapping_add(1);
+            self.0.directory_refresh_generation.set(generation);
+            let weak = Rc::downgrade(&self.0);
+            glib::spawn_future_local(async move {
+                let sequence =
+                    gio::spawn_blocking(move || DirectorySequence::build(&current, fallback)).await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if state.directory_refresh_generation.get() != generation {
+                    return;
+                }
+                match sequence {
+                    Ok(Ok(sequence)) => {
+                        state.sequence.replace(Some(sequence));
+                        ViewerWindow(state).navigate(forward);
+                    }
+                    Ok(Err(error)) => tracing::debug!(%error, "Directory navigation unavailable"),
+                    Err(_) => tracing::warn!("Directory navigation worker panicked"),
+                }
+            });
+            return;
+        }
         if let Some((next_sequence, file)) = next {
             if !is_regular_file(&file) {
                 if let Some(current) = self.0.current_file.borrow().clone() {
@@ -3857,7 +3924,7 @@ impl ViewerWindow {
             }
             self.0.sequence.replace(Some(next_sequence));
             let Some(compare_file) = self.0.compare_file.borrow().clone() else {
-                self.load(file);
+                self.load_preserving_zoom(file);
                 return;
             };
             let generation = self.0.navigation_generation.get().wrapping_add(1);
@@ -3880,7 +3947,7 @@ impl ViewerWindow {
                 }
                 let comparison = matching_file.unwrap_or(Some(compare_file));
                 state.pending_comparison.replace(comparison);
-                ViewerWindow(state).load(file);
+                ViewerWindow(state).load_preserving_zoom(file);
             });
         }
     }
@@ -5026,6 +5093,15 @@ mod tests {
         let file = gio::File::for_path("/images/comparison/frame.png");
 
         assert_eq!(folder_path(&file), "/images/comparison");
+    }
+
+    #[test]
+    fn arrow_and_page_keys_have_navigation_directions() {
+        assert_eq!(navigation_direction(gtk::gdk::Key::Left), Some(false));
+        assert_eq!(navigation_direction(gtk::gdk::Key::Page_Up), Some(false));
+        assert_eq!(navigation_direction(gtk::gdk::Key::Right), Some(true));
+        assert_eq!(navigation_direction(gtk::gdk::Key::Page_Down), Some(true));
+        assert_eq!(navigation_direction(gtk::gdk::Key::space), None);
     }
 
     #[test]
