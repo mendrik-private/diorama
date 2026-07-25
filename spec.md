@@ -623,6 +623,11 @@ When Pencil is active:
 * Left-button drag paints.
 * Right-click samples the color beneath the pointer.
 * Right-button drag continuously samples while moving.
+* Ctrl+drag previews a straight line. While Ctrl remains held, each mouse-up endpoint anchors
+  the next line; releasing Ctrl cancels an active line preview and ends that chain.
+* Shift+drag previews an outlined rectangle from the drag start to the pointer.
+* Alt+drag previews an outlined circle centered at the drag start. Alt takes precedence over
+  Shift and Ctrl when modifiers are combined.
 * The context menu is disabled over the image while the tool is active.
 * Escape exits the tool.
 * Each continuous stroke is one undo operation.
