@@ -1,7 +1,65 @@
 use image::{Rgba, RgbaImage};
 
-use crate::document::{BrushPoint, CancellationToken, Stroke};
+use crate::document::{BrushPoint, CancellationToken, Stroke, StrokePath};
 use crate::error::{AppError, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PencilShape {
+    Line {
+        start: BrushPoint,
+        end: BrushPoint,
+    },
+    Rectangle {
+        start: BrushPoint,
+        end: BrushPoint,
+    },
+    Circle {
+        center: BrushPoint,
+        edge: BrushPoint,
+    },
+}
+
+pub fn shape_points(shape: PencilShape) -> Vec<BrushPoint> {
+    match shape {
+        PencilShape::Line { start, end } => vec![start, end],
+        PencilShape::Rectangle { start, end } => vec![
+            start,
+            BrushPoint {
+                x: end.x,
+                y: start.y,
+                pressure: start.pressure,
+            },
+            end,
+            BrushPoint {
+                x: start.x,
+                y: end.y,
+                pressure: start.pressure,
+            },
+            start,
+        ],
+        PencilShape::Circle { center, edge } => {
+            let radius = distance(center, edge);
+            if radius <= f32::EPSILON {
+                return vec![center];
+            }
+            let segments = (std::f32::consts::TAU * radius)
+                .ceil()
+                .clamp(12.0, 65_536.0) as u32;
+            let mut points = (0..segments)
+                .map(|index| {
+                    let angle = std::f32::consts::TAU * index as f32 / segments as f32;
+                    BrushPoint {
+                        x: center.x + radius * angle.cos(),
+                        y: center.y + radius * angle.sin(),
+                        pressure: center.pressure,
+                    }
+                })
+                .collect::<Vec<_>>();
+            points.push(points[0]);
+            points
+        }
+    }
+}
 
 pub fn sample(image: &RgbaImage, x: u32, y: u32) -> Option<[u8; 4]> {
     (x < image.width() && y < image.height()).then(|| image.get_pixel(x, y).0)
@@ -24,7 +82,10 @@ pub fn paint_stroke(
     }
 
     let spacing = (stroke.width * 0.2).max(0.25);
-    let points = smooth_path(&stroke.points, spacing);
+    let points = match stroke.path {
+        StrokePath::Smooth => smooth_path(&stroke.points, spacing),
+        StrokePath::Linear => linear_path(&stroke.points, spacing),
+    };
     for point in points {
         cancellation.check()?;
         stamp(&mut output, point.x, point.y, point.pressure, stroke);
@@ -68,6 +129,23 @@ fn smooth_path(points: &[BrushPoint], spacing: f32) -> Vec<BrushPoint> {
     let last = points[points.len() - 1];
     let previous = points[points.len() - 2];
     append_quadratic(&mut path, midpoint(previous, last), last, last, spacing);
+    path
+}
+
+fn linear_path(points: &[BrushPoint], spacing: f32) -> Vec<BrushPoint> {
+    let points = points.iter().copied().fold(Vec::new(), |mut path, point| {
+        if path.last() != Some(&point) {
+            path.push(point);
+        }
+        path
+    });
+    let Some(&first) = points.first() else {
+        return Vec::new();
+    };
+    let mut path = vec![first];
+    for pair in points.windows(2) {
+        append_linear(&mut path, pair[0], pair[1], spacing);
+    }
     path
 }
 
@@ -171,8 +249,8 @@ fn blend(destination: Rgba<u8>, source: Rgba<u8>, source_alpha: f32) -> Rgba<u8>
 mod tests {
     use image::{Rgba, RgbaImage};
 
-    use super::{paint_stroke, sample, smooth_path};
-    use crate::document::{BrushPoint, CancellationToken, Stroke};
+    use super::{PencilShape, paint_stroke, sample, shape_points, smooth_path};
+    use crate::document::{BrushPoint, CancellationToken, Stroke, StrokePath};
 
     #[test]
     fn samples_exact_rgba() {
@@ -189,6 +267,7 @@ mod tests {
                 y: 10.0,
                 pressure: 1.0,
             }],
+            path: StrokePath::Smooth,
             color: [255, 0, 0, 255],
             width: 3.0,
             opacity: 1.0,
@@ -252,6 +331,7 @@ mod tests {
                     pressure: 1.0,
                 },
             ],
+            path: StrokePath::Smooth,
             color: [255, 0, 0, 255],
             width: 1.0,
             opacity: 1.0,
@@ -262,5 +342,97 @@ mod tests {
 
         assert!(output.get_pixel(9, 3).0[3] > 0);
         assert_eq!(output.get_pixel(0, 0).0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn shape_paths_keep_the_line_endpoints_and_close_rectangles() {
+        let start = BrushPoint {
+            x: 2.5,
+            y: 3.5,
+            pressure: 1.0,
+        };
+        let end = BrushPoint {
+            x: 8.5,
+            y: 9.5,
+            pressure: 0.5,
+        };
+
+        assert_eq!(shape_points(PencilShape::Line { start, end }), [start, end]);
+        assert_eq!(
+            shape_points(PencilShape::Rectangle { start, end }),
+            [
+                start,
+                BrushPoint {
+                    x: end.x,
+                    y: start.y,
+                    pressure: start.pressure,
+                },
+                end,
+                BrushPoint {
+                    x: start.x,
+                    y: end.y,
+                    pressure: start.pressure,
+                },
+                start,
+            ]
+        );
+    }
+
+    #[test]
+    fn circle_path_is_closed_and_keeps_a_constant_radius() {
+        let center = BrushPoint {
+            x: 10.5,
+            y: 12.5,
+            pressure: 0.75,
+        };
+        let edge = BrushPoint {
+            x: 15.5,
+            y: 12.5,
+            pressure: 1.0,
+        };
+        let path = shape_points(PencilShape::Circle { center, edge });
+
+        assert!(path.len() >= 13);
+        assert_eq!(path.first(), path.last());
+        assert!(path.iter().all(|point| {
+            ((point.x - center.x).hypot(point.y - center.y) - 5.0).abs() < 0.001
+                && point.pressure == center.pressure
+        }));
+    }
+
+    #[test]
+    fn linear_rectangle_path_keeps_its_corners_and_closing_edge() {
+        let start = BrushPoint {
+            x: 2.5,
+            y: 3.5,
+            pressure: 1.0,
+        };
+        let end = BrushPoint {
+            x: 10.5,
+            y: 8.5,
+            pressure: 1.0,
+        };
+        let stroke = Stroke {
+            points: shape_points(PencilShape::Rectangle { start, end }),
+            path: StrokePath::Linear,
+            color: [255, 0, 0, 255],
+            width: 1.0,
+            opacity: 1.0,
+            hardness: 1.0,
+        };
+
+        let output = paint_stroke(
+            &RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0])),
+            &stroke,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        for (x, y) in [(2, 3), (10, 3), (10, 8), (2, 8), (2, 6)] {
+            assert!(
+                output.get_pixel(x, y).0[3] > 0,
+                "missing rectangle at {x},{y}"
+            );
+        }
     }
 }

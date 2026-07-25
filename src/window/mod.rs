@@ -15,7 +15,7 @@ use palette::FromColor as _;
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
 use crate::document::{
-    BrushPoint, CancellationToken, Document, Operation, Resampling, Rotation, Stroke,
+    BrushPoint, CancellationToken, Document, Operation, Resampling, Rotation, Stroke, StrokePath,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::image::{
@@ -74,6 +74,72 @@ struct MeasurementDrag {
     current: (u32, u32),
     start_screen: (f64, f64),
     image_dimensions: (u32, u32),
+}
+
+struct PencilDrag {
+    canvas: ImageCanvas,
+    start_screen: (f64, f64),
+    origin: BrushPoint,
+    line_start: BrushPoint,
+    current: BrushPoint,
+    freehand_points: Vec<BrushPoint>,
+    line_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PencilDragMode {
+    Freehand,
+    Line,
+    Rectangle,
+    Circle,
+}
+
+fn pencil_drag_mode(modifiers: gtk::gdk::ModifierType) -> PencilDragMode {
+    if modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
+        PencilDragMode::Circle
+    } else if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        PencilDragMode::Rectangle
+    } else if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        PencilDragMode::Line
+    } else {
+        PencilDragMode::Freehand
+    }
+}
+
+fn pencil_line_start(
+    mode: PencilDragMode,
+    line_anchor: Option<BrushPoint>,
+    origin: BrushPoint,
+) -> BrushPoint {
+    if mode == PencilDragMode::Line {
+        line_anchor.unwrap_or(origin)
+    } else {
+        origin
+    }
+}
+
+fn pencil_drag_points(drag: &PencilDrag, mode: PencilDragMode) -> Vec<BrushPoint> {
+    match mode {
+        PencilDragMode::Freehand => drag.freehand_points.clone(),
+        PencilDragMode::Line => {
+            crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Line {
+                start: drag.line_start,
+                end: drag.current,
+            })
+        }
+        PencilDragMode::Rectangle => {
+            crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Rectangle {
+                start: drag.origin,
+                end: drag.current,
+            })
+        }
+        PencilDragMode::Circle => {
+            crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Circle {
+                center: drag.origin,
+                edge: drag.current,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -430,7 +496,9 @@ struct WindowState {
     close_approved: Cell<bool>,
     pencil_active: Cell<bool>,
     pencil_points: RefCell<Vec<BrushPoint>>,
-    pencil_start: Cell<(f64, f64)>,
+    pencil_path: Cell<StrokePath>,
+    pencil_drag: RefCell<Option<PencilDrag>>,
+    pencil_line_anchor: Cell<Option<BrushPoint>>,
     pencil_color: Cell<[u8; 4]>,
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
@@ -683,7 +751,9 @@ impl ViewerWindow {
             close_approved: Cell::new(false),
             pencil_active: Cell::new(false),
             pencil_points: RefCell::new(Vec::new()),
-            pencil_start: Cell::new((0.0, 0.0)),
+            pencil_path: Cell::new(StrokePath::Smooth),
+            pencil_drag: RefCell::new(None),
+            pencil_line_anchor: Cell::new(None),
             pencil_color: Cell::new([0, 0, 0, 255]),
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
@@ -1278,6 +1348,14 @@ impl ViewerWindow {
                 }
             }
         });
+        keys.connect_key_released({
+            let this = self.clone();
+            move |_, key, _, _| {
+                if key == gtk::gdk::Key::Control_L || key == gtk::gdk::Key::Control_R {
+                    this.abort_pencil_line();
+                }
+            }
+        });
         self.0.window.add_controller(keys);
     }
 
@@ -1488,6 +1566,9 @@ impl ViewerWindow {
                     .add_toast(adw::Toast::new("Open an editable image first"));
             }
             return;
+        }
+        if !active {
+            self.abort_pencil_drag();
         }
         self.0.pencil_active.set(active);
         self.0.canvas.set_accessible_label(if active {
@@ -1775,23 +1856,36 @@ impl ViewerWindow {
         let Some(image) = self.0.rendered.borrow().clone() else {
             return;
         };
-        self.paint_pencil_preview(&self.0.canvas, &image);
+        self.paint_pencil_preview(
+            &self.0.canvas,
+            &image,
+            &self.0.pencil_points.borrow(),
+            self.0.pencil_path.get(),
+        );
     }
 
     fn preview_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
         let Some(image) = self.0.compare_rendered.borrow().clone() else {
             return;
         };
-        self.paint_pencil_preview(canvas, &image);
+        self.paint_pencil_preview(
+            canvas,
+            &image,
+            &self.0.pencil_points.borrow(),
+            self.0.pencil_path.get(),
+        );
     }
 
     fn paint_pencil_preview(
         &self,
         canvas: &ImageCanvas,
         image: &image::RgbaImage,
+        points: &[BrushPoint],
+        path: StrokePath,
     ) -> Option<image::RgbaImage> {
         let stroke = Stroke {
-            points: self.0.pencil_points.borrow().clone(),
+            points: points.to_vec(),
+            path,
             color: self.0.pencil_color.get(),
             width: 1.0,
             opacity: 1.0,
@@ -1811,12 +1905,154 @@ impl ViewerWindow {
         None
     }
 
-    fn commit_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
+    fn commit_comparison_pencil_stroke(
+        &self,
+        canvas: &ImageCanvas,
+        points: &[BrushPoint],
+        path: StrokePath,
+    ) {
         let Some(image) = self.0.compare_rendered.borrow().clone() else {
             return;
         };
-        if let Some(preview) = self.paint_pencil_preview(canvas, &image) {
+        if let Some(preview) = self.paint_pencil_preview(canvas, &image, points, path) {
             self.0.compare_rendered.replace(Some(preview));
+        }
+    }
+
+    fn begin_pencil_drag(
+        &self,
+        canvas: &ImageCanvas,
+        screen_x: f64,
+        screen_y: f64,
+        modifiers: gtk::gdk::ModifierType,
+    ) {
+        let Some(origin) = canvas
+            .pixel_at(screen_x, screen_y)
+            .map(|(x, y)| BrushPoint {
+                x: x as f32 + 0.5,
+                y: y as f32 + 0.5,
+                pressure: 1.0,
+            })
+        else {
+            return;
+        };
+        let mode = pencil_drag_mode(modifiers);
+        let line_start = pencil_line_start(mode, self.0.pencil_line_anchor.get(), origin);
+        self.0.pencil_drag.replace(Some(PencilDrag {
+            canvas: canvas.clone(),
+            start_screen: (screen_x, screen_y),
+            origin,
+            line_start,
+            current: origin,
+            freehand_points: vec![origin],
+            line_mode: mode == PencilDragMode::Line,
+        }));
+        self.update_pencil_drag(canvas, screen_x, screen_y, modifiers);
+    }
+
+    fn update_pencil_drag(
+        &self,
+        canvas: &ImageCanvas,
+        screen_x: f64,
+        screen_y: f64,
+        modifiers: gtk::gdk::ModifierType,
+    ) {
+        let Some(current) = canvas
+            .pixel_at(screen_x, screen_y)
+            .map(|(x, y)| BrushPoint {
+                x: x as f32 + 0.5,
+                y: y as f32 + 0.5,
+                pressure: 1.0,
+            })
+        else {
+            return;
+        };
+        let mode = pencil_drag_mode(modifiers);
+        let points = {
+            let mut pencil_drag = self.0.pencil_drag.borrow_mut();
+            let Some(drag) = pencil_drag.as_mut() else {
+                return;
+            };
+            if drag.canvas != *canvas {
+                return;
+            }
+            drag.current = current;
+            if drag.freehand_points.last() != Some(&current) {
+                drag.freehand_points.push(current);
+            }
+            drag.line_mode = mode == PencilDragMode::Line;
+            pencil_drag_points(drag, mode)
+        };
+        self.0.pencil_points.replace(points);
+        self.0.pencil_path.set(if mode == PencilDragMode::Freehand {
+            StrokePath::Smooth
+        } else {
+            StrokePath::Linear
+        });
+        if canvas == &self.0.canvas {
+            self.preview_pencil_stroke();
+        } else {
+            self.preview_comparison_pencil_stroke(canvas);
+        }
+    }
+
+    fn finish_pencil_drag(
+        &self,
+        canvas: &ImageCanvas,
+        screen_x: f64,
+        screen_y: f64,
+        modifiers: gtk::gdk::ModifierType,
+    ) -> Option<(Vec<BrushPoint>, StrokePath)> {
+        self.update_pencil_drag(canvas, screen_x, screen_y, modifiers);
+        let drag = self.0.pencil_drag.take()?;
+        if drag.canvas != *canvas {
+            self.0.pencil_drag.replace(Some(drag));
+            return None;
+        }
+        if drag.line_mode {
+            self.0.pencil_line_anchor.set(Some(drag.current));
+        } else {
+            self.0.pencil_line_anchor.set(None);
+        }
+        let points = self.0.pencil_points.take();
+        let path = self.0.pencil_path.replace(StrokePath::Smooth);
+        Some((points, path))
+    }
+
+    fn abort_pencil_drag(&self) {
+        self.0.pencil_line_anchor.set(None);
+        self.0.pencil_points.borrow_mut().clear();
+        self.0.pencil_path.set(StrokePath::Smooth);
+        let Some(drag) = self.0.pencil_drag.take() else {
+            return;
+        };
+        let image = if drag.canvas == self.0.canvas {
+            self.0.rendered.borrow().clone()
+        } else {
+            self.0.compare_rendered.borrow().clone()
+        };
+        if let Some(image) = image
+            && let Ok(texture) = texture_from_rgba(&image)
+        {
+            drag.canvas.set_texture(Some(&texture));
+            drag.canvas.update_lens_texture(&texture);
+            if drag.canvas == self.0.canvas {
+                self.update_minimap();
+            }
+        }
+    }
+
+    fn abort_pencil_line(&self) {
+        if self
+            .0
+            .pencil_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.line_mode)
+        {
+            self.abort_pencil_drag();
+        } else {
+            self.0.pencil_line_anchor.set(None);
         }
     }
 
@@ -4495,54 +4731,61 @@ impl ViewerWindow {
         pencil.set_button(1);
         pencil.connect_drag_begin({
             let this = self.clone();
-            move |_, x, y| {
+            move |gesture, x, y| {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                this.0.pencil_start.set((x, y));
-                let Some((x, y)) = this.0.canvas.pixel_at(x, y) else {
-                    return;
-                };
-                this.0.pencil_points.replace(vec![BrushPoint {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                    pressure: 1.0,
-                }]);
-                this.preview_pencil_stroke();
+                this.begin_pencil_drag(&this.0.canvas, x, y, gesture.current_event_state());
             }
         });
         pencil.connect_drag_update({
             let this = self.clone();
-            move |_, offset_x, offset_y| {
+            move |gesture, offset_x, offset_y| {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                let (start_x, start_y) = this.0.pencil_start.get();
-                let Some((x, y)) = this
-                    .0
-                    .canvas
-                    .pixel_at(start_x + offset_x, start_y + offset_y)
-                else {
+                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
+                    (
+                        drag.start_screen.0 + offset_x,
+                        drag.start_screen.1 + offset_y,
+                    )
+                }) else {
                     return;
                 };
-                this.0.pencil_points.borrow_mut().push(BrushPoint {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                    pressure: 1.0,
-                });
-                this.preview_pencil_stroke();
+                this.update_pencil_drag(
+                    &this.0.canvas,
+                    drag.0,
+                    drag.1,
+                    gesture.current_event_state(),
+                );
             }
         });
         pencil.connect_drag_end({
             let this = self.clone();
-            move |_, _, _| {
+            move |gesture, offset_x, offset_y| {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                let points = this.0.pencil_points.take();
+                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
+                    (
+                        drag.start_screen.0 + offset_x,
+                        drag.start_screen.1 + offset_y,
+                    )
+                }) else {
+                    return;
+                };
+                let Some((points, path)) = this.finish_pencil_drag(
+                    &this.0.canvas,
+                    drag.0,
+                    drag.1,
+                    gesture.current_event_state(),
+                ) else {
+                    return;
+                };
                 if !points.is_empty() {
                     this.apply(Operation::Pencil(Stroke {
                         points,
+                        path,
                         color: this.0.pencil_color.get(),
                         width: 1.0,
                         opacity: 1.0,
@@ -4615,52 +4858,54 @@ impl ViewerWindow {
         pencil.connect_drag_begin({
             let this = self.clone();
             let canvas = canvas.clone();
-            move |_, x, y| {
+            move |gesture, x, y| {
                 if !this.0.pencil_active.get() || this.0.compare_rendered.borrow().is_none() {
                     return;
                 }
-                this.0.pencil_start.set((x, y));
-                let Some((x, y)) = canvas.pixel_at(x, y) else {
-                    return;
-                };
-                this.0.pencil_points.replace(vec![BrushPoint {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                    pressure: 1.0,
-                }]);
-                this.preview_comparison_pencil_stroke(&canvas);
+                this.begin_pencil_drag(&canvas, x, y, gesture.current_event_state());
             }
         });
         pencil.connect_drag_update({
             let this = self.clone();
             let canvas = canvas.clone();
-            move |_, offset_x, offset_y| {
+            move |gesture, offset_x, offset_y| {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                let (start_x, start_y) = this.0.pencil_start.get();
-                let Some((x, y)) = canvas.pixel_at(start_x + offset_x, start_y + offset_y) else {
+                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
+                    (
+                        drag.start_screen.0 + offset_x,
+                        drag.start_screen.1 + offset_y,
+                    )
+                }) else {
                     return;
                 };
-                this.0.pencil_points.borrow_mut().push(BrushPoint {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                    pressure: 1.0,
-                });
-                this.preview_comparison_pencil_stroke(&canvas);
+                this.update_pencil_drag(&canvas, drag.0, drag.1, gesture.current_event_state());
             }
         });
         pencil.connect_drag_end({
             let this = self.clone();
             let canvas = canvas.clone();
-            move |_, _, _| {
+            move |gesture, offset_x, offset_y| {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                if !this.0.pencil_points.borrow().is_empty() {
-                    this.commit_comparison_pencil_stroke(&canvas);
+                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
+                    (
+                        drag.start_screen.0 + offset_x,
+                        drag.start_screen.1 + offset_y,
+                    )
+                }) else {
+                    return;
+                };
+                let Some((points, path)) =
+                    this.finish_pencil_drag(&canvas, drag.0, drag.1, gesture.current_event_state())
+                else {
+                    return;
+                };
+                if !points.is_empty() {
+                    this.commit_comparison_pencil_stroke(&canvas, &points, path);
                 }
-                this.0.pencil_points.take();
             }
         });
         canvas.add_controller(pencil.clone());
@@ -5293,6 +5538,49 @@ mod tests {
         assert!(!pencil_can_activate(true, true));
         assert!(!pencil_can_activate(false, false));
         assert!(pencil_can_activate(false, true));
+    }
+
+    #[test]
+    fn pencil_drag_modifiers_select_shapes_and_reuse_only_line_anchors() {
+        let origin = BrushPoint {
+            x: 2.5,
+            y: 3.5,
+            pressure: 1.0,
+        };
+        let anchor = BrushPoint {
+            x: 8.5,
+            y: 9.5,
+            pressure: 1.0,
+        };
+
+        assert_eq!(
+            pencil_drag_mode(gtk::gdk::ModifierType::CONTROL_MASK),
+            PencilDragMode::Line
+        );
+        assert_eq!(
+            pencil_drag_mode(gtk::gdk::ModifierType::SHIFT_MASK),
+            PencilDragMode::Rectangle
+        );
+        assert_eq!(
+            pencil_drag_mode(gtk::gdk::ModifierType::ALT_MASK),
+            PencilDragMode::Circle
+        );
+        assert_eq!(
+            pencil_drag_mode(
+                gtk::gdk::ModifierType::CONTROL_MASK
+                    | gtk::gdk::ModifierType::SHIFT_MASK
+                    | gtk::gdk::ModifierType::ALT_MASK
+            ),
+            PencilDragMode::Circle
+        );
+        assert_eq!(
+            pencil_line_start(PencilDragMode::Line, Some(anchor), origin),
+            anchor
+        );
+        assert_eq!(
+            pencil_line_start(PencilDragMode::Rectangle, Some(anchor), origin),
+            origin
+        );
     }
 
     #[test]
