@@ -20,9 +20,16 @@ pub struct BrushPoint {
     pub pressure: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokePath {
+    Smooth,
+    Linear,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stroke {
     pub points: Vec<BrushPoint>,
+    pub path: StrokePath,
     pub color: [u8; 4],
     pub width: f32,
     pub opacity: f32,
