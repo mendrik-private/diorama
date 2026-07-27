@@ -60,6 +60,9 @@
     {
       "name": "diorama",
       "buildsystem": "meson",
+      "config-opts": [
+        "--buildtype=release"
+      ],
       "only-arches": [
         "x86_64"
       ],

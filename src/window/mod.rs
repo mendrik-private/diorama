@@ -1190,9 +1190,17 @@ impl ViewerWindow {
                 });
             }
         });
+        self.add_action("open-with", {
+            let this = self.clone();
+            move || this.open_with()
+        });
         self.add_action("close", {
             let window = self.0.window.clone();
             move || window.close()
+        });
+        self.add_action("copy-image", {
+            let this = self.clone();
+            move || this.copy_current_image_to_clipboard()
         });
         self.add_action("zoom-in", {
             let this = self.clone();
@@ -1778,6 +1786,43 @@ impl ViewerWindow {
         self.0
             .toasts
             .add_toast(adw::Toast::new(&format!("Copied {text}")));
+    }
+
+    fn copy_current_image_to_clipboard(&self) {
+        let Some(texture) = self.0.canvas.texture() else {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an image first"));
+            return;
+        };
+        self.0.window.clipboard().set_texture(&texture);
+        self.0.toasts.add_toast(adw::Toast::new(&format!(
+            "Copied {} × {} image",
+            texture.width(),
+            texture.height()
+        )));
+    }
+
+    fn open_with(&self) {
+        let Some(file) = self.0.current_file.borrow().clone() else {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an image first"));
+            return;
+        };
+        let launcher = open_with_launcher(&file);
+        let parent = self.0.window.clone();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            if let Err(error) = launcher.launch_future(Some(&parent)).await
+                && !open_with_was_cancelled(&error)
+                && let Some(state) = weak.upgrade()
+            {
+                state.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not open image with another app: {error}"
+                )));
+            }
+        });
     }
 
     fn set_selection_active(&self, active: bool) {
@@ -3061,6 +3106,7 @@ impl ViewerWindow {
                 "General",
                 vec![
                     ("Open", "<Control>o"),
+                    ("Copy Image", "<Control>c"),
                     ("Save", "<Control>s"),
                     ("Save As", "<Control><Shift>s"),
                     ("Close", "<Control>w"),
@@ -5568,6 +5614,8 @@ fn menu_button() -> gtk::MenuButton {
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("Open…"), Some("win.open"));
+    menu.append(Some("Open With…"), Some("win.open-with"));
+    menu.append(Some("Copy Image"), Some("win.copy-image"));
     menu.append(Some("Save"), Some("win.save"));
     menu.append(Some("Save As…"), Some("win.save-as"));
     menu.append(Some("Compare Images…"), Some("win.compare"));
@@ -5581,6 +5629,19 @@ fn main_menu() -> gio::Menu {
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Diorama"), Some("win.about"));
     menu
+}
+
+fn open_with_launcher(file: &gio::File) -> gtk::FileLauncher {
+    let launcher = gtk::FileLauncher::new(Some(file));
+    launcher.set_always_ask(true);
+    launcher.set_writable(true);
+    launcher
+}
+
+fn open_with_was_cancelled(error: &glib::Error) -> bool {
+    error.matches(gtk::DialogError::Cancelled)
+        || error.matches(gtk::DialogError::Dismissed)
+        || error.matches(gio::IOErrorEnum::Cancelled)
 }
 
 fn lens_size_index(diameter: f32) -> u32 {
@@ -6170,6 +6231,61 @@ mod tests {
     }
 
     #[test]
+    fn main_menu_delegates_open_with_to_a_window_action() {
+        let menu: gio::MenuModel = main_menu().upcast();
+        let entries = (0..menu.n_items())
+            .filter_map(|index| {
+                let label = menu
+                    .item_attribute_value(index, "label", None)?
+                    .get::<String>()?;
+                let action = menu
+                    .item_attribute_value(index, "action", None)?
+                    .get::<String>()?;
+                Some((label, action))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(entries.contains(&("Open With…".to_owned(), "win.open-with".to_owned())));
+    }
+
+    #[test]
+    fn cancelling_the_system_app_chooser_is_not_an_error() {
+        for error in [
+            glib::Error::new(gtk::DialogError::Cancelled, "cancelled"),
+            glib::Error::new(gtk::DialogError::Dismissed, "dismissed"),
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled"),
+        ] {
+            assert!(open_with_was_cancelled(&error));
+        }
+        assert!(!open_with_was_cancelled(&glib::Error::new(
+            gtk::DialogError::Failed,
+            "failed"
+        )));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn open_with_action_uses_an_always_ask_writable_launcher() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.OpenWithTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let file = gio::File::for_path("/images/example.png");
+
+        let launcher = open_with_launcher(&file);
+
+        assert!(window.0.window.lookup_action("open-with").is_some());
+        assert!(launcher.must_always_ask());
+        assert!(launcher.is_writable());
+        assert_eq!(launcher.file(), Some(file));
+    }
+
+    #[test]
     fn export_completion_only_matches_its_originating_file_generation() {
         let original = Some(gio::File::for_path("/images/original.png"));
         let replacement = Some(gio::File::for_path("/images/replacement.png"));
@@ -6395,6 +6511,34 @@ mod tests {
         });
 
         assert!(!window.0.selection_button.is_active());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn copy_image_action_places_the_complete_canvas_texture_on_the_clipboard() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ImageClipboardTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_fn(2, 2, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+
+        assert!(window.0.window.lookup_action("copy-image").is_some());
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "copy-image", None);
+        let copied = glib::MainContext::default()
+            .block_on(window.0.window.clipboard().read_texture_future())
+            .expect("clipboard read")
+            .expect("clipboard texture");
+
+        assert_eq!(rgba_from_texture(&copied), Some(image));
     }
 
     #[test]
