@@ -22,9 +22,7 @@ pub fn build() -> adw::Application {
         }
     });
     application.connect_open(|application, files, _hint| {
-        for file in files {
-            window::ViewerWindow::new(application, Some(file.clone())).present();
-        }
+        window::ViewerWindow::new_with_files(application, files).present();
     });
     application
 }

@@ -142,6 +142,14 @@ fn pencil_drag_points(drag: &PencilDrag, mode: PencilDragMode) -> Vec<BrushPoint
     }
 }
 
+fn pencil_drag_path(mode: PencilDragMode) -> StrokePath {
+    match mode {
+        PencilDragMode::Freehand => StrokePath::Smooth,
+        PencilDragMode::Line | PencilDragMode::Rectangle => StrokePath::Linear,
+        PencilDragMode::Circle => StrokePath::Circle,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ZoomGestureAnchor {
     start_zoom: f64,
@@ -425,12 +433,18 @@ fn relative_modified_time(modified: SystemTime, now: SystemTime) -> String {
 }
 
 fn image_subtitle(
+    folder: &str,
     dimensions: (u32, u32),
     zoom: f64,
     modified: Option<SystemTime>,
     now: SystemTime,
 ) -> String {
-    let details = format!("{} × {} · {:.0}%", dimensions.0, dimensions.1, zoom * 100.0);
+    let details = format!(
+        "{folder} · {} × {} · {:.0}%",
+        dimensions.0,
+        dimensions.1,
+        zoom * 100.0
+    );
     match modified {
         Some(modified) => format!("{details} · {}", relative_modified_time(modified, now)),
         None => details,
@@ -484,6 +498,7 @@ struct WindowState {
     settings: Settings,
     current_file: RefCell<Option<gio::File>>,
     sequence: RefCell<Option<DirectorySequence>>,
+    explicit_navigation: Cell<bool>,
     cancellable: RefCell<Option<gio::Cancellable>>,
     render_cancellation: RefCell<Option<CancellationToken>>,
     load_generation: Cell<u64>,
@@ -570,6 +585,18 @@ struct WindowState {
 
 impl ViewerWindow {
     pub fn new(application: &adw::Application, file: Option<gio::File>) -> Self {
+        let files = file.into_iter().collect::<Vec<_>>();
+        Self::new_with_files(application, &files)
+    }
+
+    pub fn new_with_files(application: &adw::Application, files: &[gio::File]) -> Self {
+        let initial_file = files.first().cloned();
+        let initial_sequence = if files.len() > 1 {
+            DirectorySequence::from_files(files)
+        } else {
+            None
+        };
+        let explicit_navigation = initial_sequence.is_some();
         let settings = Settings::default();
         let canvas = ImageCanvas::default();
         canvas.set_filter(settings.zoom_filter());
@@ -738,7 +765,8 @@ impl ViewerWindow {
             toasts,
             settings,
             current_file: RefCell::new(None),
-            sequence: RefCell::new(None),
+            sequence: RefCell::new(initial_sequence),
+            explicit_navigation: Cell::new(explicit_navigation),
             cancellable: RefCell::new(None),
             render_cancellation: RefCell::new(None),
             load_generation: Cell::new(0),
@@ -833,7 +861,7 @@ impl ViewerWindow {
         this.connect_single_image_lens();
         this.install_state_persistence();
         this.install_subtitle_clock();
-        if let Some(file) = file {
+        if let Some(file) = initial_file {
             this.load(file);
         }
         this
@@ -867,6 +895,28 @@ impl ViewerWindow {
 
     fn load_preserving_zoom(&self, file: gio::File) {
         self.load_with_fit(file, false);
+    }
+
+    fn load_from_new_scope(&self, file: gio::File) {
+        if self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(Document::is_dirty)
+        {
+            let this = self.clone();
+            self.confirm_discard("Discard unsaved edits and open another image?", move || {
+                if let Some(document) = this.0.document.borrow_mut().as_mut() {
+                    document.restore_original();
+                }
+                this.load_from_new_scope(file.clone());
+            });
+            return;
+        }
+        self.0.explicit_navigation.set(false);
+        self.0.sequence.replace(None);
+        self.load(file);
     }
 
     fn load_with_fit(&self, file: gio::File, fit: bool) {
@@ -919,7 +969,9 @@ impl ViewerWindow {
             .pending_directory_changes
             .replace(PendingDirectoryChanges::default());
         self.0.directory_refresh_scheduled.set(false);
-        self.0.sequence.replace(None);
+        if !self.0.explicit_navigation.get() {
+            self.0.sequence.replace(None);
+        }
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
         }
@@ -974,6 +1026,7 @@ impl ViewerWindow {
                     if fit {
                         ViewerWindow(state.clone()).fit(false);
                     }
+                    ViewerWindow(state.clone()).update_subtitle();
                     if preview.animation_delay.is_some() {
                         ViewerWindow(state.clone()).start_animation(file.clone(), generation);
                     }
@@ -1044,7 +1097,7 @@ impl ViewerWindow {
                 let this = this.clone();
                 glib::spawn_future_local(async move {
                     if let Ok(file) = dialog.open_future(Some(&parent)).await {
-                        this.load(file);
+                        this.load_from_new_scope(file);
                     }
                 });
             }
@@ -1812,6 +1865,7 @@ impl ViewerWindow {
             Ok(texture) => {
                 self.0.window.clipboard().set_texture(&texture);
                 self.0.toasts.add_toast(adw::Toast::new(message));
+                self.0.selection_button.set_active(false);
             }
             Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error)),
         }
@@ -1984,11 +2038,7 @@ impl ViewerWindow {
             pencil_drag_points(drag, mode)
         };
         self.0.pencil_points.replace(points);
-        self.0.pencil_path.set(if mode == PencilDragMode::Freehand {
-            StrokePath::Smooth
-        } else {
-            StrokePath::Linear
-        });
+        self.0.pencil_path.set(pencil_drag_path(mode));
         if canvas == &self.0.canvas {
             self.preview_pencil_stroke();
         } else {
@@ -2219,9 +2269,13 @@ impl ViewerWindow {
         let Some(texture) = self.0.canvas.texture() else {
             return;
         };
+        let Some(file) = self.0.current_file.borrow().clone() else {
+            return;
+        };
         let dimensions = (texture.width() as u32, texture.height() as u32);
         let modified = *self.0.source_modified.borrow();
         self.0.title.set_subtitle(&image_subtitle(
+            &folder_path(&file),
             dimensions,
             self.0.canvas.zoom(),
             modified,
@@ -2490,6 +2544,12 @@ impl ViewerWindow {
                         let target = gio::File::for_path(&path);
                         if let Some(parent) = target.parent() {
                             state.settings.set_last_open_folder(&parent);
+                        }
+                        if state.explicit_navigation.get()
+                            && let Some(source) = source_file.as_ref()
+                            && let Some(sequence) = state.sequence.borrow_mut().as_mut()
+                        {
+                            sequence.replace_file(source, target.clone());
                         }
                         state.current_file.replace(Some(target.clone()));
                         ViewerWindow(state.clone()).rebuild_navigation(target);
@@ -3129,6 +3189,14 @@ impl ViewerWindow {
     }
 
     fn rebuild_navigation(&self, file: gio::File) {
+        if self.0.explicit_navigation.get() {
+            if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
+                monitor.cancel();
+            }
+            self.prefetch_neighbors();
+            self.monitor_directory();
+            return;
+        }
         self.0.sequence.replace(None);
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
@@ -3138,6 +3206,13 @@ impl ViewerWindow {
     }
 
     fn refresh_navigation(&self, file: gio::File, restart_monitor: bool) {
+        if self.0.explicit_navigation.get() {
+            self.prefetch_neighbors();
+            if restart_monitor {
+                self.monitor_directory();
+            }
+            return;
+        }
         let fallback = self.0.settings.folder_sort();
         let expected_file = file.clone();
         let generation = self.0.directory_refresh_generation.get().wrapping_add(1);
@@ -3242,6 +3317,11 @@ impl ViewerWindow {
         };
 
         if let Some(target) = pending.current_renamed_to.filter(is_regular_file) {
+            if self.0.explicit_navigation.get()
+                && let Some(sequence) = self.0.sequence.borrow_mut().as_mut()
+            {
+                sequence.replace_file(&current, target.clone());
+            }
             self.0.current_file.replace(Some(target.clone()));
             if let Some(document) = self.0.document.borrow_mut().as_mut() {
                 document.set_path(target.path());
@@ -3264,17 +3344,27 @@ impl ViewerWindow {
         }
 
         if pending.current_removed && !is_regular_file(&current) {
-            let replacement = self.0.sequence.borrow().as_ref().and_then(|sequence| {
-                sequence
-                    .replacements_after_current_removed()
-                    .find(is_regular_file)
-            });
             let dirty = self
                 .0
                 .document
                 .borrow()
                 .as_ref()
                 .is_some_and(Document::is_dirty);
+            let replacement = if dirty {
+                None
+            } else if self.0.explicit_navigation.get() {
+                self.0
+                    .sequence
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|sequence| sequence.remove_file(&current))
+            } else {
+                self.0.sequence.borrow().as_ref().and_then(|sequence| {
+                    sequence
+                        .replacements_after_current_removed()
+                        .find(is_regular_file)
+                })
+            };
             if !dirty && let Some(replacement) = replacement {
                 self.0
                     .pending_comparison
@@ -3285,7 +3375,9 @@ impl ViewerWindow {
                     .add_toast(adw::Toast::new("The previous image was moved or deleted"));
                 return;
             }
-            self.0.sequence.replace(None);
+            if !self.0.explicit_navigation.get() {
+                self.0.sequence.replace(None);
+            }
             self.prefetch_neighbors();
             self.0.external_source_conflict.set(true);
             self.0.title.set_subtitle("File moved or deleted");
@@ -4150,6 +4242,17 @@ impl ViewerWindow {
         }
         if let Some((next_sequence, file)) = next {
             if !is_regular_file(&file) {
+                if self.0.explicit_navigation.get() {
+                    if let Some(sequence) = self.0.sequence.borrow_mut().as_mut() {
+                        sequence.remove_file(&file);
+                    }
+                    self.prefetch_neighbors();
+                    self.0.toasts.add_toast(adw::Toast::new(
+                        "That image was moved or deleted; it was removed from the opened files",
+                    ));
+                    self.navigate(forward);
+                    return;
+                }
                 if let Some(current) = self.0.current_file.borrow().clone() {
                     self.refresh_navigation(current, false);
                 }
@@ -4248,6 +4351,7 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .and_then(DirectorySequence::replacement_after_current_removed);
+        let explicit_navigation = self.0.explicit_navigation.get();
         let fallback = self.0.settings.folder_sort();
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
@@ -4255,7 +4359,7 @@ impl ViewerWindow {
         let generation = self.0.load_generation.get();
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
-            let replacement = if known_replacement.is_some() {
+            let replacement = if explicit_navigation || known_replacement.is_some() {
                 known_replacement
             } else {
                 let sequence_file = file.clone();
@@ -4282,7 +4386,7 @@ impl ViewerWindow {
                 return;
             }
             if state.load_generation.get() != generation
-                || !files_equal(&state.current_file.borrow(), &Some(file))
+                || !files_equal(&state.current_file.borrow(), &Some(file.clone()))
             {
                 state.deletion_running.set(false);
                 this.monitor_directory();
@@ -4291,6 +4395,15 @@ impl ViewerWindow {
             if let Some(document) = state.document.borrow_mut().as_mut() {
                 document.restore_original();
             }
+            let replacement = if state.explicit_navigation.get() {
+                state
+                    .sequence
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|sequence| sequence.remove_file(&file))
+            } else {
+                replacement
+            };
             state.deletion_running.set(false);
             state.toasts.add_toast(adw::Toast::new("Image deleted"));
             if let Some(replacement) = replacement {
@@ -5495,17 +5608,23 @@ mod tests {
     }
 
     #[test]
-    fn image_subtitle_places_modified_time_after_zoom() {
+    fn image_subtitle_includes_folder_and_places_modified_time_after_zoom() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         let modified = now - Duration::from_secs(3 * 60);
 
         assert_eq!(
-            image_subtitle((1920, 1080), 1.25, Some(modified), now),
-            "1920 × 1080 · 125% · 3 minutes ago"
+            image_subtitle(
+                "/images/comparison",
+                (1920, 1080),
+                1.25,
+                Some(modified),
+                now
+            ),
+            "/images/comparison · 1920 × 1080 · 125% · 3 minutes ago"
         );
         assert_eq!(
-            image_subtitle((640, 480), 0.5, None, now),
-            "640 × 480 · 50%"
+            image_subtitle("/images/comparison", (640, 480), 0.5, None, now),
+            "/images/comparison · 640 × 480 · 50%"
         );
     }
 
@@ -5581,6 +5700,16 @@ mod tests {
             pencil_line_start(PencilDragMode::Rectangle, Some(anchor), origin),
             origin
         );
+        assert_eq!(
+            pencil_drag_path(PencilDragMode::Freehand),
+            StrokePath::Smooth
+        );
+        assert_eq!(pencil_drag_path(PencilDragMode::Line), StrokePath::Linear);
+        assert_eq!(
+            pencil_drag_path(PencilDragMode::Rectangle),
+            StrokePath::Linear
+        );
+        assert_eq!(pencil_drag_path(PencilDragMode::Circle), StrokePath::Circle);
     }
 
     #[test]
@@ -5781,6 +5910,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn copied_selection_deactivates_the_selection_tool() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.SelectionClipboardTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        window.0.rendered.replace(Some(image));
+        window.0.selection_button.set_active(true);
+
+        window.complete_selection(SelectionDrag {
+            start: (0, 0),
+            current: (1, 1),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (2, 2),
+        });
+
+        assert!(!window.0.selection_button.is_active());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn completed_measurement_is_written_to_the_clipboard() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -5897,6 +6052,32 @@ mod tests {
         window.0.canvas_overlay.allocate(1000, 600, -1, None);
         assert_eq!(window.0.scale_controls.width(), 948);
         assert!(window.0.scale_slider.width() > 260);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn multiple_opened_files_seed_one_explicit_navigation_sequence() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.MultiFileOpenTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let files = ["third.png", "first.png", "second.png"].map(gio::File::for_path);
+        let window = ViewerWindow::new_with_files(&application, &files);
+
+        assert_eq!(application.windows().len(), 1);
+        assert!(window.0.explicit_navigation.get());
+        assert!(files_equal(
+            &window.0.current_file.borrow(),
+            &Some(files[0].clone())
+        ));
+        let sequence = window.0.sequence.borrow();
+        let sequence = sequence.as_ref().expect("explicit navigation sequence");
+        assert_eq!(sequence.len(), 3);
+        assert_eq!(sequence.current().uri(), files[0].uri());
     }
 
     #[test]

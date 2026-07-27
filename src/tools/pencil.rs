@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use image::{Rgba, RgbaImage};
 
 use crate::document::{BrushPoint, CancellationToken, Stroke, StrokePath};
@@ -37,27 +39,7 @@ pub fn shape_points(shape: PencilShape) -> Vec<BrushPoint> {
             },
             start,
         ],
-        PencilShape::Circle { center, edge } => {
-            let radius = distance(center, edge);
-            if radius <= f32::EPSILON {
-                return vec![center];
-            }
-            let segments = (std::f32::consts::TAU * radius)
-                .ceil()
-                .clamp(12.0, 65_536.0) as u32;
-            let mut points = (0..segments)
-                .map(|index| {
-                    let angle = std::f32::consts::TAU * index as f32 / segments as f32;
-                    BrushPoint {
-                        x: center.x + radius * angle.cos(),
-                        y: center.y + radius * angle.sin(),
-                        pressure: center.pressure,
-                    }
-                })
-                .collect::<Vec<_>>();
-            points.push(points[0]);
-            points
-        }
+        PencilShape::Circle { center, edge } => vec![center, edge],
     }
 }
 
@@ -81,16 +63,190 @@ pub fn paint_stroke(
         return Ok(output);
     }
 
+    if stroke.width == 1.0 && stroke.hardness == 1.0 {
+        paint_pixel_stroke(&mut output, stroke, cancellation)?;
+        return Ok(output);
+    }
+
     let spacing = (stroke.width * 0.2).max(0.25);
     let points = match stroke.path {
         StrokePath::Smooth => smooth_path(&stroke.points, spacing),
         StrokePath::Linear => linear_path(&stroke.points, spacing),
+        StrokePath::Circle => circle_path(&stroke.points),
     };
     for point in points {
         cancellation.check()?;
         stamp(&mut output, point.x, point.y, point.pressure, stroke);
     }
     Ok(output)
+}
+
+fn paint_pixel_stroke(
+    image: &mut RgbaImage,
+    stroke: &Stroke,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    // A one-pixel pen must select logical pixels directly. Subpixel brush stamps can touch both
+    // sides of a half-pixel boundary and turn a diagonal into a two-pixel-wide corner.
+    let points = match stroke.path {
+        StrokePath::Smooth => pixel_perfect_freehand(&stroke.points),
+        StrokePath::Linear => bresenham_polyline(&stroke.points),
+        StrokePath::Circle => bresenham_circle_path(&stroke.points),
+    };
+    let mut painted = HashSet::with_capacity(points.len());
+    let source_alpha = f32::from(stroke.color[3]) / 255.0 * stroke.opacity;
+
+    for (index, (x, y)) in points.into_iter().enumerate() {
+        if index % 4096 == 0 {
+            cancellation.check()?;
+        }
+        if !painted.insert((x, y)) || x < 0 || y < 0 {
+            continue;
+        }
+        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+            continue;
+        };
+        if x >= image.width() || y >= image.height() {
+            continue;
+        }
+        let destination = image.get_pixel_mut(x, y);
+        *destination = blend(*destination, Rgba(stroke.color), source_alpha);
+    }
+    Ok(())
+}
+
+fn pixel_perfect_freehand(points: &[BrushPoint]) -> Vec<(i64, i64)> {
+    let points = brush_pixels(points);
+    let Some(&first) = points.first() else {
+        return Vec::new();
+    };
+    let mut path = vec![first];
+    for pair in points.windows(2) {
+        for point in bresenham_line(pair[0], pair[1]).into_iter().skip(1) {
+            append_pixel_perfect(&mut path, point);
+        }
+    }
+    path
+}
+
+fn append_pixel_perfect(path: &mut Vec<(i64, i64)>, point: (i64, i64)) {
+    if path.last() == Some(&point) {
+        return;
+    }
+    path.push(point);
+    while path.len() >= 3 {
+        let end = path.len();
+        let (start, corner, finish) = (path[end - 3], path[end - 2], path[end - 1]);
+        if !is_redundant_corner(start, corner, finish) {
+            break;
+        }
+        // Join the two diagonal pixels directly instead of retaining the orthogonal corner pixel.
+        path.remove(end - 2);
+    }
+}
+
+fn is_redundant_corner(start: (i64, i64), corner: (i64, i64), finish: (i64, i64)) -> bool {
+    start.0.abs_diff(finish.0) == 1
+        && start.1.abs_diff(finish.1) == 1
+        && manhattan_distance(start, corner) == 1
+        && manhattan_distance(corner, finish) == 1
+}
+
+fn manhattan_distance(left: (i64, i64), right: (i64, i64)) -> u64 {
+    left.0.abs_diff(right.0) + left.1.abs_diff(right.1)
+}
+
+fn bresenham_polyline(points: &[BrushPoint]) -> Vec<(i64, i64)> {
+    let points = brush_pixels(points);
+    let Some(&first) = points.first() else {
+        return Vec::new();
+    };
+    let mut path = vec![first];
+    for pair in points.windows(2) {
+        let segment = bresenham_line(pair[0], pair[1]);
+        path.extend(segment.into_iter().skip(1));
+    }
+    path
+}
+
+fn brush_pixels(points: &[BrushPoint]) -> Vec<(i64, i64)> {
+    points
+        .iter()
+        .map(|point| (point.x.floor() as i64, point.y.floor() as i64))
+        .fold(Vec::new(), |mut pixels, pixel| {
+            if pixels.last() != Some(&pixel) {
+                pixels.push(pixel);
+            }
+            pixels
+        })
+}
+
+fn bresenham_line(start: (i64, i64), end: (i64, i64)) -> Vec<(i64, i64)> {
+    // All-octant error update from the extended Bresenham rasterizer.
+    let (mut x, mut y) = start;
+    let dx = end.0.abs_diff(x) as i64;
+    let step_x = if x < end.0 { 1 } else { -1 };
+    let dy = -(end.1.abs_diff(y) as i64);
+    let step_y = if y < end.1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    let mut points = Vec::with_capacity(usize::try_from(dx.max(-dy) + 1).unwrap_or(0));
+
+    loop {
+        points.push((x, y));
+        if (x, y) == end {
+            break;
+        }
+        let doubled_error = 2 * error;
+        if doubled_error >= dy {
+            error += dy;
+            x += step_x;
+        }
+        if doubled_error <= dx {
+            error += dx;
+            y += step_y;
+        }
+    }
+    points
+}
+
+fn bresenham_circle_path(points: &[BrushPoint]) -> Vec<(i64, i64)> {
+    let Some(center) = points.first() else {
+        return Vec::new();
+    };
+    let center = (center.x.floor() as i64, center.y.floor() as i64);
+    let Some(edge) = points.get(1) else {
+        return vec![center];
+    };
+    let edge = (edge.x.floor() as i64, edge.y.floor() as i64);
+    let radius = ((edge.0 - center.0) as f64)
+        .hypot((edge.1 - center.1) as f64)
+        .round() as i64;
+    if radius == 0 {
+        return vec![center];
+    }
+
+    // The four-way symmetric integer circle is the circle extension of the same error algorithm.
+    let (mut x, mut y) = (-radius, 0);
+    let mut error = 2 - 2 * radius;
+    let mut path = Vec::with_capacity(usize::try_from(radius.saturating_mul(8)).unwrap_or(0));
+    while x < 0 {
+        path.extend([
+            (center.0 - x, center.1 + y),
+            (center.0 - y, center.1 - x),
+            (center.0 + x, center.1 - y),
+            (center.0 + y, center.1 + x),
+        ]);
+        let previous_error = error;
+        if previous_error <= y {
+            y += 1;
+            error += y * 2 + 1;
+        }
+        if previous_error > x || error > y {
+            x += 1;
+            error += x * 2 + 1;
+        }
+    }
+    path
 }
 
 fn smooth_path(points: &[BrushPoint], spacing: f32) -> Vec<BrushPoint> {
@@ -147,6 +303,17 @@ fn linear_path(points: &[BrushPoint], spacing: f32) -> Vec<BrushPoint> {
         append_linear(&mut path, pair[0], pair[1], spacing);
     }
     path
+}
+
+fn circle_path(points: &[BrushPoint]) -> Vec<BrushPoint> {
+    bresenham_circle_path(points)
+        .into_iter()
+        .map(|(x, y)| BrushPoint {
+            x: x as f32 + 0.5,
+            y: y as f32 + 0.5,
+            pressure: points.first().map_or(1.0, |point| point.pressure),
+        })
+        .collect()
 }
 
 fn append_linear(path: &mut Vec<BrushPoint>, start: BrushPoint, end: BrushPoint, spacing: f32) {
@@ -247,10 +414,22 @@ fn blend(destination: Rgba<u8>, source: Rgba<u8>, source_alpha: f32) -> Rgba<u8>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use image::{Rgba, RgbaImage};
 
-    use super::{PencilShape, paint_stroke, sample, shape_points, smooth_path};
+    use super::{
+        PencilShape, bresenham_circle_path, bresenham_line, paint_stroke, pixel_perfect_freehand,
+        sample, shape_points, smooth_path,
+    };
     use crate::document::{BrushPoint, CancellationToken, Stroke, StrokePath};
+
+    fn painted_pixels(image: &RgbaImage) -> HashSet<(i64, i64)> {
+        image
+            .enumerate_pixels()
+            .filter_map(|(x, y, pixel)| (pixel.0[3] > 0).then_some((i64::from(x), i64::from(y))))
+            .collect()
+    }
 
     #[test]
     fn samples_exact_rgba() {
@@ -333,7 +512,7 @@ mod tests {
             ],
             path: StrokePath::Smooth,
             color: [255, 0, 0, 255],
-            width: 1.0,
+            width: 3.0,
             opacity: 1.0,
             hardness: 1.0,
         };
@@ -379,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn circle_path_is_closed_and_keeps_a_constant_radius() {
+    fn circle_shape_keeps_the_center_and_edge_for_integer_rasterization() {
         let center = BrushPoint {
             x: 10.5,
             y: 12.5,
@@ -392,12 +571,193 @@ mod tests {
         };
         let path = shape_points(PencilShape::Circle { center, edge });
 
-        assert!(path.len() >= 13);
-        assert_eq!(path.first(), path.last());
-        assert!(path.iter().all(|point| {
-            ((point.x - center.x).hypot(point.y - center.y) - 5.0).abs() < 0.001
-                && point.pressure == center.pressure
-        }));
+        assert_eq!(path, [center, edge]);
+    }
+
+    #[test]
+    fn extended_bresenham_line_selects_one_exact_pixel_per_major_axis_step() {
+        assert_eq!(bresenham_line((2, 2), (2, 2)), [(2, 2)]);
+        assert_eq!(
+            bresenham_line((1, 1), (6, 3)),
+            [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)]
+        );
+        assert_eq!(
+            bresenham_line((6, 3), (1, 1)),
+            [(6, 3), (5, 3), (4, 2), (3, 2), (2, 1), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn freehand_bresenham_removes_the_fat_pixel_at_a_diagonal_turn() {
+        let points = [
+            BrushPoint {
+                x: 1.5,
+                y: 1.5,
+                pressure: 1.0,
+            },
+            BrushPoint {
+                x: 2.5,
+                y: 1.5,
+                pressure: 1.0,
+            },
+            BrushPoint {
+                x: 2.5,
+                y: 2.5,
+                pressure: 1.0,
+            },
+            BrushPoint {
+                x: 3.5,
+                y: 3.5,
+                pressure: 1.0,
+            },
+        ];
+
+        assert_eq!(pixel_perfect_freehand(&points), [(1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn one_pixel_freehand_and_line_strokes_paint_the_exact_raster_paths() {
+        let image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+        let paint = |points, path| {
+            paint_stroke(
+                &image,
+                &Stroke {
+                    points,
+                    path,
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                    opacity: 1.0,
+                    hardness: 1.0,
+                },
+                &CancellationToken::default(),
+            )
+            .map(|output| painted_pixels(&output))
+            .unwrap()
+        };
+
+        let freehand = paint(
+            vec![
+                BrushPoint {
+                    x: 1.5,
+                    y: 1.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 2.5,
+                    y: 1.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 2.5,
+                    y: 2.5,
+                    pressure: 1.0,
+                },
+            ],
+            StrokePath::Smooth,
+        );
+        assert_eq!(freehand, HashSet::from([(1, 1), (2, 2)]));
+
+        let line = paint(
+            vec![
+                BrushPoint {
+                    x: 1.5,
+                    y: 1.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 6.5,
+                    y: 3.5,
+                    pressure: 1.0,
+                },
+            ],
+            StrokePath::Linear,
+        );
+        assert_eq!(
+            line,
+            HashSet::from([(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)])
+        );
+    }
+
+    #[test]
+    fn extended_bresenham_circle_is_exact_and_symmetric() {
+        let center = BrushPoint {
+            x: 4.5,
+            y: 4.5,
+            pressure: 1.0,
+        };
+        let edge = BrushPoint {
+            x: 6.5,
+            y: 4.5,
+            pressure: 1.0,
+        };
+        let actual = bresenham_circle_path(&[center, edge])
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected = HashSet::from([
+            (6, 4),
+            (4, 6),
+            (2, 4),
+            (4, 2),
+            (6, 5),
+            (3, 6),
+            (2, 3),
+            (5, 2),
+            (5, 6),
+            (2, 5),
+            (3, 2),
+            (6, 3),
+        ]);
+
+        assert!(bresenham_circle_path(&[]).is_empty());
+        assert_eq!(bresenham_circle_path(&[center]), [(4, 4)]);
+        assert_eq!(bresenham_circle_path(&[center, center]), [(4, 4)]);
+        assert_eq!(actual, expected);
+        for &(x, y) in &actual {
+            assert!(actual.contains(&(8 - x, y)));
+            assert!(actual.contains(&(x, 8 - y)));
+        }
+    }
+
+    #[test]
+    fn one_pixel_circle_paints_only_the_bresenham_ring() {
+        let image = RgbaImage::from_pixel(9, 9, Rgba([0, 0, 0, 0]));
+        let stroke = Stroke {
+            points: vec![
+                BrushPoint {
+                    x: 4.5,
+                    y: 4.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 6.5,
+                    y: 4.5,
+                    pressure: 1.0,
+                },
+            ],
+            path: StrokePath::Circle,
+            color: [255, 0, 0, 255],
+            width: 1.0,
+            opacity: 1.0,
+            hardness: 1.0,
+        };
+
+        let output = paint_stroke(&image, &stroke, &CancellationToken::default()).unwrap();
+        let painted = painted_pixels(&output);
+        let expected = bresenham_circle_path(&stroke.points)
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(painted, expected);
+        for x in 0..8 {
+            for y in 0..8 {
+                assert!(
+                    ![(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+                        .into_iter()
+                        .all(|point| painted.contains(&point)),
+                    "fat 2 × 2 block starts at {x},{y}"
+                );
+            }
+        }
     }
 
     #[test]

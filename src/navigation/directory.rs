@@ -36,6 +36,15 @@ pub struct DirectorySequence {
 }
 
 impl DirectorySequence {
+    pub fn from_files(files: &[gio::File]) -> Option<Self> {
+        (!files.is_empty()).then(|| Self {
+            entries: files.to_vec(),
+            current: 0,
+            order: SortOrder::Name,
+            reversed: false,
+        })
+    }
+
     pub fn build(current: &gio::File, fallback: SortOrder) -> Result<Self> {
         let parent = current
             .parent()
@@ -157,6 +166,29 @@ impl DirectorySequence {
             .iter()
             .chain(self.entries[..self.current].iter().rev())
             .cloned()
+    }
+
+    pub fn remove_file(&mut self, file: &gio::File) -> Option<gio::File> {
+        let index = self.entries.iter().position(|entry| entry.equal(file))?;
+        self.entries.remove(index);
+        if self.entries.is_empty() {
+            self.current = 0;
+            return None;
+        }
+        if index < self.current {
+            self.current -= 1;
+        } else if self.current >= self.entries.len() {
+            self.current = self.entries.len() - 1;
+        }
+        self.entries.get(self.current).cloned()
+    }
+
+    pub fn replace_file(&mut self, source: &gio::File, target: gio::File) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.equal(source)) else {
+            return false;
+        };
+        *entry = target;
+        true
     }
 }
 
@@ -424,6 +456,64 @@ mod tests {
             Some("b.png".into())
         );
         assert!(single.replacement_after_current_removed().is_none());
+    }
+
+    #[test]
+    fn explicit_files_preserve_the_supplied_navigation_order() {
+        assert!(DirectorySequence::from_files(&[]).is_none());
+        let files = ["third.png", "first.png", "second.png"].map(gio::File::for_path);
+        let mut sequence =
+            DirectorySequence::from_files(&files).expect("non-empty explicit sequence");
+
+        assert_eq!(
+            sequence.current().basename().as_deref(),
+            Some(std::path::Path::new("third.png"))
+        );
+        assert_eq!(
+            sequence
+                .next_image()
+                .and_then(gio::File::basename)
+                .as_deref(),
+            Some(std::path::Path::new("first.png"))
+        );
+        assert_eq!(
+            sequence
+                .next_image()
+                .and_then(gio::File::basename)
+                .as_deref(),
+            Some(std::path::Path::new("second.png"))
+        );
+        assert!(sequence.next_image().is_none());
+    }
+
+    #[test]
+    fn explicit_sequence_tracks_removed_and_renamed_files() {
+        let files = ["first.png", "second.png", "third.png"].map(gio::File::for_path);
+        let mut sequence =
+            DirectorySequence::from_files(&files).expect("non-empty explicit sequence");
+        sequence.next_image();
+
+        let replacement = sequence
+            .remove_file(&files[1])
+            .expect("next file replaces removed current file");
+        assert_eq!(
+            replacement.basename().as_deref(),
+            Some(std::path::Path::new("third.png"))
+        );
+        let renamed = gio::File::for_path("renamed.png");
+        assert!(sequence.replace_file(&files[2], renamed.clone()));
+        assert_eq!(sequence.current().uri(), renamed.uri());
+        assert!(!sequence.replace_file(&files[1], gio::File::for_path("missing.png")));
+
+        assert_eq!(
+            sequence
+                .remove_file(&renamed)
+                .and_then(|file| file.basename()),
+            Some("first.png".into())
+        );
+        assert!(sequence.remove_file(&files[0]).is_none());
+        assert!(sequence.is_empty());
+        assert!(sequence.remove_file(&files[1]).is_none());
     }
 
     #[test]
