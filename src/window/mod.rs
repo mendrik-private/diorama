@@ -76,6 +76,15 @@ struct MeasurementDrag {
     image_dimensions: (u32, u32),
 }
 
+#[derive(Clone, Copy)]
+struct ZoomRectDrag {
+    start: (u32, u32),
+    current: (u32, u32),
+    start_screen: (f64, f64),
+    image_dimensions: (u32, u32),
+    load_generation: u64,
+}
+
 struct PencilDrag {
     canvas: ImageCanvas,
     start_screen: (f64, f64),
@@ -142,6 +151,14 @@ fn pencil_drag_points(drag: &PencilDrag, mode: PencilDragMode) -> Vec<BrushPoint
     }
 }
 
+fn pencil_drag_path(mode: PencilDragMode) -> StrokePath {
+    match mode {
+        PencilDragMode::Freehand => StrokePath::Smooth,
+        PencilDragMode::Line | PencilDragMode::Rectangle => StrokePath::Linear,
+        PencilDragMode::Circle => StrokePath::Circle,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ZoomGestureAnchor {
     start_zoom: f64,
@@ -149,6 +166,13 @@ struct ZoomGestureAnchor {
     content_y: f64,
     horizontal_value: f64,
     vertical_value: f64,
+}
+
+#[derive(Clone, Copy)]
+enum ZoomAlignment {
+    Nearest,
+    Contain,
+    Cover,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -336,14 +360,40 @@ fn selection_overlay(drag: SelectionDrag) -> Option<CropOverlay> {
 }
 
 fn measurement_overlay(drag: MeasurementDrag) -> CropOverlay {
+    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
+}
+
+fn zoom_rect_overlay(drag: ZoomRectDrag) -> CropOverlay {
+    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
+}
+
+fn boundary_overlay(
+    start: (u32, u32),
+    current: (u32, u32),
+    image_dimensions: (u32, u32),
+) -> CropOverlay {
     CropOverlay {
-        x: drag.start.0.min(drag.current.0),
-        y: drag.start.1.min(drag.current.1),
-        width: drag.start.0.abs_diff(drag.current.0),
-        height: drag.start.1.abs_diff(drag.current.1),
-        image_width: drag.image_dimensions.0,
-        image_height: drag.image_dimensions.1,
+        x: start.0.min(current.0),
+        y: start.1.min(current.1),
+        width: start.0.abs_diff(current.0),
+        height: start.1.abs_diff(current.1),
+        image_width: image_dimensions.0,
+        image_height: image_dimensions.1,
     }
+}
+
+fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64> {
+    if !usable_panel_size(viewport) || selection.width == 0 || selection.height == 0 {
+        return None;
+    }
+    Some(
+        (f64::from(viewport.0) / f64::from(selection.width))
+            .min(f64::from(viewport.1) / f64::from(selection.height)),
+    )
+}
+
+fn no_tool_active(active_tools: &[bool]) -> bool {
+    !active_tools.iter().any(|active| *active)
 }
 
 fn measurement_clipboard_text(measurement: CropOverlay) -> String {
@@ -425,12 +475,18 @@ fn relative_modified_time(modified: SystemTime, now: SystemTime) -> String {
 }
 
 fn image_subtitle(
+    folder: &str,
     dimensions: (u32, u32),
     zoom: f64,
     modified: Option<SystemTime>,
     now: SystemTime,
 ) -> String {
-    let details = format!("{} × {} · {:.0}%", dimensions.0, dimensions.1, zoom * 100.0);
+    let details = format!(
+        "{folder} · {} × {} · {:.0}%",
+        dimensions.0,
+        dimensions.1,
+        zoom * 100.0
+    );
     match modified {
         Some(modified) => format!("{details} · {}", relative_modified_time(modified, now)),
         None => details,
@@ -440,6 +496,46 @@ fn image_subtitle(
 fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
     (f64::from(size.0.max(1)) / f64::from(dimensions.0.max(1)))
         .min(f64::from(size.1.max(1)) / f64::from(dimensions.1.max(1)))
+}
+
+fn normalized_render_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.round().max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn aligned_hard_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
+    if zoom < 1.0 {
+        return zoom;
+    }
+    let render_scale = normalized_render_scale(render_scale);
+    let render_zoom = zoom * render_scale;
+    let render_zoom = match alignment {
+        ZoomAlignment::Nearest => render_zoom.round(),
+        ZoomAlignment::Contain => render_zoom.floor(),
+        ZoomAlignment::Cover => render_zoom.ceil(),
+    }
+    .max(render_scale);
+    render_zoom / render_scale
+}
+
+fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {
+    let render_scale = normalized_render_scale(render_scale);
+    let render_zoom = zoom * render_scale;
+    let next = if zoom >= 1.0 {
+        if zoom_in {
+            render_zoom.floor() + 1.0
+        } else if zoom > 1.0 + 1e-6 {
+            (render_zoom.ceil() - 1.0).max(render_scale)
+        } else {
+            render_zoom * 0.8
+        }
+    } else {
+        render_zoom * if zoom_in { 1.25 } else { 0.8 }
+    };
+    next / render_scale
 }
 
 fn usable_panel_size(size: (i32, i32)) -> bool {
@@ -484,6 +580,7 @@ struct WindowState {
     settings: Settings,
     current_file: RefCell<Option<gio::File>>,
     sequence: RefCell<Option<DirectorySequence>>,
+    explicit_navigation: Cell<bool>,
     cancellable: RefCell<Option<gio::Cancellable>>,
     render_cancellation: RefCell<Option<CancellationToken>>,
     load_generation: Cell<u64>,
@@ -502,6 +599,7 @@ struct WindowState {
     pencil_color: Cell<[u8; 4]>,
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
+    zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     color_picker_button: gtk::ToggleButton,
@@ -557,6 +655,7 @@ struct WindowState {
     fit_tick_scheduled: Cell<bool>,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
+    render_scale: Cell<f64>,
     scale_button: gtk::ToggleButton,
     scale_controls: gtk::Box,
     scale_slider: gtk::Scale,
@@ -570,6 +669,18 @@ struct WindowState {
 
 impl ViewerWindow {
     pub fn new(application: &adw::Application, file: Option<gio::File>) -> Self {
+        let files = file.into_iter().collect::<Vec<_>>();
+        Self::new_with_files(application, &files)
+    }
+
+    pub fn new_with_files(application: &adw::Application, files: &[gio::File]) -> Self {
+        let initial_file = files.first().cloned();
+        let initial_sequence = if files.len() > 1 {
+            DirectorySequence::from_files(files)
+        } else {
+            None
+        };
+        let explicit_navigation = initial_sequence.is_some();
         let settings = Settings::default();
         let canvas = ImageCanvas::default();
         canvas.set_filter(settings.zoom_filter());
@@ -738,7 +849,8 @@ impl ViewerWindow {
             toasts,
             settings,
             current_file: RefCell::new(None),
-            sequence: RefCell::new(None),
+            sequence: RefCell::new(initial_sequence),
+            explicit_navigation: Cell::new(explicit_navigation),
             cancellable: RefCell::new(None),
             render_cancellation: RefCell::new(None),
             load_generation: Cell::new(0),
@@ -757,6 +869,7 @@ impl ViewerWindow {
             pencil_color: Cell::new([0, 0, 0, 255]),
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
+            zoom_rect_drag: Cell::new(None),
             selection_button: header_widgets.selection_button,
             selection_drag: Cell::new(None),
             color_picker_button: header_widgets.color_picker_button,
@@ -810,6 +923,7 @@ impl ViewerWindow {
             fit_tick_scheduled: Cell::new(false),
             zoom_controls,
             zoom_label,
+            render_scale: Cell::new(1.0),
             scale_button: header_widgets.scale_button,
             scale_controls,
             scale_slider,
@@ -829,11 +943,12 @@ impl ViewerWindow {
         this.install_tool_controls();
         this.install_scale_controls();
         this.install_gestures();
+        this.install_render_scale_tracking();
         this.install_minimap();
         this.connect_single_image_lens();
         this.install_state_persistence();
         this.install_subtitle_clock();
-        if let Some(file) = file {
+        if let Some(file) = initial_file {
             this.load(file);
         }
         this
@@ -869,7 +984,30 @@ impl ViewerWindow {
         self.load_with_fit(file, false);
     }
 
+    fn load_from_new_scope(&self, file: gio::File) {
+        if self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(Document::is_dirty)
+        {
+            let this = self.clone();
+            self.confirm_discard("Discard unsaved edits and open another image?", move || {
+                if let Some(document) = this.0.document.borrow_mut().as_mut() {
+                    document.restore_original();
+                }
+                this.load_from_new_scope(file.clone());
+            });
+            return;
+        }
+        self.0.explicit_navigation.set(false);
+        self.0.sequence.replace(None);
+        self.load(file);
+    }
+
     fn load_with_fit(&self, file: gio::File, fit: bool) {
+        self.cancel_zoom_rect_drag();
         self.0
             .navigation_generation
             .set(self.0.navigation_generation.get().wrapping_add(1));
@@ -919,7 +1057,9 @@ impl ViewerWindow {
             .pending_directory_changes
             .replace(PendingDirectoryChanges::default());
         self.0.directory_refresh_scheduled.set(false);
-        self.0.sequence.replace(None);
+        if !self.0.explicit_navigation.get() {
+            self.0.sequence.replace(None);
+        }
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
         }
@@ -974,6 +1114,7 @@ impl ViewerWindow {
                     if fit {
                         ViewerWindow(state.clone()).fit(false);
                     }
+                    ViewerWindow(state.clone()).update_subtitle();
                     if preview.animation_delay.is_some() {
                         ViewerWindow(state.clone()).start_animation(file.clone(), generation);
                     }
@@ -1044,22 +1185,30 @@ impl ViewerWindow {
                 let this = this.clone();
                 glib::spawn_future_local(async move {
                     if let Ok(file) = dialog.open_future(Some(&parent)).await {
-                        this.load(file);
+                        this.load_from_new_scope(file);
                     }
                 });
             }
+        });
+        self.add_action("open-with", {
+            let this = self.clone();
+            move || this.open_with()
         });
         self.add_action("close", {
             let window = self.0.window.clone();
             move || window.close()
         });
+        self.add_action("copy-image", {
+            let this = self.clone();
+            move || this.copy_current_image_to_clipboard()
+        });
         self.add_action("zoom-in", {
             let this = self.clone();
-            move || this.set_zoom(this.0.canvas.zoom() * 1.25)
+            move || this.step_zoom(true)
         });
         self.add_action("zoom-out", {
             let this = self.clone();
-            move || this.set_zoom(this.0.canvas.zoom() / 1.25)
+            move || this.step_zoom(false)
         });
         self.add_action("actual-size", {
             let this = self.clone();
@@ -1102,6 +1251,7 @@ impl ViewerWindow {
                     canvas.set_filter(filter);
                 }
                 this.0.settings.set_zoom_filter(filter);
+                this.set_zoom(this.0.canvas.zoom());
             }
         });
         self.add_action("previous", {
@@ -1258,6 +1408,10 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.0.zoom_rect_drag.get().is_some() {
+                    this.cancel_zoom_rect_drag();
+                    return;
+                }
                 if this.0.measurement_button.is_active() {
                     this.0.measurement_button.set_active(false);
                     return;
@@ -1427,6 +1581,7 @@ impl ViewerWindow {
 
     fn set_scale_preview_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -1549,6 +1704,7 @@ impl ViewerWindow {
 
     fn set_pencil_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -1587,6 +1743,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -1631,6 +1788,43 @@ impl ViewerWindow {
             .add_toast(adw::Toast::new(&format!("Copied {text}")));
     }
 
+    fn copy_current_image_to_clipboard(&self) {
+        let Some(texture) = self.0.canvas.texture() else {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an image first"));
+            return;
+        };
+        self.0.window.clipboard().set_texture(&texture);
+        self.0.toasts.add_toast(adw::Toast::new(&format!(
+            "Copied {} × {} image",
+            texture.width(),
+            texture.height()
+        )));
+    }
+
+    fn open_with(&self) {
+        let Some(file) = self.0.current_file.borrow().clone() else {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new("Open an image first"));
+            return;
+        };
+        let launcher = open_with_launcher(&file);
+        let parent = self.0.window.clone();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            if let Err(error) = launcher.launch_future(Some(&parent)).await
+                && !open_with_was_cancelled(&error)
+                && let Some(state) = weak.upgrade()
+            {
+                state.toasts.add_toast(adw::Toast::new(&format!(
+                    "Could not open image with another app: {error}"
+                )));
+            }
+        });
+    }
+
     fn set_selection_active(&self, active: bool) {
         if active && self.0.rendered.borrow().is_none() {
             self.0.selection_button.set_active(false);
@@ -1640,6 +1834,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.color_picker_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -1674,6 +1869,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -1812,6 +2008,7 @@ impl ViewerWindow {
             Ok(texture) => {
                 self.0.window.clipboard().set_texture(&texture);
                 self.0.toasts.add_toast(adw::Toast::new(message));
+                self.0.selection_button.set_active(false);
             }
             Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error)),
         }
@@ -1984,11 +2181,7 @@ impl ViewerWindow {
             pencil_drag_points(drag, mode)
         };
         self.0.pencil_points.replace(points);
-        self.0.pencil_path.set(if mode == PencilDragMode::Freehand {
-            StrokePath::Smooth
-        } else {
-            StrokePath::Linear
-        });
+        self.0.pencil_path.set(pencil_drag_path(mode));
         if canvas == &self.0.canvas {
             self.preview_pencil_stroke();
         } else {
@@ -2058,6 +2251,7 @@ impl ViewerWindow {
 
     fn set_edit_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -2219,9 +2413,13 @@ impl ViewerWindow {
         let Some(texture) = self.0.canvas.texture() else {
             return;
         };
+        let Some(file) = self.0.current_file.borrow().clone() else {
+            return;
+        };
         let dimensions = (texture.width() as u32, texture.height() as u32);
         let modified = *self.0.source_modified.borrow();
         self.0.title.set_subtitle(&image_subtitle(
+            &folder_path(&file),
             dimensions,
             self.0.canvas.zoom(),
             modified,
@@ -2490,6 +2688,12 @@ impl ViewerWindow {
                         let target = gio::File::for_path(&path);
                         if let Some(parent) = target.parent() {
                             state.settings.set_last_open_folder(&parent);
+                        }
+                        if state.explicit_navigation.get()
+                            && let Some(source) = source_file.as_ref()
+                            && let Some(sequence) = state.sequence.borrow_mut().as_mut()
+                        {
+                            sequence.replace_file(source, target.clone());
                         }
                         state.current_file.replace(Some(target.clone()));
                         ViewerWindow(state.clone()).rebuild_navigation(target);
@@ -2874,6 +3078,7 @@ impl ViewerWindow {
                 canvas.set_filter(zoom_filter);
                 canvas.set_background(background);
             }
+            this.set_zoom(this.0.canvas.zoom());
             this.0.lens_diameter.set(lens_diameter);
             this.0.settings.set_zoom_filter(zoom_filter);
             this.0.settings.set_background(background);
@@ -2901,6 +3106,7 @@ impl ViewerWindow {
                 "General",
                 vec![
                     ("Open", "<Control>o"),
+                    ("Copy Image", "<Control>c"),
                     ("Save", "<Control>s"),
                     ("Save As", "<Control><Shift>s"),
                     ("Close", "<Control>w"),
@@ -3129,6 +3335,14 @@ impl ViewerWindow {
     }
 
     fn rebuild_navigation(&self, file: gio::File) {
+        if self.0.explicit_navigation.get() {
+            if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
+                monitor.cancel();
+            }
+            self.prefetch_neighbors();
+            self.monitor_directory();
+            return;
+        }
         self.0.sequence.replace(None);
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
@@ -3138,6 +3352,13 @@ impl ViewerWindow {
     }
 
     fn refresh_navigation(&self, file: gio::File, restart_monitor: bool) {
+        if self.0.explicit_navigation.get() {
+            self.prefetch_neighbors();
+            if restart_monitor {
+                self.monitor_directory();
+            }
+            return;
+        }
         let fallback = self.0.settings.folder_sort();
         let expected_file = file.clone();
         let generation = self.0.directory_refresh_generation.get().wrapping_add(1);
@@ -3242,6 +3463,11 @@ impl ViewerWindow {
         };
 
         if let Some(target) = pending.current_renamed_to.filter(is_regular_file) {
+            if self.0.explicit_navigation.get()
+                && let Some(sequence) = self.0.sequence.borrow_mut().as_mut()
+            {
+                sequence.replace_file(&current, target.clone());
+            }
             self.0.current_file.replace(Some(target.clone()));
             if let Some(document) = self.0.document.borrow_mut().as_mut() {
                 document.set_path(target.path());
@@ -3264,17 +3490,27 @@ impl ViewerWindow {
         }
 
         if pending.current_removed && !is_regular_file(&current) {
-            let replacement = self.0.sequence.borrow().as_ref().and_then(|sequence| {
-                sequence
-                    .replacements_after_current_removed()
-                    .find(is_regular_file)
-            });
             let dirty = self
                 .0
                 .document
                 .borrow()
                 .as_ref()
                 .is_some_and(Document::is_dirty);
+            let replacement = if dirty {
+                None
+            } else if self.0.explicit_navigation.get() {
+                self.0
+                    .sequence
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|sequence| sequence.remove_file(&current))
+            } else {
+                self.0.sequence.borrow().as_ref().and_then(|sequence| {
+                    sequence
+                        .replacements_after_current_removed()
+                        .find(is_regular_file)
+                })
+            };
             if !dirty && let Some(replacement) = replacement {
                 self.0
                     .pending_comparison
@@ -3285,7 +3521,9 @@ impl ViewerWindow {
                     .add_toast(adw::Toast::new("The previous image was moved or deleted"));
                 return;
             }
-            self.0.sequence.replace(None);
+            if !self.0.explicit_navigation.get() {
+                self.0.sequence.replace(None);
+            }
             self.prefetch_neighbors();
             self.0.external_source_conflict.set(true);
             self.0.title.set_subtitle("File moved or deleted");
@@ -3433,6 +3671,7 @@ impl ViewerWindow {
         compare_canvas.set_texture(Some(&preview.texture));
         compare_canvas.set_filter(self.0.canvas.filter());
         compare_canvas.set_background(self.0.canvas.background());
+        compare_canvas.set_render_scale(self.0.render_scale.get());
         compare_canvas.set_zoom(self.0.canvas.zoom());
         compare_canvas.set_halign(gtk::Align::Center);
         compare_canvas.set_valign(gtk::Align::Center);
@@ -3550,8 +3789,7 @@ impl ViewerWindow {
                     .current_event_state()
                     .contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 {
-                    let factor = if dy < 0.0 { 1.25 } else { 0.8 };
-                    this.set_zoom(this.0.canvas.zoom() * factor);
+                    this.step_zoom(dy < 0.0);
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -3623,7 +3861,7 @@ impl ViewerWindow {
             ),
         );
         self.0.compare_fit_zooms.set(Some(fit_zooms));
-        self.set_zoom(fit_zooms.0);
+        self.set_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
         true
     }
 
@@ -3787,6 +4025,7 @@ impl ViewerWindow {
 
     fn set_single_image_lens_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
         }
@@ -3966,8 +4205,79 @@ impl ViewerWindow {
             .push((source.clone(), scroll.upcast()));
     }
 
+    fn zoom_rect_drag_available(&self) -> bool {
+        self.0.canvas.texture().is_some()
+            && no_tool_active(&[
+                self.0.measurement_button.is_active(),
+                self.0.selection_button.is_active(),
+                self.0.color_picker_button.is_active(),
+                self.0.scale_button.is_active(),
+                self.0.edit_button.is_active(),
+                self.0.pencil_active.get(),
+                self.0.lens_active.get(),
+            ])
+    }
+
+    fn cancel_zoom_rect_drag(&self) {
+        if self.0.zoom_rect_drag.take().is_some() {
+            self.0.canvas.set_crop_overlay(None);
+        }
+    }
+
+    fn zoom_to_rect(&self, selection: CropOverlay) {
+        let viewport = (self.0.scrolled.width(), self.0.scrolled.height());
+        let Some(target_zoom) = zoom_rect_target(viewport, selection) else {
+            return;
+        };
+        let generation = self.0.load_generation.get();
+        self.set_zoom_with_alignment(target_zoom, Some(ZoomAlignment::Contain));
+        let weak = Rc::downgrade(&self.0);
+        glib::idle_add_local_once(move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.load_generation.get() != generation
+                || state.canvas.texture().is_none_or(|texture| {
+                    texture.width() as u32 != selection.image_width
+                        || texture.height() as u32 != selection.image_height
+                })
+            {
+                return;
+            }
+            let Some(rect) = state.canvas.crop_display_bounds(selection) else {
+                return;
+            };
+            let horizontal = state.scrolled.hadjustment();
+            let vertical = state.scrolled.vadjustment();
+            horizontal
+                .set_value(f64::from(rect.x() + rect.width() / 2.0) - horizontal.page_size() / 2.0);
+            vertical
+                .set_value(f64::from(rect.y() + rect.height() / 2.0) - vertical.page_size() / 2.0);
+        });
+    }
+
+    fn step_zoom(&self, zoom_in: bool) {
+        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            stepped_hard_zoom(self.0.canvas.zoom(), self.0.render_scale.get(), zoom_in)
+        } else {
+            self.0.canvas.zoom() * if zoom_in { 1.25 } else { 0.8 }
+        };
+        self.set_zoom(zoom);
+    }
+
     fn set_zoom(&self, zoom: f64) {
+        self.set_zoom_with_alignment(zoom, Some(ZoomAlignment::Nearest));
+    }
+
+    fn set_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
         self.0.pending_fit.set(None);
+        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            alignment.map_or(zoom, |alignment| {
+                aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+            })
+        } else {
+            zoom
+        };
         self.0.canvas.set_zoom(zoom);
         self.0
             .zoom_label
@@ -3984,9 +4294,46 @@ impl ViewerWindow {
                 .map_or(self.0.canvas.zoom(), |fit_zooms| {
                     comparison_zoom(self.0.canvas.zoom(), fit_zooms)
                 });
+            let zoom = if compare.filter() == ZoomFilter::Hard {
+                alignment.map_or(zoom, |alignment| {
+                    aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                })
+            } else {
+                zoom
+            };
             compare.set_zoom(zoom);
         }
         self.update_minimap();
+    }
+
+    fn install_render_scale_tracking(&self) {
+        self.0.window.connect_realize({
+            let this = self.clone();
+            move |window| {
+                let Some(surface) = window.surface() else {
+                    return;
+                };
+                this.update_render_scale(f64::from(surface.scale_factor()));
+                let weak = Rc::downgrade(&this.0);
+                surface.connect_scale_factor_notify(move |surface| {
+                    if let Some(state) = weak.upgrade() {
+                        ViewerWindow(state).update_render_scale(f64::from(surface.scale_factor()));
+                    }
+                });
+            }
+        });
+    }
+
+    fn update_render_scale(&self, scale: f64) {
+        // GSK renders into the integer scale-factor buffer before the compositor
+        // applies GNOME's fractional surface scale.
+        let scale = normalized_render_scale(scale);
+        self.0.render_scale.set(scale);
+        self.0.canvas.set_render_scale(scale);
+        if let Some(compare) = self.0.compare_canvas.borrow().as_ref() {
+            compare.set_render_scale(scale);
+        }
+        self.set_zoom(self.0.canvas.zoom());
     }
 
     fn install_minimap(&self) {
@@ -4075,7 +4422,12 @@ impl ViewerWindow {
 
     fn zoom_at(&self, factor: f64, position: Option<(f64, f64)>) {
         let old_zoom = self.0.canvas.zoom();
-        let new_zoom = (old_zoom * factor).clamp(0.01, 64.0);
+        let new_zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            stepped_hard_zoom(old_zoom, self.0.render_scale.get(), factor > 1.0)
+        } else {
+            old_zoom * factor
+        }
+        .clamp(0.01, 64.0);
         let applied_factor = new_zoom / old_zoom;
         let horizontal = self.0.scrolled.hadjustment();
         let vertical = self.0.scrolled.vadjustment();
@@ -4150,6 +4502,17 @@ impl ViewerWindow {
         }
         if let Some((next_sequence, file)) = next {
             if !is_regular_file(&file) {
+                if self.0.explicit_navigation.get() {
+                    if let Some(sequence) = self.0.sequence.borrow_mut().as_mut() {
+                        sequence.remove_file(&file);
+                    }
+                    self.prefetch_neighbors();
+                    self.0.toasts.add_toast(adw::Toast::new(
+                        "That image was moved or deleted; it was removed from the opened files",
+                    ));
+                    self.navigate(forward);
+                    return;
+                }
                 if let Some(current) = self.0.current_file.borrow().clone() {
                     self.refresh_navigation(current, false);
                 }
@@ -4248,6 +4611,7 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .and_then(DirectorySequence::replacement_after_current_removed);
+        let explicit_navigation = self.0.explicit_navigation.get();
         let fallback = self.0.settings.folder_sort();
         if let Some(monitor) = self.0.directory_monitor.borrow_mut().take() {
             monitor.cancel();
@@ -4255,7 +4619,7 @@ impl ViewerWindow {
         let generation = self.0.load_generation.get();
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
-            let replacement = if known_replacement.is_some() {
+            let replacement = if explicit_navigation || known_replacement.is_some() {
                 known_replacement
             } else {
                 let sequence_file = file.clone();
@@ -4282,7 +4646,7 @@ impl ViewerWindow {
                 return;
             }
             if state.load_generation.get() != generation
-                || !files_equal(&state.current_file.borrow(), &Some(file))
+                || !files_equal(&state.current_file.borrow(), &Some(file.clone()))
             {
                 state.deletion_running.set(false);
                 this.monitor_directory();
@@ -4291,6 +4655,15 @@ impl ViewerWindow {
             if let Some(document) = state.document.borrow_mut().as_mut() {
                 document.restore_original();
             }
+            let replacement = if state.explicit_navigation.get() {
+                state
+                    .sequence
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|sequence| sequence.remove_file(&file))
+            } else {
+                replacement
+            };
             state.deletion_running.set(false);
             state.toasts.add_toast(adw::Toast::new("Image deleted"));
             if let Some(replacement) = replacement {
@@ -4332,11 +4705,18 @@ impl ViewerWindow {
         let height = f64::from(viewport.1);
         let horizontal = width / f64::from(texture.width());
         let vertical = height / f64::from(texture.height());
-        self.set_zoom(if fill {
-            horizontal.max(vertical)
-        } else {
-            horizontal.min(vertical)
-        });
+        self.set_zoom_with_alignment(
+            if fill {
+                horizontal.max(vertical)
+            } else {
+                horizontal.min(vertical)
+            },
+            Some(if fill {
+                ZoomAlignment::Cover
+            } else {
+                ZoomAlignment::Contain
+            }),
+        );
         true
     }
 
@@ -4400,7 +4780,7 @@ impl ViewerWindow {
                     applied_factor,
                 );
                 zoom_adjustment_target.set(Some((horizontal_target, vertical_target)));
-                this.set_zoom(target_zoom);
+                this.set_zoom_with_alignment(target_zoom, None);
                 let horizontal = this.0.scrolled.hadjustment();
                 let vertical = this.0.scrolled.vadjustment();
                 horizontal.set_value(horizontal_target);
@@ -4408,12 +4788,45 @@ impl ViewerWindow {
             }
         });
         zoom.connect_end({
+            let this = self.clone();
+            let zoom_anchor = zoom_anchor.clone();
             let zoom_adjustment_target = zoom_adjustment_target.clone();
-            move |_, _| zoom_adjustment_target.set(None)
+            move |_, _| {
+                if let Some(anchor) = zoom_anchor.take() {
+                    let target_zoom = if this.0.canvas.filter() == ZoomFilter::Hard {
+                        aligned_hard_zoom(
+                            this.0.canvas.zoom(),
+                            this.0.render_scale.get(),
+                            ZoomAlignment::Nearest,
+                        )
+                    } else {
+                        this.0.canvas.zoom()
+                    };
+                    let applied_factor = target_zoom / anchor.start_zoom;
+                    let horizontal_target = anchored_adjustment_value(
+                        anchor.horizontal_value,
+                        anchor.content_x,
+                        applied_factor,
+                    );
+                    let vertical_target = anchored_adjustment_value(
+                        anchor.vertical_value,
+                        anchor.content_y,
+                        applied_factor,
+                    );
+                    this.set_zoom(target_zoom);
+                    this.0.scrolled.hadjustment().set_value(horizontal_target);
+                    this.0.scrolled.vadjustment().set_value(vertical_target);
+                }
+                zoom_adjustment_target.set(None);
+            }
         });
         zoom.connect_cancel({
+            let zoom_anchor = zoom_anchor.clone();
             let zoom_adjustment_target = zoom_adjustment_target.clone();
-            move |_, _| zoom_adjustment_target.set(None)
+            move |_, _| {
+                zoom_anchor.set(None);
+                zoom_adjustment_target.set(None);
+            }
         });
         self.0.canvas.add_controller(zoom);
 
@@ -4796,6 +5209,92 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(pencil);
 
+        let zoom_rect = gtk::GestureDrag::new();
+        zoom_rect.set_button(1);
+        zoom_rect.connect_drag_begin({
+            let this = self.clone();
+            move |gesture, x, y| {
+                if !this.zoom_rect_drag_available() {
+                    return;
+                }
+                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
+                    return;
+                };
+                let Some(image_dimensions) = this
+                    .0
+                    .canvas
+                    .texture()
+                    .map(|texture| (texture.width() as u32, texture.height() as u32))
+                else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let drag = ZoomRectDrag {
+                    start,
+                    current: start,
+                    start_screen: (x, y),
+                    image_dimensions,
+                    load_generation: this.0.load_generation.get(),
+                };
+                this.0.zoom_rect_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
+            }
+        });
+        zoom_rect.connect_drag_update({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.zoom_rect_drag.get() else {
+                    return;
+                };
+                if drag.load_generation != this.0.load_generation.get() {
+                    this.cancel_zoom_rect_drag();
+                    return;
+                }
+                let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) else {
+                    return;
+                };
+                drag.current = current;
+                this.0.zoom_rect_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
+            }
+        });
+        zoom_rect.connect_drag_end({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.zoom_rect_drag.take() else {
+                    return;
+                };
+                if let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) {
+                    drag.current = current;
+                }
+                this.0.canvas.set_crop_overlay(None);
+                if drag.load_generation == this.0.load_generation.get()
+                    && this.zoom_rect_drag_available()
+                {
+                    this.zoom_to_rect(zoom_rect_overlay(drag));
+                }
+            }
+        });
+        zoom_rect.connect_cancel({
+            let this = self.clone();
+            move |_, _| {
+                if this.0.zoom_rect_drag.take().is_some() {
+                    this.0.canvas.set_crop_overlay(None);
+                }
+            }
+        });
+        self.0.canvas.add_controller(zoom_rect);
+
         let sampler = gtk::GestureClick::new();
         sampler.set_button(3);
         sampler.connect_pressed({
@@ -5115,6 +5614,8 @@ fn menu_button() -> gtk::MenuButton {
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("Open…"), Some("win.open"));
+    menu.append(Some("Open With…"), Some("win.open-with"));
+    menu.append(Some("Copy Image"), Some("win.copy-image"));
     menu.append(Some("Save"), Some("win.save"));
     menu.append(Some("Save As…"), Some("win.save-as"));
     menu.append(Some("Compare Images…"), Some("win.compare"));
@@ -5128,6 +5629,19 @@ fn main_menu() -> gio::Menu {
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Diorama"), Some("win.about"));
     menu
+}
+
+fn open_with_launcher(file: &gio::File) -> gtk::FileLauncher {
+    let launcher = gtk::FileLauncher::new(Some(file));
+    launcher.set_always_ask(true);
+    launcher.set_writable(true);
+    launcher
+}
+
+fn open_with_was_cancelled(error: &glib::Error) -> bool {
+    error.matches(gtk::DialogError::Cancelled)
+        || error.matches(gtk::DialogError::Dismissed)
+        || error.matches(gio::IOErrorEnum::Cancelled)
 }
 
 fn lens_size_index(diameter: f32) -> u32 {
@@ -5495,17 +6009,23 @@ mod tests {
     }
 
     #[test]
-    fn image_subtitle_places_modified_time_after_zoom() {
+    fn image_subtitle_includes_folder_and_places_modified_time_after_zoom() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
         let modified = now - Duration::from_secs(3 * 60);
 
         assert_eq!(
-            image_subtitle((1920, 1080), 1.25, Some(modified), now),
-            "1920 × 1080 · 125% · 3 minutes ago"
+            image_subtitle(
+                "/images/comparison",
+                (1920, 1080),
+                1.25,
+                Some(modified),
+                now
+            ),
+            "/images/comparison · 1920 × 1080 · 125% · 3 minutes ago"
         );
         assert_eq!(
-            image_subtitle((640, 480), 0.5, None, now),
-            "640 × 480 · 50%"
+            image_subtitle("/images/comparison", (640, 480), 0.5, None, now),
+            "/images/comparison · 640 × 480 · 50%"
         );
     }
 
@@ -5524,6 +6044,53 @@ mod tests {
             comparison_zoom(primary_fit * 2.0, (primary_fit, comparison_fit)),
             2.0
         );
+    }
+
+    #[test]
+    fn hard_zoom_aligns_to_the_integer_render_grid() {
+        let render_scale = 2.0;
+
+        assert_eq!(
+            aligned_hard_zoom(1.0, render_scale, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.24, render_scale, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.26, render_scale, ZoomAlignment::Nearest),
+            1.5
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Contain),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Cover),
+            1.5
+        );
+        assert_eq!(
+            aligned_hard_zoom(0.75, render_scale, ZoomAlignment::Nearest),
+            0.75
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.0, f64::NAN, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(normalized_render_scale(1.666_667), 2.0);
+    }
+
+    #[test]
+    fn hard_zoom_steps_by_whole_render_pixels_above_actual_size() {
+        let render_scale = 2.0;
+
+        assert_eq!(stepped_hard_zoom(1.0, render_scale, true), 1.5);
+        assert_eq!(stepped_hard_zoom(1.5, render_scale, true), 2.0);
+        assert_eq!(stepped_hard_zoom(2.0, render_scale, false), 1.5);
+        assert_eq!(stepped_hard_zoom(1.5, render_scale, false), 1.0);
+        assert_eq!(stepped_hard_zoom(1.0, render_scale, false), 0.8);
+        assert!((stepped_hard_zoom(0.8, render_scale, false) - 0.64).abs() < 1e-9);
     }
 
     #[test]
@@ -5581,6 +6148,16 @@ mod tests {
             pencil_line_start(PencilDragMode::Rectangle, Some(anchor), origin),
             origin
         );
+        assert_eq!(
+            pencil_drag_path(PencilDragMode::Freehand),
+            StrokePath::Smooth
+        );
+        assert_eq!(pencil_drag_path(PencilDragMode::Line), StrokePath::Linear);
+        assert_eq!(
+            pencil_drag_path(PencilDragMode::Rectangle),
+            StrokePath::Linear
+        );
+        assert_eq!(pencil_drag_path(PencilDragMode::Circle), StrokePath::Circle);
     }
 
     #[test]
@@ -5651,6 +6228,61 @@ mod tests {
                 ("Scale".to_owned(), "win.scale-preview".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn main_menu_delegates_open_with_to_a_window_action() {
+        let menu: gio::MenuModel = main_menu().upcast();
+        let entries = (0..menu.n_items())
+            .filter_map(|index| {
+                let label = menu
+                    .item_attribute_value(index, "label", None)?
+                    .get::<String>()?;
+                let action = menu
+                    .item_attribute_value(index, "action", None)?
+                    .get::<String>()?;
+                Some((label, action))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(entries.contains(&("Open With…".to_owned(), "win.open-with".to_owned())));
+    }
+
+    #[test]
+    fn cancelling_the_system_app_chooser_is_not_an_error() {
+        for error in [
+            glib::Error::new(gtk::DialogError::Cancelled, "cancelled"),
+            glib::Error::new(gtk::DialogError::Dismissed, "dismissed"),
+            glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled"),
+        ] {
+            assert!(open_with_was_cancelled(&error));
+        }
+        assert!(!open_with_was_cancelled(&glib::Error::new(
+            gtk::DialogError::Failed,
+            "failed"
+        )));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn open_with_action_uses_an_always_ask_writable_launcher() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.OpenWithTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let file = gio::File::for_path("/images/example.png");
+
+        let launcher = open_with_launcher(&file);
+
+        assert!(window.0.window.lookup_action("open-with").is_some());
+        assert!(launcher.must_always_ask());
+        assert!(launcher.is_writable());
+        assert_eq!(launcher.file(), Some(file));
     }
 
     #[test]
@@ -5772,11 +6404,141 @@ mod tests {
     }
 
     #[test]
+    fn zoom_rectangle_uses_grid_boundaries_in_both_drag_directions() {
+        let forward = zoom_rect_overlay(ZoomRectDrag {
+            start: (12, 9),
+            current: (52, 39),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (100, 80),
+            load_generation: 0,
+        });
+        let reverse = zoom_rect_overlay(ZoomRectDrag {
+            start: (52, 39),
+            current: (12, 9),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (100, 80),
+            load_generation: 0,
+        });
+
+        assert_eq!(
+            (
+                forward.x,
+                forward.y,
+                forward.width,
+                forward.height,
+                forward.image_width,
+                forward.image_height,
+            ),
+            (
+                reverse.x,
+                reverse.y,
+                reverse.width,
+                reverse.height,
+                reverse.image_width,
+                reverse.image_height,
+            )
+        );
+        assert_eq!(
+            (forward.x, forward.y, forward.width, forward.height),
+            (12, 9, 40, 30)
+        );
+    }
+
+    #[test]
+    fn zoom_rectangle_fits_the_complete_selection_and_ignores_degenerate_drags() {
+        let selection = CropOverlay {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 100,
+            image_width: 1000,
+            image_height: 800,
+        };
+
+        assert_eq!(zoom_rect_target((800, 600), selection), Some(4.0));
+        assert_eq!(
+            zoom_rect_target(
+                (800, 600),
+                CropOverlay {
+                    width: 0,
+                    ..selection
+                }
+            ),
+            None
+        );
+        assert_eq!(zoom_rect_target((1, 600), selection), None);
+    }
+
+    #[test]
+    fn zoom_rectangle_is_only_available_without_an_active_tool() {
+        assert!(no_tool_active(&[false; 7]));
+        for active_index in 0..7 {
+            let mut active_tools = [false; 7];
+            active_tools[active_index] = true;
+            assert!(!no_tool_active(&active_tools));
+        }
+    }
+
+    #[test]
     fn downloaded_comparison_texture_keeps_rgba_pixels() {
         let image = image::RgbaImage::from_raw(1, 1, vec![12, 34, 56, 78]).unwrap();
         let texture = texture_from_rgba(&image).unwrap();
 
         assert_eq!(rgba_from_texture(&texture), Some(image));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn copied_selection_deactivates_the_selection_tool() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.SelectionClipboardTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        window.0.rendered.replace(Some(image));
+        window.0.selection_button.set_active(true);
+
+        window.complete_selection(SelectionDrag {
+            start: (0, 0),
+            current: (1, 1),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (2, 2),
+        });
+
+        assert!(!window.0.selection_button.is_active());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn copy_image_action_places_the_complete_canvas_texture_on_the_clipboard() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ImageClipboardTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_fn(2, 2, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+
+        assert!(window.0.window.lookup_action("copy-image").is_some());
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "copy-image", None);
+        let copied = glib::MainContext::default()
+            .block_on(window.0.window.clipboard().read_texture_future())
+            .expect("clipboard read")
+            .expect("clipboard texture");
+
+        assert_eq!(rgba_from_texture(&copied), Some(image));
     }
 
     #[test]
@@ -5901,6 +6663,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn multiple_opened_files_seed_one_explicit_navigation_sequence() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.MultiFileOpenTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let files = ["third.png", "first.png", "second.png"].map(gio::File::for_path);
+        let window = ViewerWindow::new_with_files(&application, &files);
+
+        assert_eq!(application.windows().len(), 1);
+        assert!(window.0.explicit_navigation.get());
+        assert!(files_equal(
+            &window.0.current_file.borrow(),
+            &Some(files[0].clone())
+        ));
+        let sequence = window.0.sequence.borrow();
+        let sequence = sequence.as_ref().expect("explicit navigation sequence");
+        assert_eq!(sequence.len(), 3);
+        assert_eq!(sequence.current().uri(), files[0].uri());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn new_window_fit_waits_for_the_real_viewport_size() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -5931,7 +6719,94 @@ mod tests {
 
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
-        assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (200, 100)));
+        assert_eq!(
+            window.0.canvas.zoom(),
+            aligned_hard_zoom(
+                panel_fit_zoom(viewport, (200, 100)),
+                window.0.render_scale.get(),
+                ZoomAlignment::Contain,
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn hard_zoom_keeps_one_hundred_percent_at_fractional_gnome_scaling() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PhysicalZoomTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+
+        window.update_render_scale(2.0);
+        window.set_zoom(1.0);
+
+        assert_eq!(window.0.render_scale.get(), 2.0);
+        assert_eq!(window.0.canvas.zoom(), 1.0);
+        assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn zoom_rectangle_fits_and_centers_the_selected_region() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(100, 80, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.scrolled.allocate(800, 600, -1, None);
+        let selection = CropOverlay {
+            x: 40,
+            y: 30,
+            width: 20,
+            height: 10,
+            image_width: 100,
+            image_height: 80,
+        };
+        let expected_zoom = aligned_hard_zoom(
+            zoom_rect_target(
+                (window.0.scrolled.width(), window.0.scrolled.height()),
+                selection,
+            )
+            .unwrap(),
+            window.0.render_scale.get(),
+            ZoomAlignment::Contain,
+        );
+
+        window.zoom_to_rect(selection);
+        window.0.scrolled.allocate(800, 600, -1, None);
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert_eq!(window.0.canvas.zoom(), expected_zoom);
+        let selected = window.0.canvas.crop_display_bounds(selection).unwrap();
+        let horizontal = window.0.scrolled.hadjustment();
+        let vertical = window.0.scrolled.vadjustment();
+        assert!(
+            (horizontal.value() + horizontal.page_size() / 2.0
+                - f64::from(selected.x() + selected.width() / 2.0))
+            .abs()
+                < 1.0
+        );
+        assert!(
+            (vertical.value() + vertical.page_size() / 2.0
+                - f64::from(selected.y() + selected.height() / 2.0))
+            .abs()
+                < 1.0
+        );
     }
 
     #[test]

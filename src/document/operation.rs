@@ -24,6 +24,7 @@ pub struct BrushPoint {
 pub enum StrokePath {
     Smooth,
     Linear,
+    Circle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
