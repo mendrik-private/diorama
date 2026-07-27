@@ -76,6 +76,15 @@ struct MeasurementDrag {
     image_dimensions: (u32, u32),
 }
 
+#[derive(Clone, Copy)]
+struct ZoomRectDrag {
+    start: (u32, u32),
+    current: (u32, u32),
+    start_screen: (f64, f64),
+    image_dimensions: (u32, u32),
+    load_generation: u64,
+}
+
 struct PencilDrag {
     canvas: ImageCanvas,
     start_screen: (f64, f64),
@@ -157,6 +166,13 @@ struct ZoomGestureAnchor {
     content_y: f64,
     horizontal_value: f64,
     vertical_value: f64,
+}
+
+#[derive(Clone, Copy)]
+enum ZoomAlignment {
+    Nearest,
+    Contain,
+    Cover,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,14 +360,40 @@ fn selection_overlay(drag: SelectionDrag) -> Option<CropOverlay> {
 }
 
 fn measurement_overlay(drag: MeasurementDrag) -> CropOverlay {
+    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
+}
+
+fn zoom_rect_overlay(drag: ZoomRectDrag) -> CropOverlay {
+    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
+}
+
+fn boundary_overlay(
+    start: (u32, u32),
+    current: (u32, u32),
+    image_dimensions: (u32, u32),
+) -> CropOverlay {
     CropOverlay {
-        x: drag.start.0.min(drag.current.0),
-        y: drag.start.1.min(drag.current.1),
-        width: drag.start.0.abs_diff(drag.current.0),
-        height: drag.start.1.abs_diff(drag.current.1),
-        image_width: drag.image_dimensions.0,
-        image_height: drag.image_dimensions.1,
+        x: start.0.min(current.0),
+        y: start.1.min(current.1),
+        width: start.0.abs_diff(current.0),
+        height: start.1.abs_diff(current.1),
+        image_width: image_dimensions.0,
+        image_height: image_dimensions.1,
     }
+}
+
+fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64> {
+    if !usable_panel_size(viewport) || selection.width == 0 || selection.height == 0 {
+        return None;
+    }
+    Some(
+        (f64::from(viewport.0) / f64::from(selection.width))
+            .min(f64::from(viewport.1) / f64::from(selection.height)),
+    )
+}
+
+fn no_tool_active(active_tools: &[bool]) -> bool {
+    !active_tools.iter().any(|active| *active)
 }
 
 fn measurement_clipboard_text(measurement: CropOverlay) -> String {
@@ -456,6 +498,46 @@ fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
         .min(f64::from(size.1.max(1)) / f64::from(dimensions.1.max(1)))
 }
 
+fn normalized_render_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.round().max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn aligned_hard_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
+    if zoom < 1.0 {
+        return zoom;
+    }
+    let render_scale = normalized_render_scale(render_scale);
+    let render_zoom = zoom * render_scale;
+    let render_zoom = match alignment {
+        ZoomAlignment::Nearest => render_zoom.round(),
+        ZoomAlignment::Contain => render_zoom.floor(),
+        ZoomAlignment::Cover => render_zoom.ceil(),
+    }
+    .max(render_scale);
+    render_zoom / render_scale
+}
+
+fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {
+    let render_scale = normalized_render_scale(render_scale);
+    let render_zoom = zoom * render_scale;
+    let next = if zoom >= 1.0 {
+        if zoom_in {
+            render_zoom.floor() + 1.0
+        } else if zoom > 1.0 + 1e-6 {
+            (render_zoom.ceil() - 1.0).max(render_scale)
+        } else {
+            render_zoom * 0.8
+        }
+    } else {
+        render_zoom * if zoom_in { 1.25 } else { 0.8 }
+    };
+    next / render_scale
+}
+
 fn usable_panel_size(size: (i32, i32)) -> bool {
     size.0 > 1 && size.1 > 1
 }
@@ -517,6 +599,7 @@ struct WindowState {
     pencil_color: Cell<[u8; 4]>,
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
+    zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     color_picker_button: gtk::ToggleButton,
@@ -572,6 +655,7 @@ struct WindowState {
     fit_tick_scheduled: Cell<bool>,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
+    render_scale: Cell<f64>,
     scale_button: gtk::ToggleButton,
     scale_controls: gtk::Box,
     scale_slider: gtk::Scale,
@@ -785,6 +869,7 @@ impl ViewerWindow {
             pencil_color: Cell::new([0, 0, 0, 255]),
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
+            zoom_rect_drag: Cell::new(None),
             selection_button: header_widgets.selection_button,
             selection_drag: Cell::new(None),
             color_picker_button: header_widgets.color_picker_button,
@@ -838,6 +923,7 @@ impl ViewerWindow {
             fit_tick_scheduled: Cell::new(false),
             zoom_controls,
             zoom_label,
+            render_scale: Cell::new(1.0),
             scale_button: header_widgets.scale_button,
             scale_controls,
             scale_slider,
@@ -857,6 +943,7 @@ impl ViewerWindow {
         this.install_tool_controls();
         this.install_scale_controls();
         this.install_gestures();
+        this.install_render_scale_tracking();
         this.install_minimap();
         this.connect_single_image_lens();
         this.install_state_persistence();
@@ -920,6 +1007,7 @@ impl ViewerWindow {
     }
 
     fn load_with_fit(&self, file: gio::File, fit: bool) {
+        self.cancel_zoom_rect_drag();
         self.0
             .navigation_generation
             .set(self.0.navigation_generation.get().wrapping_add(1));
@@ -1108,11 +1196,11 @@ impl ViewerWindow {
         });
         self.add_action("zoom-in", {
             let this = self.clone();
-            move || this.set_zoom(this.0.canvas.zoom() * 1.25)
+            move || this.step_zoom(true)
         });
         self.add_action("zoom-out", {
             let this = self.clone();
-            move || this.set_zoom(this.0.canvas.zoom() / 1.25)
+            move || this.step_zoom(false)
         });
         self.add_action("actual-size", {
             let this = self.clone();
@@ -1155,6 +1243,7 @@ impl ViewerWindow {
                     canvas.set_filter(filter);
                 }
                 this.0.settings.set_zoom_filter(filter);
+                this.set_zoom(this.0.canvas.zoom());
             }
         });
         self.add_action("previous", {
@@ -1311,6 +1400,10 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.0.zoom_rect_drag.get().is_some() {
+                    this.cancel_zoom_rect_drag();
+                    return;
+                }
                 if this.0.measurement_button.is_active() {
                     this.0.measurement_button.set_active(false);
                     return;
@@ -1480,6 +1573,7 @@ impl ViewerWindow {
 
     fn set_scale_preview_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -1602,6 +1696,7 @@ impl ViewerWindow {
 
     fn set_pencil_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -1640,6 +1735,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -1693,6 +1789,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.color_picker_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -1727,6 +1824,7 @@ impl ViewerWindow {
             return;
         }
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
             self.0.scale_button.set_active(false);
@@ -2108,6 +2206,7 @@ impl ViewerWindow {
 
     fn set_edit_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
             self.0.color_picker_button.set_active(false);
@@ -2934,6 +3033,7 @@ impl ViewerWindow {
                 canvas.set_filter(zoom_filter);
                 canvas.set_background(background);
             }
+            this.set_zoom(this.0.canvas.zoom());
             this.0.lens_diameter.set(lens_diameter);
             this.0.settings.set_zoom_filter(zoom_filter);
             this.0.settings.set_background(background);
@@ -3525,6 +3625,7 @@ impl ViewerWindow {
         compare_canvas.set_texture(Some(&preview.texture));
         compare_canvas.set_filter(self.0.canvas.filter());
         compare_canvas.set_background(self.0.canvas.background());
+        compare_canvas.set_render_scale(self.0.render_scale.get());
         compare_canvas.set_zoom(self.0.canvas.zoom());
         compare_canvas.set_halign(gtk::Align::Center);
         compare_canvas.set_valign(gtk::Align::Center);
@@ -3642,8 +3743,7 @@ impl ViewerWindow {
                     .current_event_state()
                     .contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 {
-                    let factor = if dy < 0.0 { 1.25 } else { 0.8 };
-                    this.set_zoom(this.0.canvas.zoom() * factor);
+                    this.step_zoom(dy < 0.0);
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -3715,7 +3815,7 @@ impl ViewerWindow {
             ),
         );
         self.0.compare_fit_zooms.set(Some(fit_zooms));
-        self.set_zoom(fit_zooms.0);
+        self.set_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
         true
     }
 
@@ -3879,6 +3979,7 @@ impl ViewerWindow {
 
     fn set_single_image_lens_active(&self, active: bool) {
         if active {
+            self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
             self.0.selection_button.set_active(false);
         }
@@ -4058,8 +4159,79 @@ impl ViewerWindow {
             .push((source.clone(), scroll.upcast()));
     }
 
+    fn zoom_rect_drag_available(&self) -> bool {
+        self.0.canvas.texture().is_some()
+            && no_tool_active(&[
+                self.0.measurement_button.is_active(),
+                self.0.selection_button.is_active(),
+                self.0.color_picker_button.is_active(),
+                self.0.scale_button.is_active(),
+                self.0.edit_button.is_active(),
+                self.0.pencil_active.get(),
+                self.0.lens_active.get(),
+            ])
+    }
+
+    fn cancel_zoom_rect_drag(&self) {
+        if self.0.zoom_rect_drag.take().is_some() {
+            self.0.canvas.set_crop_overlay(None);
+        }
+    }
+
+    fn zoom_to_rect(&self, selection: CropOverlay) {
+        let viewport = (self.0.scrolled.width(), self.0.scrolled.height());
+        let Some(target_zoom) = zoom_rect_target(viewport, selection) else {
+            return;
+        };
+        let generation = self.0.load_generation.get();
+        self.set_zoom_with_alignment(target_zoom, Some(ZoomAlignment::Contain));
+        let weak = Rc::downgrade(&self.0);
+        glib::idle_add_local_once(move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.load_generation.get() != generation
+                || state.canvas.texture().is_none_or(|texture| {
+                    texture.width() as u32 != selection.image_width
+                        || texture.height() as u32 != selection.image_height
+                })
+            {
+                return;
+            }
+            let Some(rect) = state.canvas.crop_display_bounds(selection) else {
+                return;
+            };
+            let horizontal = state.scrolled.hadjustment();
+            let vertical = state.scrolled.vadjustment();
+            horizontal
+                .set_value(f64::from(rect.x() + rect.width() / 2.0) - horizontal.page_size() / 2.0);
+            vertical
+                .set_value(f64::from(rect.y() + rect.height() / 2.0) - vertical.page_size() / 2.0);
+        });
+    }
+
+    fn step_zoom(&self, zoom_in: bool) {
+        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            stepped_hard_zoom(self.0.canvas.zoom(), self.0.render_scale.get(), zoom_in)
+        } else {
+            self.0.canvas.zoom() * if zoom_in { 1.25 } else { 0.8 }
+        };
+        self.set_zoom(zoom);
+    }
+
     fn set_zoom(&self, zoom: f64) {
+        self.set_zoom_with_alignment(zoom, Some(ZoomAlignment::Nearest));
+    }
+
+    fn set_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
         self.0.pending_fit.set(None);
+        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            alignment.map_or(zoom, |alignment| {
+                aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+            })
+        } else {
+            zoom
+        };
         self.0.canvas.set_zoom(zoom);
         self.0
             .zoom_label
@@ -4076,9 +4248,46 @@ impl ViewerWindow {
                 .map_or(self.0.canvas.zoom(), |fit_zooms| {
                     comparison_zoom(self.0.canvas.zoom(), fit_zooms)
                 });
+            let zoom = if compare.filter() == ZoomFilter::Hard {
+                alignment.map_or(zoom, |alignment| {
+                    aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                })
+            } else {
+                zoom
+            };
             compare.set_zoom(zoom);
         }
         self.update_minimap();
+    }
+
+    fn install_render_scale_tracking(&self) {
+        self.0.window.connect_realize({
+            let this = self.clone();
+            move |window| {
+                let Some(surface) = window.surface() else {
+                    return;
+                };
+                this.update_render_scale(f64::from(surface.scale_factor()));
+                let weak = Rc::downgrade(&this.0);
+                surface.connect_scale_factor_notify(move |surface| {
+                    if let Some(state) = weak.upgrade() {
+                        ViewerWindow(state).update_render_scale(f64::from(surface.scale_factor()));
+                    }
+                });
+            }
+        });
+    }
+
+    fn update_render_scale(&self, scale: f64) {
+        // GSK renders into the integer scale-factor buffer before the compositor
+        // applies GNOME's fractional surface scale.
+        let scale = normalized_render_scale(scale);
+        self.0.render_scale.set(scale);
+        self.0.canvas.set_render_scale(scale);
+        if let Some(compare) = self.0.compare_canvas.borrow().as_ref() {
+            compare.set_render_scale(scale);
+        }
+        self.set_zoom(self.0.canvas.zoom());
     }
 
     fn install_minimap(&self) {
@@ -4167,7 +4376,12 @@ impl ViewerWindow {
 
     fn zoom_at(&self, factor: f64, position: Option<(f64, f64)>) {
         let old_zoom = self.0.canvas.zoom();
-        let new_zoom = (old_zoom * factor).clamp(0.01, 64.0);
+        let new_zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+            stepped_hard_zoom(old_zoom, self.0.render_scale.get(), factor > 1.0)
+        } else {
+            old_zoom * factor
+        }
+        .clamp(0.01, 64.0);
         let applied_factor = new_zoom / old_zoom;
         let horizontal = self.0.scrolled.hadjustment();
         let vertical = self.0.scrolled.vadjustment();
@@ -4445,11 +4659,18 @@ impl ViewerWindow {
         let height = f64::from(viewport.1);
         let horizontal = width / f64::from(texture.width());
         let vertical = height / f64::from(texture.height());
-        self.set_zoom(if fill {
-            horizontal.max(vertical)
-        } else {
-            horizontal.min(vertical)
-        });
+        self.set_zoom_with_alignment(
+            if fill {
+                horizontal.max(vertical)
+            } else {
+                horizontal.min(vertical)
+            },
+            Some(if fill {
+                ZoomAlignment::Cover
+            } else {
+                ZoomAlignment::Contain
+            }),
+        );
         true
     }
 
@@ -4513,7 +4734,7 @@ impl ViewerWindow {
                     applied_factor,
                 );
                 zoom_adjustment_target.set(Some((horizontal_target, vertical_target)));
-                this.set_zoom(target_zoom);
+                this.set_zoom_with_alignment(target_zoom, None);
                 let horizontal = this.0.scrolled.hadjustment();
                 let vertical = this.0.scrolled.vadjustment();
                 horizontal.set_value(horizontal_target);
@@ -4521,12 +4742,45 @@ impl ViewerWindow {
             }
         });
         zoom.connect_end({
+            let this = self.clone();
+            let zoom_anchor = zoom_anchor.clone();
             let zoom_adjustment_target = zoom_adjustment_target.clone();
-            move |_, _| zoom_adjustment_target.set(None)
+            move |_, _| {
+                if let Some(anchor) = zoom_anchor.take() {
+                    let target_zoom = if this.0.canvas.filter() == ZoomFilter::Hard {
+                        aligned_hard_zoom(
+                            this.0.canvas.zoom(),
+                            this.0.render_scale.get(),
+                            ZoomAlignment::Nearest,
+                        )
+                    } else {
+                        this.0.canvas.zoom()
+                    };
+                    let applied_factor = target_zoom / anchor.start_zoom;
+                    let horizontal_target = anchored_adjustment_value(
+                        anchor.horizontal_value,
+                        anchor.content_x,
+                        applied_factor,
+                    );
+                    let vertical_target = anchored_adjustment_value(
+                        anchor.vertical_value,
+                        anchor.content_y,
+                        applied_factor,
+                    );
+                    this.set_zoom(target_zoom);
+                    this.0.scrolled.hadjustment().set_value(horizontal_target);
+                    this.0.scrolled.vadjustment().set_value(vertical_target);
+                }
+                zoom_adjustment_target.set(None);
+            }
         });
         zoom.connect_cancel({
+            let zoom_anchor = zoom_anchor.clone();
             let zoom_adjustment_target = zoom_adjustment_target.clone();
-            move |_, _| zoom_adjustment_target.set(None)
+            move |_, _| {
+                zoom_anchor.set(None);
+                zoom_adjustment_target.set(None);
+            }
         });
         self.0.canvas.add_controller(zoom);
 
@@ -4908,6 +5162,92 @@ impl ViewerWindow {
             }
         });
         self.0.canvas.add_controller(pencil);
+
+        let zoom_rect = gtk::GestureDrag::new();
+        zoom_rect.set_button(1);
+        zoom_rect.connect_drag_begin({
+            let this = self.clone();
+            move |gesture, x, y| {
+                if !this.zoom_rect_drag_available() {
+                    return;
+                }
+                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
+                    return;
+                };
+                let Some(image_dimensions) = this
+                    .0
+                    .canvas
+                    .texture()
+                    .map(|texture| (texture.width() as u32, texture.height() as u32))
+                else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let drag = ZoomRectDrag {
+                    start,
+                    current: start,
+                    start_screen: (x, y),
+                    image_dimensions,
+                    load_generation: this.0.load_generation.get(),
+                };
+                this.0.zoom_rect_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
+            }
+        });
+        zoom_rect.connect_drag_update({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.zoom_rect_drag.get() else {
+                    return;
+                };
+                if drag.load_generation != this.0.load_generation.get() {
+                    this.cancel_zoom_rect_drag();
+                    return;
+                }
+                let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) else {
+                    return;
+                };
+                drag.current = current;
+                this.0.zoom_rect_drag.set(Some(drag));
+                this.0
+                    .canvas
+                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
+            }
+        });
+        zoom_rect.connect_drag_end({
+            let this = self.clone();
+            move |_, offset_x, offset_y| {
+                let Some(mut drag) = this.0.zoom_rect_drag.take() else {
+                    return;
+                };
+                if let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
+                    drag.start_screen.0 + offset_x,
+                    drag.start_screen.1 + offset_y,
+                ) {
+                    drag.current = current;
+                }
+                this.0.canvas.set_crop_overlay(None);
+                if drag.load_generation == this.0.load_generation.get()
+                    && this.zoom_rect_drag_available()
+                {
+                    this.zoom_to_rect(zoom_rect_overlay(drag));
+                }
+            }
+        });
+        zoom_rect.connect_cancel({
+            let this = self.clone();
+            move |_, _| {
+                if this.0.zoom_rect_drag.take().is_some() {
+                    this.0.canvas.set_crop_overlay(None);
+                }
+            }
+        });
+        self.0.canvas.add_controller(zoom_rect);
 
         let sampler = gtk::GestureClick::new();
         sampler.set_button(3);
@@ -5646,6 +5986,53 @@ mod tests {
     }
 
     #[test]
+    fn hard_zoom_aligns_to_the_integer_render_grid() {
+        let render_scale = 2.0;
+
+        assert_eq!(
+            aligned_hard_zoom(1.0, render_scale, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.24, render_scale, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.26, render_scale, ZoomAlignment::Nearest),
+            1.5
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Contain),
+            1.0
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Cover),
+            1.5
+        );
+        assert_eq!(
+            aligned_hard_zoom(0.75, render_scale, ZoomAlignment::Nearest),
+            0.75
+        );
+        assert_eq!(
+            aligned_hard_zoom(1.0, f64::NAN, ZoomAlignment::Nearest),
+            1.0
+        );
+        assert_eq!(normalized_render_scale(1.666_667), 2.0);
+    }
+
+    #[test]
+    fn hard_zoom_steps_by_whole_render_pixels_above_actual_size() {
+        let render_scale = 2.0;
+
+        assert_eq!(stepped_hard_zoom(1.0, render_scale, true), 1.5);
+        assert_eq!(stepped_hard_zoom(1.5, render_scale, true), 2.0);
+        assert_eq!(stepped_hard_zoom(2.0, render_scale, false), 1.5);
+        assert_eq!(stepped_hard_zoom(1.5, render_scale, false), 1.0);
+        assert_eq!(stepped_hard_zoom(1.0, render_scale, false), 0.8);
+        assert!((stepped_hard_zoom(0.8, render_scale, false) - 0.64).abs() < 1e-9);
+    }
+
+    #[test]
     fn compare_layout_rejects_placeholder_allocations() {
         assert!(!usable_panel_size((1, 600)));
         assert!(!usable_panel_size((800, 1)));
@@ -5901,6 +6288,82 @@ mod tests {
     }
 
     #[test]
+    fn zoom_rectangle_uses_grid_boundaries_in_both_drag_directions() {
+        let forward = zoom_rect_overlay(ZoomRectDrag {
+            start: (12, 9),
+            current: (52, 39),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (100, 80),
+            load_generation: 0,
+        });
+        let reverse = zoom_rect_overlay(ZoomRectDrag {
+            start: (52, 39),
+            current: (12, 9),
+            start_screen: (0.0, 0.0),
+            image_dimensions: (100, 80),
+            load_generation: 0,
+        });
+
+        assert_eq!(
+            (
+                forward.x,
+                forward.y,
+                forward.width,
+                forward.height,
+                forward.image_width,
+                forward.image_height,
+            ),
+            (
+                reverse.x,
+                reverse.y,
+                reverse.width,
+                reverse.height,
+                reverse.image_width,
+                reverse.image_height,
+            )
+        );
+        assert_eq!(
+            (forward.x, forward.y, forward.width, forward.height),
+            (12, 9, 40, 30)
+        );
+    }
+
+    #[test]
+    fn zoom_rectangle_fits_the_complete_selection_and_ignores_degenerate_drags() {
+        let selection = CropOverlay {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 100,
+            image_width: 1000,
+            image_height: 800,
+        };
+
+        assert_eq!(zoom_rect_target((800, 600), selection), Some(4.0));
+        assert_eq!(
+            zoom_rect_target(
+                (800, 600),
+                CropOverlay {
+                    width: 0,
+                    ..selection
+                }
+            ),
+            None
+        );
+        assert_eq!(zoom_rect_target((1, 600), selection), None);
+    }
+
+    #[test]
+    fn zoom_rectangle_is_only_available_without_an_active_tool() {
+        assert!(no_tool_active(&[false; 7]));
+        for active_index in 0..7 {
+            let mut active_tools = [false; 7];
+            active_tools[active_index] = true;
+            assert!(!no_tool_active(&active_tools));
+        }
+    }
+
+    #[test]
     fn downloaded_comparison_texture_keeps_rgba_pixels() {
         let image = image::RgbaImage::from_raw(1, 1, vec![12, 34, 56, 78]).unwrap();
         let texture = texture_from_rgba(&image).unwrap();
@@ -6112,7 +6575,94 @@ mod tests {
 
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
-        assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (200, 100)));
+        assert_eq!(
+            window.0.canvas.zoom(),
+            aligned_hard_zoom(
+                panel_fit_zoom(viewport, (200, 100)),
+                window.0.render_scale.get(),
+                ZoomAlignment::Contain,
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn hard_zoom_keeps_one_hundred_percent_at_fractional_gnome_scaling() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PhysicalZoomTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+
+        window.update_render_scale(2.0);
+        window.set_zoom(1.0);
+
+        assert_eq!(window.0.render_scale.get(), 2.0);
+        assert_eq!(window.0.canvas.zoom(), 1.0);
+        assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn zoom_rectangle_fits_and_centers_the_selected_region() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(100, 80, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.scrolled.allocate(800, 600, -1, None);
+        let selection = CropOverlay {
+            x: 40,
+            y: 30,
+            width: 20,
+            height: 10,
+            image_width: 100,
+            image_height: 80,
+        };
+        let expected_zoom = aligned_hard_zoom(
+            zoom_rect_target(
+                (window.0.scrolled.width(), window.0.scrolled.height()),
+                selection,
+            )
+            .unwrap(),
+            window.0.render_scale.get(),
+            ZoomAlignment::Contain,
+        );
+
+        window.zoom_to_rect(selection);
+        window.0.scrolled.allocate(800, 600, -1, None);
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert_eq!(window.0.canvas.zoom(), expected_zoom);
+        let selected = window.0.canvas.crop_display_bounds(selection).unwrap();
+        let horizontal = window.0.scrolled.hadjustment();
+        let vertical = window.0.scrolled.vadjustment();
+        assert!(
+            (horizontal.value() + horizontal.page_size() / 2.0
+                - f64::from(selected.x() + selected.width() / 2.0))
+            .abs()
+                < 1.0
+        );
+        assert!(
+            (vertical.value() + vertical.page_size() / 2.0
+                - f64::from(selected.y() + selected.height() / 2.0))
+            .abs()
+                < 1.0
+        );
     }
 
     #[test]

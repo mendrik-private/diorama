@@ -12,6 +12,110 @@ pub enum ZoomFilter {
     Hard,
 }
 
+fn normalized_render_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.round().max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn aligned_render_pixel_scale(zoom: f64, render_scale: f64) -> Option<f64> {
+    let effective_scale = zoom * normalized_render_scale(render_scale);
+    let aligned = effective_scale.round();
+    (aligned >= 1.0 && (effective_scale - aligned).abs() <= 1e-6 * effective_scale.abs().max(1.0))
+        .then_some(aligned)
+}
+
+fn measured_image_dimension(
+    dimension: i32,
+    zoom: f64,
+    filter: ZoomFilter,
+    render_scale: f64,
+) -> i32 {
+    let scaled = f64::from(dimension) * zoom;
+    if filter == ZoomFilter::Hard && aligned_render_pixel_scale(zoom, render_scale).is_some() {
+        scaled.ceil() as i32
+    } else {
+        scaled.round() as i32
+    }
+}
+
+fn canvas_image_bounds(
+    bounds: gtk::graphene::Rect,
+    image_dimensions: (i32, i32),
+    zoom: f64,
+    filter: ZoomFilter,
+    render_scale: f64,
+    preview_scale: f32,
+) -> gtk::graphene::Rect {
+    let image_width = image_dimensions.0.max(1);
+    let image_height = image_dimensions.1.max(1);
+    let mut image_bounds = if filter == ZoomFilter::Hard {
+        aligned_render_pixel_scale(zoom, render_scale).map(|pixel_scale| {
+            let render_scale = normalized_render_scale(render_scale);
+            let width = f64::from(image_width) * pixel_scale / render_scale;
+            let height = f64::from(image_height) * pixel_scale / render_scale;
+            let x = ((f64::from(bounds.x()) + (f64::from(bounds.width()) - width) / 2.0)
+                * render_scale)
+                .round()
+                / render_scale;
+            let y = ((f64::from(bounds.y()) + (f64::from(bounds.height()) - height) / 2.0)
+                * render_scale)
+                .round()
+                / render_scale;
+            gtk::graphene::Rect::new(x as f32, y as f32, width as f32, height as f32)
+        })
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        let image_ratio = image_width as f32 / image_height as f32;
+        let bounds_ratio = bounds.width() / bounds.height().max(1.0);
+        if image_ratio > bounds_ratio {
+            let height = bounds.width() / image_ratio;
+            gtk::graphene::Rect::new(
+                bounds.x(),
+                bounds.y() + (bounds.height() - height) / 2.0,
+                bounds.width(),
+                height,
+            )
+        } else {
+            let width = bounds.height() * image_ratio;
+            gtk::graphene::Rect::new(
+                bounds.x() + (bounds.width() - width) / 2.0,
+                bounds.y(),
+                width,
+                bounds.height(),
+            )
+        }
+    });
+
+    let preview_scale = preview_scale.clamp(0.01, 64.0);
+    if preview_scale != 1.0 {
+        let width = image_bounds.width() * preview_scale;
+        let height = image_bounds.height() * preview_scale;
+        image_bounds = gtk::graphene::Rect::new(
+            image_bounds.x() + (image_bounds.width() - width) / 2.0,
+            image_bounds.y() + (image_bounds.height() - height) / 2.0,
+            width,
+            height,
+        );
+    }
+    image_bounds
+}
+
+fn overlay_rect(image_bounds: gtk::graphene::Rect, overlay: &CropOverlay) -> gtk::graphene::Rect {
+    let width = overlay.image_width.max(1) as f32;
+    let height = overlay.image_height.max(1) as f32;
+    gtk::graphene::Rect::new(
+        image_bounds.x() + image_bounds.width() * overlay.x as f32 / width,
+        image_bounds.y() + image_bounds.height() * overlay.y as f32 / height,
+        image_bounds.width() * overlay.width as f32 / width,
+        image_bounds.height() * overlay.height as f32 / height,
+    )
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Background {
     #[default]
@@ -105,6 +209,7 @@ mod imp {
     pub struct ImageCanvas {
         pub texture: RefCell<Option<gdk::Texture>>,
         pub zoom: Cell<f64>,
+        pub render_scale: Cell<f64>,
         pub filter: Cell<ZoomFilter>,
         pub background: Cell<Background>,
         pub auto_background_luminance: Cell<f32>,
@@ -132,6 +237,7 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             self.zoom.set(1.0);
+            self.render_scale.set(1.0);
             self.preview_scale.set(1.0);
             self.auto_background_luminance.set(0.5);
             let object = self.obj();
@@ -150,7 +256,12 @@ mod imp {
                 } else {
                     texture.height()
                 };
-                (f64::from(dimension) * self.zoom.get()).round() as i32
+                measured_image_dimension(
+                    dimension,
+                    self.zoom.get(),
+                    self.filter.get(),
+                    self.render_scale.get(),
+                )
             });
             (size.max(1), size.max(1), -1, -1)
         }
@@ -169,9 +280,15 @@ mod imp {
                 self.background.get(),
                 self.auto_background_luminance.get(),
             );
-            if let Some(texture) = self.texture.borrow().as_ref() {
-                let image_bounds =
-                    scale_bounds(contain_bounds(bounds, texture), self.preview_scale.get());
+            let image_bounds = self.texture.borrow().as_ref().map(|texture| {
+                let image_bounds = canvas_image_bounds(
+                    bounds,
+                    (texture.width(), texture.height()),
+                    self.zoom.get(),
+                    self.filter.get(),
+                    self.render_scale.get(),
+                    self.preview_scale.get(),
+                );
                 let filter = match self.filter.get() {
                     ZoomFilter::Soft => gtk::gsk::ScalingFilter::Linear,
                     ZoomFilter::Hard => gtk::gsk::ScalingFilter::Nearest,
@@ -185,28 +302,29 @@ mod imp {
                     draw_measurement_layer(
                         snapshot,
                         &object,
-                        bounds,
                         image_bounds,
                         measurement,
                         measurement_cursor,
-                        self.preview_scale.get(),
                     );
                     snapshot.pop();
                 } else {
                     snapshot.append_scaled_texture(texture, filter, &image_bounds);
                 }
-            }
+                image_bounds
+            });
             if let Some(lens) = self.lens.borrow().as_ref() {
                 draw_lens(snapshot, bounds, lens);
             }
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
             }
-            if let Some(flash) = self.mask_flash.borrow().as_ref() {
-                draw_mask_flash(snapshot, bounds, flash, self.preview_scale.get());
-            }
-            if let Some(overlay) = self.crop_overlay.borrow().as_ref() {
-                draw_crop_overlay(snapshot, bounds, overlay, self.preview_scale.get());
+            if let Some(image_bounds) = image_bounds {
+                if let Some(flash) = self.mask_flash.borrow().as_ref() {
+                    draw_mask_flash(snapshot, image_bounds, flash);
+                }
+                if let Some(overlay) = self.crop_overlay.borrow().as_ref() {
+                    draw_crop_overlay(snapshot, image_bounds, overlay);
+                }
             }
         }
     }
@@ -272,18 +390,6 @@ mod imp {
         }
     }
 
-    fn scale_bounds(bounds: gtk::graphene::Rect, scale: f32) -> gtk::graphene::Rect {
-        let scale = scale.clamp(0.01, 64.0);
-        let width = bounds.width() * scale;
-        let height = bounds.height() * scale;
-        gtk::graphene::Rect::new(
-            bounds.x() + (bounds.width() - width) / 2.0,
-            bounds.y() + (bounds.height() - height) / 2.0,
-            width,
-            height,
-        )
-    }
-
     fn draw_marker(
         snapshot: &gtk::Snapshot,
         bounds: gtk::graphene::Rect,
@@ -300,34 +406,30 @@ mod imp {
 
     fn draw_crop_overlay(
         snapshot: &gtk::Snapshot,
-        bounds: gtk::graphene::Rect,
+        image_bounds: gtk::graphene::Rect,
         overlay: &CropOverlay,
-        preview_scale: f32,
     ) {
-        draw_dashed_crop_border(snapshot, overlay_rect(bounds, overlay, preview_scale));
+        draw_dashed_crop_border(snapshot, overlay_rect(image_bounds, overlay));
     }
 
     fn draw_mask_flash(
         snapshot: &gtk::Snapshot,
-        bounds: gtk::graphene::Rect,
+        image_bounds: gtk::graphene::Rect,
         flash: &MaskFlash,
-        preview_scale: f32,
     ) {
         snapshot.append_scaled_texture(
             &flash.texture,
             gtk::gsk::ScalingFilter::Nearest,
-            &overlay_rect(bounds, &flash.bounds, preview_scale),
+            &overlay_rect(image_bounds, &flash.bounds),
         );
     }
 
     fn draw_measurement_layer(
         snapshot: &gtk::Snapshot,
         canvas: &super::ImageCanvas,
-        bounds: gtk::graphene::Rect,
         image_bounds: gtk::graphene::Rect,
         measurement: Option<CropOverlay>,
         cursor: Option<(f32, f32)>,
-        preview_scale: f32,
     ) {
         let white = gdk::RGBA::WHITE;
         if let Some((normalized_x, normalized_y)) = cursor {
@@ -345,7 +447,7 @@ mod imp {
         let Some(measurement) = measurement else {
             return;
         };
-        let rect = overlay_rect(bounds, &measurement, preview_scale);
+        let rect = overlay_rect(image_bounds, &measurement);
         let rounded = gtk::gsk::RoundedRect::from_rect(rect, 0.0);
         snapshot.append_border(&rounded, &[1.0; 4], &[white; 4]);
         let (origin_label, width_label, height_label) = measurement_labels(measurement);
@@ -469,41 +571,6 @@ mod imp {
         )
     }
 
-    fn overlay_rect(
-        bounds: gtk::graphene::Rect,
-        overlay: &CropOverlay,
-        preview_scale: f32,
-    ) -> gtk::graphene::Rect {
-        let width = overlay.image_width.max(1) as f32;
-        let height = overlay.image_height.max(1) as f32;
-        let image_ratio = width / height;
-        let bounds_ratio = bounds.width() / bounds.height().max(1.0);
-        let image_bounds = if image_ratio > bounds_ratio {
-            let fitted_height = bounds.width() / image_ratio;
-            gtk::graphene::Rect::new(
-                bounds.x(),
-                bounds.y() + (bounds.height() - fitted_height) / 2.0,
-                bounds.width(),
-                fitted_height,
-            )
-        } else {
-            let fitted_width = bounds.height() * image_ratio;
-            gtk::graphene::Rect::new(
-                bounds.x() + (bounds.width() - fitted_width) / 2.0,
-                bounds.y(),
-                fitted_width,
-                bounds.height(),
-            )
-        };
-        let image_bounds = scale_bounds(image_bounds, preview_scale);
-        gtk::graphene::Rect::new(
-            image_bounds.x() + image_bounds.width() * overlay.x as f32 / width,
-            image_bounds.y() + image_bounds.height() * overlay.y as f32 / height,
-            image_bounds.width() * overlay.width as f32 / width,
-            image_bounds.height() * overlay.height as f32 / height,
-        )
-    }
-
     fn draw_dashed_crop_border(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
         let red = gdk::RGBA::new(0.95, 0.18, 0.18, 1.0);
         let blue = gdk::RGBA::new(0.18, 0.42, 0.96, 1.0);
@@ -601,6 +668,22 @@ impl Default for ImageCanvas {
 }
 
 impl ImageCanvas {
+    fn image_bounds_for_texture(&self, texture: &gdk::Texture) -> gtk::graphene::Rect {
+        canvas_image_bounds(
+            gtk::graphene::Rect::new(
+                0.0,
+                0.0,
+                self.width().max(1) as f32,
+                self.height().max(1) as f32,
+            ),
+            (texture.width(), texture.height()),
+            self.imp().zoom.get(),
+            self.imp().filter.get(),
+            self.imp().render_scale.get(),
+            self.imp().preview_scale.get(),
+        )
+    }
+
     pub fn set_texture(&self, texture: Option<&gdk::Texture>) {
         self.imp().texture.replace(texture.cloned());
         self.queue_resize();
@@ -621,6 +704,12 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
+    pub fn set_render_scale(&self, scale: f64) {
+        self.imp().render_scale.set(normalized_render_scale(scale));
+        self.queue_resize();
+        self.queue_draw();
+    }
+
     pub fn zoom_in(&self) {
         self.set_zoom(self.zoom() * 1.25);
     }
@@ -635,6 +724,7 @@ impl ImageCanvas {
 
     pub fn set_filter(&self, filter: ZoomFilter) {
         self.imp().filter.set(filter);
+        self.queue_resize();
         self.queue_draw();
     }
 
@@ -730,77 +820,36 @@ impl ImageCanvas {
 
     pub fn crop_display_bounds(&self, overlay: CropOverlay) -> Option<gtk::graphene::Rect> {
         let texture = self.texture()?;
-        let canvas_width = self.width().max(1) as f32;
-        let canvas_height = self.height().max(1) as f32;
-        let image_ratio = texture.width() as f32 / texture.height().max(1) as f32;
-        let canvas_ratio = canvas_width / canvas_height;
-        let image_bounds = if image_ratio > canvas_ratio {
-            let height = canvas_width / image_ratio;
-            gtk::graphene::Rect::new(0.0, (canvas_height - height) / 2.0, canvas_width, height)
-        } else {
-            let width = canvas_height * image_ratio;
-            gtk::graphene::Rect::new((canvas_width - width) / 2.0, 0.0, width, canvas_height)
-        };
-        let preview_scale = self.imp().preview_scale.get().clamp(0.01, 64.0);
-        let preview_width = image_bounds.width() * preview_scale;
-        let preview_height = image_bounds.height() * preview_scale;
-        let image_bounds = gtk::graphene::Rect::new(
-            image_bounds.x() + (image_bounds.width() - preview_width) / 2.0,
-            image_bounds.y() + (image_bounds.height() - preview_height) / 2.0,
-            preview_width,
-            preview_height,
-        );
-        Some(gtk::graphene::Rect::new(
-            image_bounds.x()
-                + image_bounds.width() * overlay.x as f32 / overlay.image_width.max(1) as f32,
-            image_bounds.y()
-                + image_bounds.height() * overlay.y as f32 / overlay.image_height.max(1) as f32,
-            image_bounds.width() * overlay.width as f32 / overlay.image_width.max(1) as f32,
-            image_bounds.height() * overlay.height as f32 / overlay.image_height.max(1) as f32,
+        Some(overlay_rect(
+            self.image_bounds_for_texture(&texture),
+            &overlay,
         ))
     }
 
     pub fn pixel_at(&self, x: f64, y: f64) -> Option<(u32, u32)> {
         let texture = self.texture()?;
-        let width = f64::from(self.width().max(1));
-        let height = f64::from(self.height().max(1));
-        let image_ratio = f64::from(texture.width()) / f64::from(texture.height().max(1));
-        let bounds_ratio = width / height;
-        let (left, top, image_width, image_height) = if image_ratio > bounds_ratio {
-            let image_height = width / image_ratio;
-            (0.0, (height - image_height) / 2.0, width, image_height)
-        } else {
-            let image_width = height * image_ratio;
-            ((width - image_width) / 2.0, 0.0, image_width, height)
-        };
-        if x < left || y < top || x >= left + image_width || y >= top + image_height {
-            return None;
-        }
+        let normalized = self.normalized_at(x, y)?;
         Some((
-            ((x - left) * f64::from(texture.width()) / image_width) as u32,
-            ((y - top) * f64::from(texture.height()) / image_height) as u32,
+            (normalized.0 * texture.width() as f32) as u32,
+            (normalized.1 * texture.height() as f32) as u32,
         ))
     }
 
     pub fn normalized_at(&self, x: f64, y: f64) -> Option<(f32, f32)> {
         let texture = self.texture()?;
-        let width = f64::from(self.width().max(1));
-        let height = f64::from(self.height().max(1));
-        let image_ratio = f64::from(texture.width()) / f64::from(texture.height().max(1));
-        let bounds_ratio = width / height;
-        let (left, top, image_width, image_height) = if image_ratio > bounds_ratio {
-            let image_height = width / image_ratio;
-            (0.0, (height - image_height) / 2.0, width, image_height)
-        } else {
-            let image_width = height * image_ratio;
-            ((width - image_width) / 2.0, 0.0, image_width, height)
-        };
-        if x < left || y < top || x >= left + image_width || y >= top + image_height {
+        let bounds = self.image_bounds_for_texture(&texture);
+        let x = x as f32;
+        let y = y as f32;
+        if x < bounds.x()
+            || y < bounds.y()
+            || x >= bounds.x() + bounds.width()
+            || y >= bounds.y() + bounds.height()
+        {
             return None;
         }
         Some((
-            (x - left) as f32 / image_width as f32,
-            (y - top) as f32 / image_height as f32,
+            (x - bounds.x()) / bounds.width(),
+            (y - bounds.y()) / bounds.height(),
         ))
     }
 
@@ -816,6 +865,19 @@ impl ImageCanvas {
     pub fn pixel_boundary_at(&self, x: f64, y: f64) -> Option<(u32, u32)> {
         let texture = self.texture()?;
         let normalized = self.normalized_at(x, y)?;
+        Some(pixel_boundary_from_normalized(
+            normalized,
+            (texture.width() as u32, texture.height() as u32),
+        ))
+    }
+
+    pub fn clamped_pixel_boundary_at(&self, x: f64, y: f64) -> Option<(u32, u32)> {
+        let texture = self.texture()?;
+        let bounds = self.image_bounds_for_texture(&texture);
+        let normalized = (
+            ((x as f32 - bounds.x()) / bounds.width()).clamp(0.0, 1.0),
+            ((y as f32 - bounds.y()) / bounds.height()).clamp(0.0, 1.0),
+        );
         Some(pixel_boundary_from_normalized(
             normalized,
             (texture.width() as u32, texture.height() as u32),
@@ -970,6 +1032,51 @@ mod tests {
     #[test]
     fn hard_zoom_is_the_default_filter() {
         assert_eq!(ZoomFilter::default(), ZoomFilter::Hard);
+    }
+
+    #[test]
+    fn hard_zoom_measurement_reserves_the_full_render_aligned_extent() {
+        assert_eq!(measured_image_dimension(3, 1.0, ZoomFilter::Hard, 2.0), 3);
+        assert_eq!(measured_image_dimension(3, 1.5, ZoomFilter::Hard, 2.0), 5);
+        assert_eq!(measured_image_dimension(3, 1.25, ZoomFilter::Hard, 1.0), 4);
+    }
+
+    #[test]
+    fn one_hundred_percent_maps_every_source_pixel_to_equal_render_blocks() {
+        let render_scale = 2.0;
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 101.0, 3.0);
+        let image_bounds =
+            canvas_image_bounds(bounds, (101, 3), 1.0, ZoomFilter::Hard, render_scale, 1.0);
+
+        assert!((f64::from(image_bounds.x()) * render_scale).fract().abs() < 1e-6);
+        assert!((f64::from(image_bounds.y()) * render_scale).fract().abs() < 1e-6);
+        assert_eq!(image_bounds.width(), 101.0);
+        assert_eq!(image_bounds.height(), 3.0);
+        assert!(
+            (f64::from(image_bounds.width()) * render_scale - 202.0).abs() < 1e-5,
+            "each source pixel must occupy two GTK render-buffer pixels"
+        );
+        assert!(
+            (f64::from(image_bounds.height()) * render_scale - 6.0).abs() < 1e-5,
+            "each source pixel must occupy two GTK render-buffer pixels"
+        );
+    }
+
+    #[test]
+    fn fractional_or_soft_zoom_keeps_the_requested_contained_bounds() {
+        assert_eq!(aligned_render_pixel_scale(1.25, 1.0), None);
+        assert_eq!(aligned_render_pixel_scale(1.0, 2.0), Some(2.0));
+        assert_eq!(aligned_render_pixel_scale(0.8, 2.0), None);
+        assert_eq!(normalized_render_scale(1.666_667), 2.0);
+        assert_eq!(normalized_render_scale(f64::NAN), 1.0);
+        assert_eq!(normalized_render_scale(0.0), 1.0);
+
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 4.0, 4.0);
+        let soft = canvas_image_bounds(bounds, (4, 2), 1.0, ZoomFilter::Soft, 2.0, 1.0);
+        assert_eq!(
+            (soft.x(), soft.y(), soft.width(), soft.height()),
+            (0.0, 1.0, 4.0, 2.0)
+        );
     }
 
     #[test]
