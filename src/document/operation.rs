@@ -33,6 +33,7 @@ pub struct Stroke {
     pub path: StrokePath,
     pub color: [u8; 4],
     pub width: f32,
+    pub anti_aliasing: bool,
     pub opacity: f32,
     pub hardness: f32,
 }

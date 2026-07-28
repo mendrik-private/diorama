@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use image::{Rgba, RgbaImage};
 
@@ -19,6 +19,12 @@ pub enum PencilShape {
         center: BrushPoint,
         edge: BrushPoint,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimedBrushPoint {
+    pub point: BrushPoint,
+    pub timestamp_ms: u32,
 }
 
 pub fn shape_points(shape: PencilShape) -> Vec<BrushPoint> {
@@ -43,6 +49,46 @@ pub fn shape_points(shape: PencilShape) -> Vec<BrushPoint> {
     }
 }
 
+pub fn adaptive_smooth(
+    points: &[TimedBrushPoint],
+    base_smoothing: f32,
+    speed_smoothing: f32,
+    speed_sensitivity: f32,
+    passes: usize,
+) -> Vec<BrushPoint> {
+    if points.len() < 3 {
+        return points.iter().map(|sample| sample.point).collect();
+    }
+
+    let strengths = points
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let previous = points[index.saturating_sub(1)];
+            let next = points[(index + 1).min(points.len() - 1)];
+            let elapsed_ms = next.timestamp_ms.wrapping_sub(previous.timestamp_ms).max(1) as f32;
+            let speed = distance(previous.point, next.point) / elapsed_ms;
+            let speed_factor = 1.0 - (-speed / speed_sensitivity.max(0.001)).exp();
+
+            base_smoothing + speed_smoothing * speed_factor
+        })
+        .collect::<Vec<_>>();
+
+    let mut result = points.iter().map(|sample| sample.point).collect::<Vec<_>>();
+    for _ in 0..passes {
+        let mut next = result.clone();
+        for index in 1..result.len() - 1 {
+            let alpha = (strengths[index] * 0.22).min(0.48);
+            let neighbor_midpoint = midpoint(result[index - 1], result[index + 1]);
+            next[index].x = result[index].x * (1.0 - alpha) + neighbor_midpoint.x * alpha;
+            next[index].y = result[index].y * (1.0 - alpha) + neighbor_midpoint.y * alpha;
+        }
+        result = next;
+    }
+
+    result
+}
+
 pub fn sample(image: &RgbaImage, x: u32, y: u32) -> Option<[u8; 4]> {
     (x < image.width() && y < image.height()).then(|| image.get_pixel(x, y).0)
 }
@@ -63,7 +109,7 @@ pub fn paint_stroke(
         return Ok(output);
     }
 
-    if stroke.width == 1.0 && stroke.hardness == 1.0 {
+    if stroke.width == 1.0 && stroke.hardness == 1.0 && !stroke.anti_aliasing {
         paint_pixel_stroke(&mut output, stroke, cancellation)?;
         return Ok(output);
     }
@@ -72,8 +118,13 @@ pub fn paint_stroke(
     let points = match stroke.path {
         StrokePath::Smooth => smooth_path(&stroke.points, spacing),
         StrokePath::Linear => linear_path(&stroke.points, spacing),
+        StrokePath::Circle if stroke.anti_aliasing => smooth_circle_path(&stroke.points, spacing),
         StrokePath::Circle => circle_path(&stroke.points),
     };
+    if stroke.anti_aliasing {
+        paint_antialiased_stroke(&mut output, &points, stroke, cancellation)?;
+        return Ok(output);
+    }
     for point in points {
         cancellation.check()?;
         stamp(&mut output, point.x, point.y, point.pressure, stroke);
@@ -316,6 +367,32 @@ fn circle_path(points: &[BrushPoint]) -> Vec<BrushPoint> {
         .collect()
 }
 
+fn smooth_circle_path(points: &[BrushPoint], spacing: f32) -> Vec<BrushPoint> {
+    let Some(&center) = points.first() else {
+        return Vec::new();
+    };
+    let Some(&edge) = points.get(1) else {
+        return vec![center];
+    };
+    let radius = distance(center, edge);
+    if radius <= f32::EPSILON {
+        return vec![center];
+    }
+    let steps = (std::f32::consts::TAU * radius / spacing.max(0.01))
+        .ceil()
+        .max(8.0) as usize;
+    (0..steps)
+        .map(|step| {
+            let angle = std::f32::consts::TAU * step as f32 / steps as f32;
+            BrushPoint {
+                x: center.x + radius * angle.cos(),
+                y: center.y + radius * angle.sin(),
+                pressure: center.pressure,
+            }
+        })
+        .collect()
+}
+
 fn append_linear(path: &mut Vec<BrushPoint>, start: BrushPoint, end: BrushPoint, spacing: f32) {
     let steps = (distance(start, end) / spacing.max(0.01)).ceil().max(1.0) as u32;
     for step in 1..=steps {
@@ -364,6 +441,87 @@ fn midpoint(left: BrushPoint, right: BrushPoint) -> BrushPoint {
 
 fn distance(left: BrushPoint, right: BrushPoint) -> f32 {
     (right.x - left.x).hypot(right.y - left.y)
+}
+
+fn subdued_edge_coverage(coverage: f32) -> f32 {
+    // Keep the fully covered brush core intact while making the AA fringe less visually heavy.
+    coverage * coverage * (2.0 - coverage)
+}
+
+fn paint_antialiased_stroke(
+    image: &mut RgbaImage,
+    points: &[BrushPoint],
+    stroke: &Stroke,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut coverage = HashMap::new();
+    for (index, point) in points.iter().enumerate() {
+        if index % 4096 == 0 {
+            cancellation.check()?;
+        }
+        accumulate_stamp_coverage(
+            &mut coverage,
+            image.dimensions(),
+            point.x,
+            point.y,
+            point.pressure,
+            stroke,
+        );
+    }
+
+    let source_alpha = f32::from(stroke.color[3]) / 255.0 * stroke.opacity;
+    for (index, ((x, y), coverage)) in coverage.into_iter().enumerate() {
+        if index % 4096 == 0 {
+            cancellation.check()?;
+        }
+        let destination = image.get_pixel_mut(x, y);
+        *destination = blend(*destination, Rgba(stroke.color), source_alpha * coverage);
+    }
+    Ok(())
+}
+
+fn accumulate_stamp_coverage(
+    coverage: &mut HashMap<(u32, u32), f32>,
+    dimensions: (u32, u32),
+    center_x: f32,
+    center_y: f32,
+    pressure: f32,
+    stroke: &Stroke,
+) {
+    let (width, height) = dimensions;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let radius = stroke.width * pressure.clamp(0.01, 1.0) / 2.0;
+    let outer_radius = radius + 0.5;
+    let min_x = (center_x - outer_radius).floor().max(0.0) as u32;
+    let min_y = (center_y - outer_radius).floor().max(0.0) as u32;
+    let max_x = (center_x + outer_radius)
+        .ceil()
+        .min(width.saturating_sub(1) as f32) as u32;
+    let max_y = (center_y + outer_radius)
+        .ceil()
+        .min(height.saturating_sub(1) as f32) as u32;
+    let hard_radius = (radius - 0.5).max(0.0) * stroke.hardness;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let distance = (x as f32 + 0.5 - center_x).hypot(y as f32 + 0.5 - center_y);
+            let linear_coverage = if distance <= hard_radius {
+                1.0
+            } else {
+                ((outer_radius - distance) / (outer_radius - hard_radius)).clamp(0.0, 1.0)
+            };
+            let pixel_coverage = subdued_edge_coverage(linear_coverage);
+            if pixel_coverage <= 0.0 {
+                continue;
+            }
+            coverage
+                .entry((x, y))
+                .and_modify(|value| *value = value.max(pixel_coverage))
+                .or_insert(pixel_coverage);
+        }
+    }
 }
 
 fn stamp(image: &mut RgbaImage, center_x: f32, center_y: f32, pressure: f32, stroke: &Stroke) {
@@ -419,8 +577,8 @@ mod tests {
     use image::{Rgba, RgbaImage};
 
     use super::{
-        PencilShape, bresenham_circle_path, bresenham_line, paint_stroke, pixel_perfect_freehand,
-        sample, shape_points, smooth_path,
+        PencilShape, TimedBrushPoint, adaptive_smooth, bresenham_circle_path, bresenham_line,
+        paint_stroke, pixel_perfect_freehand, sample, shape_points, smooth_path,
     };
     use crate::document::{BrushPoint, CancellationToken, Stroke, StrokePath};
 
@@ -438,6 +596,87 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_smoothing_increases_with_pointer_speed_and_preserves_endpoints() {
+        let samples = |last_timestamp| {
+            [
+                TimedBrushPoint {
+                    point: BrushPoint {
+                        x: 0.0,
+                        y: 0.0,
+                        pressure: 0.25,
+                    },
+                    timestamp_ms: 0,
+                },
+                TimedBrushPoint {
+                    point: BrushPoint {
+                        x: 1.0,
+                        y: 1.0,
+                        pressure: 0.5,
+                    },
+                    timestamp_ms: last_timestamp / 2,
+                },
+                TimedBrushPoint {
+                    point: BrushPoint {
+                        x: 2.0,
+                        y: 0.0,
+                        pressure: 0.75,
+                    },
+                    timestamp_ms: last_timestamp,
+                },
+            ]
+        };
+
+        let slow = adaptive_smooth(&samples(20), 0.3, 1.5, 0.8, 1);
+        let fast = adaptive_smooth(&samples(2), 0.3, 1.5, 0.8, 1);
+
+        assert_eq!(slow[0], samples(20)[0].point);
+        assert_eq!(slow[2], samples(20)[2].point);
+        assert_eq!(slow[1].pressure, samples(20)[1].point.pressure);
+        assert!(
+            fast[1].y < slow[1].y,
+            "the faster point should move farther toward its neighbors"
+        );
+    }
+
+    #[test]
+    fn adaptive_smoothing_handles_duplicate_timestamps() {
+        let samples = [
+            TimedBrushPoint {
+                point: BrushPoint {
+                    x: 0.0,
+                    y: 0.0,
+                    pressure: 1.0,
+                },
+                timestamp_ms: 5,
+            },
+            TimedBrushPoint {
+                point: BrushPoint {
+                    x: 1.0,
+                    y: 1.0,
+                    pressure: 1.0,
+                },
+                timestamp_ms: 5,
+            },
+            TimedBrushPoint {
+                point: BrushPoint {
+                    x: 2.0,
+                    y: 0.0,
+                    pressure: 1.0,
+                },
+                timestamp_ms: 5,
+            },
+        ];
+
+        let smoothed = adaptive_smooth(&samples, 0.3, 1.5, 0.8, 12);
+
+        assert!(
+            smoothed
+                .iter()
+                .all(|point| point.x.is_finite() && point.y.is_finite())
+        );
+    }
+
+    #[test]
     fn a_stroke_changes_only_nearby_pixels() {
         let image = RgbaImage::from_pixel(20, 20, Rgba([0, 0, 0, 0]));
         let stroke = Stroke {
@@ -449,6 +688,7 @@ mod tests {
             path: StrokePath::Smooth,
             color: [255, 0, 0, 255],
             width: 3.0,
+            anti_aliasing: false,
             opacity: 1.0,
             hardness: 1.0,
         };
@@ -513,6 +753,7 @@ mod tests {
             path: StrokePath::Smooth,
             color: [255, 0, 0, 255],
             width: 3.0,
+            anti_aliasing: false,
             opacity: 1.0,
             hardness: 1.0,
         };
@@ -626,6 +867,7 @@ mod tests {
                     path,
                     color: [255, 0, 0, 255],
                     width: 1.0,
+                    anti_aliasing: false,
                     opacity: 1.0,
                     hardness: 1.0,
                 },
@@ -737,6 +979,7 @@ mod tests {
             path: StrokePath::Circle,
             color: [255, 0, 0, 255],
             width: 1.0,
+            anti_aliasing: false,
             opacity: 1.0,
             hardness: 1.0,
         };
@@ -761,6 +1004,131 @@ mod tests {
     }
 
     #[test]
+    fn antialiasing_adds_partial_coverage_to_freehand_and_circle_edges() {
+        let image = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0]));
+        let paint = |points, path| {
+            paint_stroke(
+                &image,
+                &Stroke {
+                    points,
+                    path,
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                    anti_aliasing: true,
+                    opacity: 1.0,
+                    hardness: 1.0,
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        };
+        let freehand = paint(
+            vec![
+                BrushPoint {
+                    x: 2.5,
+                    y: 2.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 11.5,
+                    y: 7.5,
+                    pressure: 1.0,
+                },
+            ],
+            StrokePath::Smooth,
+        );
+        let circle = paint(
+            vec![
+                BrushPoint {
+                    x: 8.5,
+                    y: 8.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 13.5,
+                    y: 8.5,
+                    pressure: 1.0,
+                },
+            ],
+            StrokePath::Circle,
+        );
+
+        for output in [&freehand, &circle] {
+            assert!(
+                output
+                    .pixels()
+                    .any(|pixel| (1..u8::MAX).contains(&pixel.0[3])),
+                "anti-aliased edge should include partially covered pixels"
+            );
+            assert!(
+                output.pixels().any(|pixel| pixel.0[3] == u8::MAX),
+                "stroke center should remain fully covered"
+            );
+        }
+    }
+
+    #[test]
+    fn antialiasing_uses_a_subdued_fringe_without_weakening_aligned_core() {
+        let image = RgbaImage::from_pixel(9, 9, Rgba([0, 0, 0, 0]));
+        let paint = |x| {
+            paint_stroke(
+                &image,
+                &Stroke {
+                    points: vec![BrushPoint {
+                        x,
+                        y: 4.5,
+                        pressure: 1.0,
+                    }],
+                    path: StrokePath::Smooth,
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                    anti_aliasing: true,
+                    opacity: 1.0,
+                    hardness: 1.0,
+                },
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        };
+
+        let aligned = paint(4.5);
+        let half_covered = paint(4.0);
+
+        assert_eq!(aligned.get_pixel(4, 4).0[3], u8::MAX);
+        assert_eq!(half_covered.get_pixel(3, 4).0[3], 96);
+        assert_eq!(half_covered.get_pixel(4, 4).0[3], 96);
+    }
+
+    #[test]
+    fn paint_width_controls_the_round_brush_diameter() {
+        let image = RgbaImage::from_pixel(9, 9, Rgba([0, 0, 0, 0]));
+        let paint = |width| {
+            paint_stroke(
+                &image,
+                &Stroke {
+                    points: vec![BrushPoint {
+                        x: 4.5,
+                        y: 4.5,
+                        pressure: 1.0,
+                    }],
+                    path: StrokePath::Smooth,
+                    color: [255, 0, 0, 255],
+                    width,
+                    anti_aliasing: false,
+                    opacity: 1.0,
+                    hardness: 1.0,
+                },
+                &CancellationToken::default(),
+            )
+            .map(|output| painted_pixels(&output))
+            .unwrap()
+        };
+
+        assert_eq!(paint(1.0), HashSet::from([(4, 4)]));
+        assert!(paint(3.0).len() > 1);
+    }
+
+    #[test]
     fn linear_rectangle_path_keeps_its_corners_and_closing_edge() {
         let start = BrushPoint {
             x: 2.5,
@@ -777,6 +1145,7 @@ mod tests {
             path: StrokePath::Linear,
             color: [255, 0, 0, 255],
             width: 1.0,
+            anti_aliasing: false,
             opacity: 1.0,
             hardness: 1.0,
         };
