@@ -697,12 +697,12 @@ mod imp {
         )
     }
 
-    fn draw_dashed_crop_border(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
-        let red = gdk::RGBA::new(0.95, 0.18, 0.18, 1.0);
-        let blue = gdk::RGBA::new(0.18, 0.42, 0.96, 1.0);
+    pub(super) fn draw_dashed_crop_border(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
+        let black = gdk::RGBA::BLACK;
+        let white = gdk::RGBA::WHITE;
         const DASH: f32 = 8.0;
         const GAP: f32 = 4.0;
-        const THICKNESS: f32 = 2.0;
+        const THICKNESS: f32 = 1.0;
 
         for (horizontal, x, y, length) in [
             (true, rect.x(), rect.y(), rect.width()),
@@ -721,10 +721,10 @@ mod imp {
             ),
         ] {
             let mut offset = 0.0;
-            let mut is_red = true;
+            let mut is_black = true;
             while offset < length {
                 let dash = (length - offset).min(DASH);
-                let color = if is_red { &red } else { &blue };
+                let color = if is_black { &black } else { &white };
                 let segment = if horizontal {
                     gtk::graphene::Rect::new(x + offset, y, dash, THICKNESS)
                 } else {
@@ -732,7 +732,7 @@ mod imp {
                 };
                 snapshot.append_color(color, &segment);
                 offset += DASH + GAP;
-                is_red = !is_red;
+                is_black = !is_black;
             }
         }
     }
@@ -1227,6 +1227,41 @@ mod tests {
             );
             assert!(snapshot.to_node().is_some());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn drag_rectangle_border_is_one_pixel_black_and_white() {
+        gtk::init().expect("GTK display initialization");
+        let snapshot = gtk::Snapshot::new();
+        imp::draw_dashed_crop_border(&snapshot, gtk::graphene::Rect::new(2.0, 3.0, 32.0, 24.0));
+        let border = snapshot
+            .to_node()
+            .expect("border render node")
+            .downcast::<gtk::gsk::ContainerNode>()
+            .expect("border segment container");
+        let mut black_segments = 0;
+        let mut white_segments = 0;
+
+        for index in 0..border.n_children() {
+            let segment = border
+                .child(index)
+                .downcast::<gtk::gsk::ColorNode>()
+                .expect("solid border segment");
+            let bounds = segment.bounds();
+            assert!(
+                bounds.width() == 1.0 || bounds.height() == 1.0,
+                "each border segment must be exactly one pixel thick: {bounds:?}"
+            );
+            match segment.color() {
+                color if color == gdk::RGBA::BLACK => black_segments += 1,
+                color if color == gdk::RGBA::WHITE => white_segments += 1,
+                color => panic!("unexpected drag rectangle color: {color:?}"),
+            }
+        }
+
+        assert!(black_segments > 0);
+        assert!(white_segments > 0);
     }
 
     #[test]

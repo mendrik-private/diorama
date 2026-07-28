@@ -35,6 +35,8 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.flip-horizontal", &["h"]),
     ("win.flip-vertical", &["v"]),
     ("win.crop", &["c"]),
+    ("win.measure", &["m"]),
+    ("win.scale-preview", &["s"]),
     ("win.confirm-crop", &["Return", "KP_Enter"]),
     ("win.compare", &["d"]),
     ("win.pencil", &["p"]),
@@ -79,5 +81,11 @@ mod tests {
     #[test]
     fn control_c_is_reserved_for_copying_the_full_image() {
         assert!(SHORTCUTS.contains(&("win.copy-image", &["<Control>c"])));
+    }
+
+    #[test]
+    fn edit_tools_have_single_key_accelerators() {
+        assert!(SHORTCUTS.contains(&("win.measure", &["m"])));
+        assert!(SHORTCUTS.contains(&("win.scale-preview", &["s"])));
     }
 }
