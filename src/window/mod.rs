@@ -1461,8 +1461,8 @@ impl ViewerWindow {
                     .version(env!("CARGO_PKG_VERSION"))
                     .developer_name("Diorama contributors")
                     .license_type(gtk::License::Gpl30)
-                    .website("https://github.com/mendrik/diorama")
-                    .issue_url("https://github.com/mendrik/diorama/issues")
+                    .website("https://github.com/mendrik-private/diorama")
+                    .issue_url("https://github.com/mendrik-private/diorama/issues")
                     .build()
                     .present(Some(&window));
             }
@@ -5542,7 +5542,7 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     let next = button("go-next-symbolic", "Next Image", "win.next");
     let scale_button = toggle_button("view-fullscreen-symbolic", "Scale image");
     let selection_button = toggle_button(
-        "edit-select-all-symbolic",
+        "edit-cut-symbolic",
         "Select and Copy — drag a rectangle or click an object",
     );
     let color_picker_button = toggle_button(
@@ -6489,7 +6489,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn copied_selection_deactivates_the_selection_tool() {
+    fn selection_tool_uses_scissors_and_deactivates_after_copy() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.SelectionClipboardTest")
@@ -6499,9 +6499,16 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
+        let display = gtk::gdk::Display::default().expect("graphical display");
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
         window.0.rendered.replace(Some(image));
         window.0.selection_button.set_active(true);
+
+        assert_eq!(
+            window.0.selection_button.icon_name().as_deref(),
+            Some("edit-cut-symbolic")
+        );
+        assert!(gtk::IconTheme::for_display(&display).has_icon("edit-cut-symbolic"));
 
         window.complete_selection(SelectionDrag {
             start: (0, 0),
