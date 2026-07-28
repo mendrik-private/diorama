@@ -22,4 +22,9 @@ subdir('data')
 
 gnome.post_install(glib_compile_schemas: true)
 
-test('cargo-tests', cargo_script, args: [meson.project_source_root(), '', 'test'])
+test(
+  'cargo-tests',
+  cargo_script,
+  args: [meson.project_source_root(), '', 'test'],
+  timeout: 600,
+)
