@@ -5,6 +5,8 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
+use crate::document::{BrushPoint, StrokePath};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZoomFilter {
     Soft,
@@ -202,6 +204,14 @@ pub(super) struct Lens {
     show_cross: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PencilOverlay {
+    points: Vec<BrushPoint>,
+    path: StrokePath,
+    color: [u8; 4],
+    width: f32,
+}
+
 mod imp {
     use super::*;
 
@@ -220,6 +230,7 @@ mod imp {
         pub measurement_overlay: Cell<Option<CropOverlay>>,
         pub measurement_cursor: Cell<Option<(f32, f32)>>,
         pub(super) mask_flash: RefCell<Option<MaskFlash>>,
+        pub(super) pencil_overlay: RefCell<Option<PencilOverlay>>,
     }
 
     #[glib::object_subclass]
@@ -315,6 +326,19 @@ mod imp {
             if let Some(lens) = self.lens.borrow().as_ref() {
                 draw_lens(snapshot, bounds, lens);
             }
+            if let Some(image_bounds) = image_bounds
+                && let Some(overlay) = self.pencil_overlay.borrow().as_ref()
+            {
+                draw_pencil_overlay(
+                    snapshot,
+                    image_bounds,
+                    self.texture
+                        .borrow()
+                        .as_ref()
+                        .map_or((1, 1), |texture| (texture.width(), texture.height())),
+                    overlay,
+                );
+            }
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
             }
@@ -327,6 +351,108 @@ mod imp {
                 }
             }
         }
+    }
+
+    pub(super) fn draw_pencil_overlay(
+        snapshot: &gtk::Snapshot,
+        image_bounds: gtk::graphene::Rect,
+        image_dimensions: (i32, i32),
+        overlay: &PencilOverlay,
+    ) {
+        let Some(first) = overlay.points.first().copied() else {
+            return;
+        };
+        let scale_x = image_bounds.width() / image_dimensions.0.max(1) as f32;
+        let scale_y = image_bounds.height() / image_dimensions.1.max(1) as f32;
+        let map = |point: BrushPoint| {
+            gtk::graphene::Point::new(
+                image_bounds.x() + point.x * scale_x,
+                image_bounds.y() + point.y * scale_y,
+            )
+        };
+        let color = gdk::RGBA::new(
+            f32::from(overlay.color[0]) / 255.0,
+            f32::from(overlay.color[1]) / 255.0,
+            f32::from(overlay.color[2]) / 255.0,
+            f32::from(overlay.color[3]) / 255.0,
+        );
+        let line_width = overlay.width * scale_x;
+        let builder = gtk::gsk::PathBuilder::new();
+
+        if overlay.points.len() == 1 {
+            draw_pencil_dot(snapshot, image_bounds, map(first), line_width, &color);
+            return;
+        }
+
+        match overlay.path {
+            StrokePath::Smooth => {
+                let first = map(first);
+                builder.move_to(first.x(), first.y());
+                if overlay.points.len() == 2 {
+                    let last = map(overlay.points[1]);
+                    builder.line_to(last.x(), last.y());
+                } else {
+                    let second = map(overlay.points[1]);
+                    builder.quad_to(
+                        first.x(),
+                        first.y(),
+                        (first.x() + second.x()) / 2.0,
+                        (first.y() + second.y()) / 2.0,
+                    );
+                    for points in overlay.points.windows(3) {
+                        let control = map(points[1]);
+                        let next = map(points[2]);
+                        builder.quad_to(
+                            control.x(),
+                            control.y(),
+                            (control.x() + next.x()) / 2.0,
+                            (control.y() + next.y()) / 2.0,
+                        );
+                    }
+                    let last = map(*overlay.points.last().expect("at least two points"));
+                    builder.quad_to(last.x(), last.y(), last.x(), last.y());
+                }
+            }
+            StrokePath::Linear => {
+                let first = map(first);
+                builder.move_to(first.x(), first.y());
+                for point in overlay.points.iter().skip(1).copied().map(map) {
+                    builder.line_to(point.x(), point.y());
+                }
+            }
+            StrokePath::Circle => {
+                let center = map(first);
+                let edge = map(overlay.points[1]);
+                let radius = (edge.x() - center.x()).hypot(edge.y() - center.y());
+                if radius <= f32::EPSILON {
+                    draw_pencil_dot(snapshot, image_bounds, center, line_width, &color);
+                    return;
+                }
+                builder.add_circle(&center, radius);
+            }
+        }
+
+        let stroke = gtk::gsk::Stroke::builder(line_width)
+            .line_cap(gtk::gsk::LineCap::Round)
+            .line_join(gtk::gsk::LineJoin::Round)
+            .build();
+        snapshot.push_clip(&image_bounds);
+        snapshot.append_stroke(&builder.to_path(), &stroke, &color);
+        snapshot.pop();
+    }
+
+    fn draw_pencil_dot(
+        snapshot: &gtk::Snapshot,
+        image_bounds: gtk::graphene::Rect,
+        center: gtk::graphene::Point,
+        diameter: f32,
+        color: &gdk::RGBA,
+    ) {
+        let builder = gtk::gsk::PathBuilder::new();
+        builder.add_circle(&center, diameter / 2.0);
+        snapshot.push_clip(&image_bounds);
+        snapshot.append_fill(&builder.to_path(), gtk::gsk::FillRule::Winding, color);
+        snapshot.pop();
     }
 
     fn draw_lens(snapshot: &gtk::Snapshot, bounds: gtk::graphene::Rect, lens: &Lens) {
@@ -798,6 +924,28 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
+    pub fn set_pencil_overlay(
+        &self,
+        points: &[BrushPoint],
+        path: StrokePath,
+        color: [u8; 4],
+        width: f32,
+    ) {
+        self.imp().pencil_overlay.replace(Some(PencilOverlay {
+            points: points.to_vec(),
+            path,
+            color,
+            width,
+        }));
+        self.queue_draw();
+    }
+
+    pub fn clear_pencil_overlay(&self) {
+        if self.imp().pencil_overlay.borrow_mut().take().is_some() {
+            self.queue_draw();
+        }
+    }
+
     pub fn set_mask_flash(&self, texture: Option<&gdk::Texture>, bounds: CropOverlay) {
         self.imp()
             .mask_flash
@@ -1028,10 +1176,57 @@ impl MiniMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{BrushPoint, StrokePath};
 
     #[test]
     fn hard_zoom_is_the_default_filter() {
         assert_eq!(ZoomFilter::default(), ZoomFilter::Hard);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pencil_overlay_builds_render_nodes_for_every_path_shape() {
+        gtk::init().expect("GTK display initialization");
+        let point = |x, y| BrushPoint {
+            x,
+            y,
+            pressure: 1.0,
+        };
+        let cases = [
+            (vec![point(4.5, 4.5)], StrokePath::Smooth),
+            (
+                vec![point(1.5, 1.5), point(4.5, 6.5), point(8.5, 2.5)],
+                StrokePath::Smooth,
+            ),
+            (
+                vec![
+                    point(1.5, 1.5),
+                    point(8.5, 1.5),
+                    point(8.5, 8.5),
+                    point(1.5, 8.5),
+                    point(1.5, 1.5),
+                ],
+                StrokePath::Linear,
+            ),
+            (vec![point(5.5, 5.5), point(5.5, 5.5)], StrokePath::Circle),
+            (vec![point(5.5, 5.5), point(9.5, 5.5)], StrokePath::Circle),
+        ];
+
+        for (points, path) in cases {
+            let snapshot = gtk::Snapshot::new();
+            imp::draw_pencil_overlay(
+                &snapshot,
+                gtk::graphene::Rect::new(0.0, 0.0, 10.0, 10.0),
+                (10, 10),
+                &PencilOverlay {
+                    points,
+                    path,
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                },
+            );
+            assert!(snapshot.to_node().is_some());
+        }
     }
 
     #[test]

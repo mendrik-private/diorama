@@ -38,6 +38,7 @@ struct HeaderWidgets {
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
     color_button: gtk::ColorDialogButton,
+    pencil_size: gtk::SpinButton,
     edit_button: gtk::ToggleButton,
 }
 
@@ -88,11 +89,11 @@ struct ZoomRectDrag {
 struct PencilDrag {
     canvas: ImageCanvas,
     start_screen: (f64, f64),
+    mode: PencilDragMode,
     origin: BrushPoint,
     line_start: BrushPoint,
     current: BrushPoint,
-    freehand_points: Vec<BrushPoint>,
-    line_mode: bool,
+    freehand_points: Vec<crate::tools::pencil::TimedBrushPoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,9 +128,11 @@ fn pencil_line_start(
     }
 }
 
-fn pencil_drag_points(drag: &PencilDrag, mode: PencilDragMode) -> Vec<BrushPoint> {
-    match mode {
-        PencilDragMode::Freehand => drag.freehand_points.clone(),
+fn pencil_drag_points(drag: &PencilDrag) -> Vec<BrushPoint> {
+    match drag.mode {
+        PencilDragMode::Freehand => {
+            crate::tools::pencil::adaptive_smooth(&drag.freehand_points, 0.3, 1.5, 0.8, 12)
+        }
         PencilDragMode::Line => {
             crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Line {
                 start: drag.line_start,
@@ -157,6 +160,10 @@ fn pencil_drag_path(mode: PencilDragMode) -> StrokePath {
         PencilDragMode::Line | PencilDragMode::Rectangle => StrokePath::Linear,
         PencilDragMode::Circle => StrokePath::Circle,
     }
+}
+
+fn pencil_event_time(gesture: &gtk::GestureDrag) -> u32 {
+    gesture.current_event().map_or(0, |event| event.time())
 }
 
 #[derive(Clone, Copy)]
@@ -597,6 +604,8 @@ struct WindowState {
     pencil_drag: RefCell<Option<PencilDrag>>,
     pencil_line_anchor: Cell<Option<BrushPoint>>,
     pencil_color: Cell<[u8; 4]>,
+    pencil_antialiasing: Cell<bool>,
+    pencil_size: gtk::SpinButton,
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
     zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
@@ -822,6 +831,9 @@ impl ViewerWindow {
             .subtitle("Open an image to begin")
             .build();
         let header_widgets = build_header(&title);
+        header_widgets
+            .pencil_size
+            .set_value(f64::from(settings.pencil_size()));
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header_widgets.header);
         content.append(&toasts);
@@ -840,6 +852,7 @@ impl ViewerWindow {
         let lens_diameter = settings.compare_lens_size();
         let lens_magnification = settings.compare_lens_magnification();
         let scale_resampling = settings.scale_resampling();
+        let pencil_antialiasing = settings.pencil_antialiasing();
         let this = Self(Rc::new(WindowState {
             window,
             canvas,
@@ -867,6 +880,8 @@ impl ViewerWindow {
             pencil_drag: RefCell::new(None),
             pencil_line_anchor: Cell::new(None),
             pencil_color: Cell::new([0, 0, 0, 255]),
+            pencil_antialiasing: Cell::new(pencil_antialiasing),
+            pencil_size: header_widgets.pencil_size,
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
             zoom_rect_drag: Cell::new(None),
@@ -1442,15 +1457,11 @@ impl ViewerWindow {
         });
         self.add_action("preferences", {
             let this = self.clone();
-            move || this.show_preferences()
+            move || this.show_properties()
         });
         self.add_action("shortcuts", {
             let this = self.clone();
             move || this.show_shortcuts()
-        });
-        self.add_action("properties", {
-            let this = self.clone();
-            move || this.show_properties()
         });
         self.add_action("about", {
             let window = self.0.window.clone();
@@ -1557,6 +1568,10 @@ impl ViewerWindow {
         self.0.color_button.connect_rgba_notify({
             let this = self.clone();
             move |button| this.0.pencil_color.set(rgba_to_u8(button.rgba()))
+        });
+        self.0.pencil_size.connect_value_changed({
+            let settings = self.0.settings.clone();
+            move |spinner| settings.set_pencil_size(spinner.value().round() as u8)
         });
         self.0.edit_button.connect_toggled({
             let this = self.clone();
@@ -2050,26 +2065,20 @@ impl ViewerWindow {
     }
 
     fn preview_pencil_stroke(&self) {
-        let Some(image) = self.0.rendered.borrow().clone() else {
-            return;
-        };
-        self.paint_pencil_preview(
-            &self.0.canvas,
-            &image,
+        self.0.canvas.set_pencil_overlay(
             &self.0.pencil_points.borrow(),
             self.0.pencil_path.get(),
+            self.0.pencil_color.get(),
+            self.0.pencil_size.value().round() as f32,
         );
     }
 
     fn preview_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
-        let Some(image) = self.0.compare_rendered.borrow().clone() else {
-            return;
-        };
-        self.paint_pencil_preview(
-            canvas,
-            &image,
+        canvas.set_pencil_overlay(
             &self.0.pencil_points.borrow(),
             self.0.pencil_path.get(),
+            self.0.pencil_color.get(),
+            self.0.pencil_size.value().round() as f32,
         );
     }
 
@@ -2080,14 +2089,7 @@ impl ViewerWindow {
         points: &[BrushPoint],
         path: StrokePath,
     ) -> Option<image::RgbaImage> {
-        let stroke = Stroke {
-            points: points.to_vec(),
-            path,
-            color: self.0.pencil_color.get(),
-            width: 1.0,
-            opacity: 1.0,
-            hardness: 1.0,
-        };
+        let stroke = self.pencil_stroke(points, path);
         if let Ok(preview) =
             crate::tools::pencil::paint_stroke(image, &stroke, &CancellationToken::default())
             && let Ok(texture) = texture_from_rgba(&preview)
@@ -2102,6 +2104,18 @@ impl ViewerWindow {
         None
     }
 
+    fn pencil_stroke(&self, points: &[BrushPoint], path: StrokePath) -> Stroke {
+        Stroke {
+            points: points.to_vec(),
+            path,
+            color: self.0.pencil_color.get(),
+            width: self.0.pencil_size.value().round() as f32,
+            anti_aliasing: self.0.pencil_antialiasing.get(),
+            opacity: 1.0,
+            hardness: 1.0,
+        }
+    }
+
     fn commit_comparison_pencil_stroke(
         &self,
         canvas: &ImageCanvas,
@@ -2109,11 +2123,30 @@ impl ViewerWindow {
         path: StrokePath,
     ) {
         let Some(image) = self.0.compare_rendered.borrow().clone() else {
+            canvas.clear_pencil_overlay();
             return;
         };
         if let Some(preview) = self.paint_pencil_preview(canvas, &image, points, path) {
             self.0.compare_rendered.replace(Some(preview));
         }
+        canvas.clear_pencil_overlay();
+    }
+
+    fn commit_pencil_stroke(&self, points: &[BrushPoint], path: StrokePath) {
+        let stroke = self.pencil_stroke(points, path);
+        let image = self.0.rendered.borrow().clone();
+        if let Some(image) = image
+            && let Ok(preview) =
+                crate::tools::pencil::paint_stroke(&image, &stroke, &CancellationToken::default())
+            && let Ok(texture) = texture_from_rgba(&preview)
+        {
+            self.0.canvas.set_texture(Some(&texture));
+            self.0.canvas.update_lens_texture(&texture);
+            self.0.rendered.replace(Some(preview));
+            self.update_minimap();
+        }
+        self.0.canvas.clear_pencil_overlay();
+        self.apply(Operation::Pencil(stroke));
     }
 
     fn begin_pencil_drag(
@@ -2122,6 +2155,7 @@ impl ViewerWindow {
         screen_x: f64,
         screen_y: f64,
         modifiers: gtk::gdk::ModifierType,
+        timestamp_ms: u32,
     ) {
         let Some(origin) = canvas
             .pixel_at(screen_x, screen_y)
@@ -2138,13 +2172,16 @@ impl ViewerWindow {
         self.0.pencil_drag.replace(Some(PencilDrag {
             canvas: canvas.clone(),
             start_screen: (screen_x, screen_y),
+            mode,
             origin,
             line_start,
             current: origin,
-            freehand_points: vec![origin],
-            line_mode: mode == PencilDragMode::Line,
+            freehand_points: vec![crate::tools::pencil::TimedBrushPoint {
+                point: origin,
+                timestamp_ms,
+            }],
         }));
-        self.update_pencil_drag(canvas, screen_x, screen_y, modifiers);
+        self.update_pencil_drag(canvas, screen_x, screen_y, timestamp_ms);
     }
 
     fn update_pencil_drag(
@@ -2152,7 +2189,7 @@ impl ViewerWindow {
         canvas: &ImageCanvas,
         screen_x: f64,
         screen_y: f64,
-        modifiers: gtk::gdk::ModifierType,
+        timestamp_ms: u32,
     ) {
         let Some(current) = canvas
             .pixel_at(screen_x, screen_y)
@@ -2164,8 +2201,7 @@ impl ViewerWindow {
         else {
             return;
         };
-        let mode = pencil_drag_mode(modifiers);
-        let points = {
+        let (points, path) = {
             let mut pencil_drag = self.0.pencil_drag.borrow_mut();
             let Some(drag) = pencil_drag.as_mut() else {
                 return;
@@ -2174,14 +2210,19 @@ impl ViewerWindow {
                 return;
             }
             drag.current = current;
-            if drag.freehand_points.last() != Some(&current) {
-                drag.freehand_points.push(current);
+            if drag.mode == PencilDragMode::Freehand
+                && drag.freehand_points.last().map(|sample| sample.point) != Some(current)
+            {
+                drag.freehand_points
+                    .push(crate::tools::pencil::TimedBrushPoint {
+                        point: current,
+                        timestamp_ms,
+                    });
             }
-            drag.line_mode = mode == PencilDragMode::Line;
-            pencil_drag_points(drag, mode)
+            (pencil_drag_points(drag), pencil_drag_path(drag.mode))
         };
         self.0.pencil_points.replace(points);
-        self.0.pencil_path.set(pencil_drag_path(mode));
+        self.0.pencil_path.set(path);
         if canvas == &self.0.canvas {
             self.preview_pencil_stroke();
         } else {
@@ -2194,15 +2235,15 @@ impl ViewerWindow {
         canvas: &ImageCanvas,
         screen_x: f64,
         screen_y: f64,
-        modifiers: gtk::gdk::ModifierType,
+        timestamp_ms: u32,
     ) -> Option<(Vec<BrushPoint>, StrokePath)> {
-        self.update_pencil_drag(canvas, screen_x, screen_y, modifiers);
+        self.update_pencil_drag(canvas, screen_x, screen_y, timestamp_ms);
         let drag = self.0.pencil_drag.take()?;
         if drag.canvas != *canvas {
             self.0.pencil_drag.replace(Some(drag));
             return None;
         }
-        if drag.line_mode {
+        if drag.mode == PencilDragMode::Line {
             self.0.pencil_line_anchor.set(Some(drag.current));
         } else {
             self.0.pencil_line_anchor.set(None);
@@ -2219,20 +2260,7 @@ impl ViewerWindow {
         let Some(drag) = self.0.pencil_drag.take() else {
             return;
         };
-        let image = if drag.canvas == self.0.canvas {
-            self.0.rendered.borrow().clone()
-        } else {
-            self.0.compare_rendered.borrow().clone()
-        };
-        if let Some(image) = image
-            && let Ok(texture) = texture_from_rgba(&image)
-        {
-            drag.canvas.set_texture(Some(&texture));
-            drag.canvas.update_lens_texture(&texture);
-            if drag.canvas == self.0.canvas {
-                self.update_minimap();
-            }
-        }
+        drag.canvas.clear_pencil_overlay();
     }
 
     fn abort_pencil_line(&self) {
@@ -2241,7 +2269,7 @@ impl ViewerWindow {
             .pencil_drag
             .borrow()
             .as_ref()
-            .is_some_and(|drag| drag.line_mode)
+            .is_some_and(|drag| drag.mode == PencilDragMode::Line)
         {
             self.abort_pencil_drag();
         } else {
@@ -2985,19 +3013,20 @@ impl ViewerWindow {
         dialog.present(Some(&self.0.window));
     }
 
-    fn show_preferences(&self) {
+    fn show_properties(&self) {
         let dialog = adw::Dialog::builder()
-            .title("Preferences")
-            .content_width(420)
+            .title("Properties")
+            .content_width(480)
+            .content_height(650)
             .build();
         let header = adw::HeaderBar::new();
         let done = gtk::Button::with_label("Done");
         done.add_css_class("suggested-action");
         header.pack_end(&done);
-        let group = adw::PreferencesGroup::builder()
+        let viewing_group = adw::PreferencesGroup::builder()
             .title("Viewing")
             .margin_top(18)
-            .margin_bottom(18)
+            .margin_bottom(12)
             .margin_start(18)
             .margin_end(18)
             .build();
@@ -3006,7 +3035,7 @@ impl ViewerWindow {
             .subtitle("Keep pixel edges sharp with nearest-neighbor rendering")
             .active(self.0.canvas.filter() == ZoomFilter::Hard)
             .build();
-        group.add(&filter);
+        viewing_group.add(&filter);
         let background = adw::ComboRow::builder()
             .title("Transparency background")
             .model(&gtk::StringList::new(&[
@@ -3024,14 +3053,14 @@ impl ViewerWindow {
                 Background::Black => 4,
             })
             .build();
-        group.add(&background);
+        viewing_group.add(&background);
         let lens_size = adw::ComboRow::builder()
             .title("Lens size")
             .subtitle("Diameter of the pixel-inspection lens")
             .model(&gtk::StringList::new(&["Small", "Medium", "Large"]))
             .selected(lens_size_index(self.0.lens_diameter.get()))
             .build();
-        group.add(&lens_size);
+        viewing_group.add(&lens_size);
         let resampling = adw::ComboRow::builder()
             .title("Scaling method")
             .model(&gtk::StringList::new(&[
@@ -3047,10 +3076,129 @@ impl ViewerWindow {
                 Resampling::SeamCarving => 3,
             })
             .build();
-        group.add(&resampling);
+        viewing_group.add(&resampling);
+        let anti_aliasing = adw::SwitchRow::builder()
+            .title("Anti-aliasing")
+            .subtitle("Smooth the edges of pencil strokes and circles")
+            .active(self.0.pencil_antialiasing.get())
+            .build();
+        let color_format = adw::ComboRow::builder()
+            .title("Copied color format")
+            .subtitle("Format used by the Color Picker tool")
+            .model(&gtk::StringList::new(&["Hex", "RGB(A)", "OKLab", "HSL"]))
+            .selected(color_format_index(self.0.settings.color_picker_format()))
+            .build();
+        let drawing_group = adw::PreferencesGroup::builder()
+            .title("Drawing")
+            .margin_bottom(12)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+        drawing_group.add(&anti_aliasing);
+        drawing_group.add(&color_format);
+
+        let image_group = adw::PreferencesGroup::builder()
+            .title("Image")
+            .margin_bottom(18)
+            .margin_start(18)
+            .margin_end(18)
+            .build();
+        let document = self.0.document.borrow().clone();
+        let current_file = self.0.current_file.borrow().clone();
+        if document.is_none() && current_file.is_none() && self.0.canvas.texture().is_none() {
+            image_group.add(
+                &adw::ActionRow::builder()
+                    .title("No image open")
+                    .subtitle("Open an image to view its properties")
+                    .build(),
+            );
+        } else {
+            let dimensions = self
+                .0
+                .rendered
+                .borrow()
+                .as_ref()
+                .map(image::GenericImageView::dimensions)
+                .or_else(|| {
+                    self.0
+                        .canvas
+                        .texture()
+                        .map(|texture| (texture.width() as u32, texture.height() as u32))
+                })
+                .unwrap_or((0, 0));
+            let location = current_file.as_ref().map_or_else(
+                || {
+                    document
+                        .as_ref()
+                        .and_then(|document| document.source().path.as_ref())
+                        .map_or_else(
+                            || "Unavailable".to_owned(),
+                            |path| path.display().to_string(),
+                        )
+                },
+                |file| {
+                    file.path()
+                        .map_or_else(|| file.uri().to_string(), |path| path.display().to_string())
+                },
+            );
+            let metadata = document
+                .as_ref()
+                .map(|document| &document.source().metadata);
+            let format = metadata
+                .and_then(|metadata| metadata.mime_type.as_deref())
+                .unwrap_or("Unknown");
+            let metadata_summary = metadata.map_or_else(
+                || "EXIF: Unknown · XMP: Unknown · ICC profile: Unknown".to_owned(),
+                |metadata| {
+                    format!(
+                        "EXIF: {} · XMP: {} · ICC profile: {}",
+                        if metadata.exif.is_some() { "Yes" } else { "No" },
+                        if metadata.xmp.is_some() { "Yes" } else { "No" },
+                        if metadata.icc.is_some() { "Yes" } else { "No" },
+                    )
+                },
+            );
+            image_group.add(
+                &adw::ActionRow::builder()
+                    .title("Dimensions")
+                    .subtitle(format!("{} × {}", dimensions.0, dimensions.1))
+                    .build(),
+            );
+            image_group.add(
+                &adw::ActionRow::builder()
+                    .title("Location")
+                    .subtitle(location)
+                    .subtitle_lines(2)
+                    .subtitle_selectable(true)
+                    .build(),
+            );
+            image_group.add(
+                &adw::ActionRow::builder()
+                    .title("Format")
+                    .subtitle(format)
+                    .build(),
+            );
+            image_group.add(
+                &adw::ActionRow::builder()
+                    .title("Metadata")
+                    .subtitle(metadata_summary)
+                    .build(),
+            );
+        }
+
+        let preferences = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        preferences.append(&viewing_group);
+        preferences.append(&drawing_group);
+        preferences.append(&image_group);
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&preferences)
+            .build();
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         outer.append(&header);
-        outer.append(&group);
+        outer.append(&scrolled);
         dialog.set_child(Some(&outer));
         let this = self.clone();
         let apply_dialog = dialog.clone();
@@ -3083,6 +3231,13 @@ impl ViewerWindow {
             this.0.settings.set_zoom_filter(zoom_filter);
             this.0.settings.set_background(background);
             this.0.settings.set_compare_lens_size(lens_diameter);
+            this.0.pencil_antialiasing.set(anti_aliasing.is_active());
+            this.0
+                .settings
+                .set_pencil_antialiasing(anti_aliasing.is_active());
+            this.0
+                .settings
+                .set_color_picker_format(color_format_at(color_format.selected()));
             let scale_resampling = match resampling.selected() {
                 0 => Resampling::Nearest,
                 1 => Resampling::Linear,
@@ -3110,7 +3265,7 @@ impl ViewerWindow {
                     ("Save", "<Control>s"),
                     ("Save As", "<Control><Shift>s"),
                     ("Close", "<Control>w"),
-                    ("Preferences", "<Control>comma"),
+                    ("Properties", "<Control>comma"),
                 ],
             ),
             (
@@ -3149,52 +3304,6 @@ impl ViewerWindow {
             }
             dialog.add(section);
         }
-        dialog.present(Some(&self.0.window));
-    }
-
-    fn show_properties(&self) {
-        let Some(document) = self.0.document.borrow().clone() else {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
-            return;
-        };
-        let (width, height) = self
-            .0
-            .rendered
-            .borrow()
-            .as_ref()
-            .map_or((0, 0), image::GenericImageView::dimensions);
-        let source = document.source();
-        let location = source.path.as_ref().map_or_else(
-            || "GIO location".to_owned(),
-            |path| path.display().to_string(),
-        );
-        let metadata = &source.metadata;
-        let body = format!(
-            "Dimensions: {width} × {height}\nLocation: {location}\nFormat: {}\nEXIF: {} · XMP: {} · ICC profile: {}",
-            metadata.mime_type.as_deref().unwrap_or("Unknown"),
-            if metadata.exif.is_some() { "Yes" } else { "No" },
-            if metadata.xmp.is_some() { "Yes" } else { "No" },
-            if metadata.icc.is_some() { "Yes" } else { "No" },
-        );
-        let color_format = adw::ComboRow::builder()
-            .title("Copied color format")
-            .subtitle("Format used by the Color Picker tool")
-            .model(&gtk::StringList::new(&["Hex", "RGB(A)", "OKLab", "HSL"]))
-            .selected(color_format_index(self.0.settings.color_picker_format()))
-            .build();
-        color_format.connect_selected_notify({
-            let settings = self.0.settings.clone();
-            move |row| settings.set_color_picker_format(color_format_at(row.selected()))
-        });
-        let dialog = adw::AlertDialog::builder()
-            .heading("Image Properties")
-            .body(body)
-            .extra_child(&color_format)
-            .close_response("close")
-            .build();
-        dialog.add_response("close", "Close");
         dialog.present(Some(&self.0.window));
     }
 
@@ -5148,7 +5257,14 @@ impl ViewerWindow {
                 if !this.0.pencil_active.get() {
                     return;
                 }
-                this.begin_pencil_drag(&this.0.canvas, x, y, gesture.current_event_state());
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.begin_pencil_drag(
+                    &this.0.canvas,
+                    x,
+                    y,
+                    gesture.current_event_state(),
+                    pencil_event_time(gesture),
+                );
             }
         });
         pencil.connect_drag_update({
@@ -5165,12 +5281,7 @@ impl ViewerWindow {
                 }) else {
                     return;
                 };
-                this.update_pencil_drag(
-                    &this.0.canvas,
-                    drag.0,
-                    drag.1,
-                    gesture.current_event_state(),
-                );
+                this.update_pencil_drag(&this.0.canvas, drag.0, drag.1, pencil_event_time(gesture));
             }
         });
         pencil.connect_drag_end({
@@ -5191,19 +5302,12 @@ impl ViewerWindow {
                     &this.0.canvas,
                     drag.0,
                     drag.1,
-                    gesture.current_event_state(),
+                    pencil_event_time(gesture),
                 ) else {
                     return;
                 };
                 if !points.is_empty() {
-                    this.apply(Operation::Pencil(Stroke {
-                        points,
-                        path,
-                        color: this.0.pencil_color.get(),
-                        width: 1.0,
-                        opacity: 1.0,
-                        hardness: 1.0,
-                    }));
+                    this.commit_pencil_stroke(&points, path);
                 }
             }
         });
@@ -5361,7 +5465,14 @@ impl ViewerWindow {
                 if !this.0.pencil_active.get() || this.0.compare_rendered.borrow().is_none() {
                     return;
                 }
-                this.begin_pencil_drag(&canvas, x, y, gesture.current_event_state());
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.begin_pencil_drag(
+                    &canvas,
+                    x,
+                    y,
+                    gesture.current_event_state(),
+                    pencil_event_time(gesture),
+                );
             }
         });
         pencil.connect_drag_update({
@@ -5379,7 +5490,7 @@ impl ViewerWindow {
                 }) else {
                     return;
                 };
-                this.update_pencil_drag(&canvas, drag.0, drag.1, gesture.current_event_state());
+                this.update_pencil_drag(&canvas, drag.0, drag.1, pencil_event_time(gesture));
             }
         });
         pencil.connect_drag_end({
@@ -5398,7 +5509,7 @@ impl ViewerWindow {
                     return;
                 };
                 let Some((points, path)) =
-                    this.finish_pencil_drag(&canvas, drag.0, drag.1, gesture.current_event_state())
+                    this.finish_pencil_drag(&canvas, drag.0, drag.1, pencil_event_time(gesture))
                 else {
                     return;
                 };
@@ -5562,15 +5673,22 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     let color_button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     color_button.set_rgba(&u8_to_rgba([0, 0, 0, 255]));
     color_button.set_tooltip_text(Some("Pencil color"));
+    let pencil_size = spin(1.0, 128.0, 1.0);
+    pencil_size.set_width_chars(2);
+    pencil_size.set_max_width_chars(3);
+    pencil_size.set_tooltip_text(Some("Paint size in pixels"));
+    let pencil_controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    pencil_controls.append(&pencil_button);
+    pencil_controls.append(&color_button);
+    pencil_controls.append(&color_picker_button);
+    pencil_controls.append(&pencil_size);
     header.pack_start(&animation_controls);
     header.pack_start(&previous);
     header.pack_start(&next);
+    header.pack_start(&pencil_controls);
     header.pack_end(&menu_button());
     header.pack_end(&button("media-floppy-symbolic", "Save As", "win.save-as"));
     header.pack_end(&selection_button);
-    header.pack_end(&color_picker_button);
-    header.pack_end(&color_button);
-    header.pack_end(&pencil_button);
     header.pack_end(&lens_button);
     HeaderWidgets {
         header,
@@ -5583,6 +5701,7 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
         pencil_button,
         lens_button,
         color_button,
+        pencil_size,
         edit_button,
     }
 }
@@ -5624,8 +5743,7 @@ fn main_menu() -> gio::Menu {
     edit_menu.append(Some("Crop"), Some("win.crop"));
     edit_menu.append(Some("Scale"), Some("win.scale-preview"));
     menu.append_submenu(Some("Edit"), &edit_menu);
-    menu.append(Some("Image Properties"), Some("win.properties"));
-    menu.append(Some("Preferences"), Some("win.preferences"));
+    menu.append(Some("Properties"), Some("win.preferences"));
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Diorama"), Some("win.about"));
     menu
@@ -6161,6 +6279,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a graphical display"]
+    fn circle_drag_does_not_fall_back_to_buffered_freehand_points() {
+        adw::init().expect("GTK display initialization");
+        let origin = BrushPoint {
+            x: 10.5,
+            y: 12.5,
+            pressure: 1.0,
+        };
+        let current = BrushPoint {
+            x: 18.5,
+            y: 12.5,
+            pressure: 1.0,
+        };
+        let hidden_freehand_point = BrushPoint {
+            x: 14.5,
+            y: 16.5,
+            pressure: 1.0,
+        };
+        let drag = PencilDrag {
+            canvas: ImageCanvas::default(),
+            start_screen: (0.0, 0.0),
+            mode: PencilDragMode::Circle,
+            origin,
+            line_start: origin,
+            current,
+            freehand_points: [origin, hidden_freehand_point, current]
+                .into_iter()
+                .enumerate()
+                .map(|(index, point)| crate::tools::pencil::TimedBrushPoint {
+                    point,
+                    timestamp_ms: index as u32,
+                })
+                .collect(),
+        };
+
+        let points = pencil_drag_points(&drag);
+
+        assert_eq!(
+            points,
+            crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Circle {
+                center: origin,
+                edge: current,
+            })
+        );
+        assert!(!points.contains(&hidden_freehand_point));
+        assert_eq!(pencil_drag_path(drag.mode), StrokePath::Circle);
+    }
+
+    #[test]
     fn color_picker_formats_opaque_and_transparent_colors() {
         let opaque = [0x12, 0x34, 0x56, 0xff];
         let transparent = [0x12, 0x34, 0x56, 0x78];
@@ -6228,6 +6395,30 @@ mod tests {
                 ("Scale".to_owned(), "win.scale-preview".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn main_menu_has_one_unified_properties_entry() {
+        let menu: gio::MenuModel = main_menu().upcast();
+        let string_attribute = |index, name| {
+            menu.item_attribute_value(index, name, None)
+                .and_then(|value| value.get::<String>())
+        };
+        let properties: Vec<_> = (0..menu.n_items())
+            .filter(|index| string_attribute(*index, "label").as_deref() == Some("Properties"))
+            .collect();
+
+        assert_eq!(properties.len(), 1);
+        assert_eq!(
+            string_attribute(properties[0], "action").as_deref(),
+            Some("win.preferences")
+        );
+        assert!((0..menu.n_items()).all(|index| {
+            !matches!(
+                string_attribute(index, "label").as_deref(),
+                Some("Image Properties" | "Preferences")
+            )
+        }));
     }
 
     #[test]
@@ -6619,6 +6810,233 @@ mod tests {
         window.apply_picked_color(picked);
         assert_eq!(window.0.pencil_color.get(), picked);
         assert_eq!(rgba_to_u8(window.0.color_button.rgba()), picked);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pencil_controls_share_the_left_group_and_define_each_stroke() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilControlsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let controls = window
+            .0
+            .pencil_button
+            .parent()
+            .expect("pencil control group");
+
+        assert_eq!(window.0.color_button.parent().as_ref(), Some(&controls));
+        assert_eq!(
+            window.0.color_picker_button.parent().as_ref(),
+            Some(&controls)
+        );
+        assert_eq!(window.0.pencil_size.parent().as_ref(), Some(&controls));
+        assert_eq!(
+            window.0.color_button.prev_sibling().as_ref(),
+            Some(window.0.pencil_button.upcast_ref())
+        );
+        assert_eq!(
+            window.0.color_picker_button.prev_sibling().as_ref(),
+            Some(window.0.color_button.upcast_ref())
+        );
+        assert_eq!(
+            window.0.pencil_size.prev_sibling().as_ref(),
+            Some(window.0.color_picker_button.upcast_ref())
+        );
+
+        window.0.window.set_default_size(1_200, 700);
+        window.present();
+        while glib::MainContext::default().iteration(false) {}
+        let header = controls
+            .ancestor(adw::HeaderBar::static_type())
+            .expect("header ancestor");
+        let controls_bounds = controls.compute_bounds(&header).expect("control bounds");
+        let title_bounds = window
+            .0
+            .title
+            .compute_bounds(&header)
+            .expect("title bounds");
+        assert!(controls_bounds.x() < title_bounds.x());
+
+        window.0.pencil_size.set_value(7.0);
+        window.0.pencil_antialiasing.set(true);
+        let stroke = window.pencil_stroke(
+            &[BrushPoint {
+                x: 0.5,
+                y: 0.5,
+                pressure: 1.0,
+            }],
+            StrokePath::Smooth,
+        );
+        assert_eq!(stroke.width, 7.0);
+        assert!(stroke.anti_aliasing);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn committing_a_pencil_stroke_replaces_the_rendered_image_after_borrowing_it() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilCommitTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let pixels = image::RgbaImage::from_pixel(3, 3, image::Rgba([0, 0, 0, 0]));
+        let texture = texture_from_rgba(&pixels).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(pixels.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(pixels));
+
+        window.commit_pencil_stroke(
+            &[BrushPoint {
+                x: 1.5,
+                y: 1.5,
+                pressure: 1.0,
+            }],
+            StrokePath::Smooth,
+        );
+
+        assert_eq!(
+            window
+                .0
+                .rendered
+                .borrow()
+                .as_ref()
+                .expect("committed preview")
+                .get_pixel(1, 1)
+                .0,
+            [0, 0, 0, 255]
+        );
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .operations()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn properties_combines_app_drawing_and_current_image_settings() {
+        use adw::prelude::{
+            ActionRowExt as _, AdwApplicationWindowExt as _, PreferencesRowExt as _,
+        };
+
+        fn row_with_title(widget: &gtk::Widget, title: &str) -> Option<adw::PreferencesRow> {
+            if let Ok(row) = widget.clone().downcast::<adw::PreferencesRow>()
+                && row.title() == title
+            {
+                return Some(row);
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(row) = row_with_title(&current, title) {
+                    return Some(row);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+
+        fn button_with_label(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+            if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+                && button.label().as_deref() == Some(label)
+            {
+                return Some(button);
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(button) = button_with_label(&current, label) {
+                    return Some(button);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.UnifiedPropertiesTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let pixels = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 0, 255]));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(pixels.clone()),
+                path: Some(PathBuf::from("/images/current.png")),
+                metadata: crate::document::Metadata {
+                    mime_type: Some("image/png".to_owned()),
+                    ..crate::document::Metadata::default()
+                },
+            })));
+        window.0.rendered.replace(Some(pixels));
+        window
+            .0
+            .current_file
+            .replace(Some(gio::File::for_path("/images/current.png")));
+        window.present();
+
+        window.show_properties();
+
+        let dialog = window
+            .0
+            .window
+            .dialogs()
+            .item(0)
+            .expect("preferences dialog")
+            .downcast::<adw::Dialog>()
+            .expect("dialog");
+        let dialog_widget = dialog.clone().upcast::<gtk::Widget>();
+        let anti_aliasing = row_with_title(&dialog_widget, "Anti-aliasing")
+            .expect("anti-aliasing row")
+            .downcast::<adw::SwitchRow>()
+            .expect("anti-aliasing switch");
+        assert!(row_with_title(&dialog_widget, "Hard zoom").is_some());
+        assert!(row_with_title(&dialog_widget, "Copied color format").is_some());
+        let dimensions = row_with_title(&dialog_widget, "Dimensions")
+            .expect("dimensions row")
+            .downcast::<adw::ActionRow>()
+            .expect("dimensions action row");
+        assert_eq!(dimensions.subtitle().as_deref(), Some("2 × 1"));
+        assert!(row_with_title(&dialog_widget, "Location").is_some());
+        assert!(row_with_title(&dialog_widget, "Format").is_some());
+        assert!(row_with_title(&dialog_widget, "Metadata").is_some());
+        let done = button_with_label(&dialog_widget, "Done").expect("Done button");
+        let initial = anti_aliasing.is_active();
+
+        anti_aliasing.set_active(!initial);
+        assert_eq!(window.0.pencil_antialiasing.get(), initial);
+        done.emit_clicked();
+
+        assert_eq!(window.0.pencil_antialiasing.get(), !initial);
+        window.0.pencil_antialiasing.set(initial);
+        window.0.settings.set_pencil_antialiasing(initial);
     }
 
     #[test]

@@ -139,6 +139,22 @@ impl Settings {
         );
     }
 
+    pub fn pencil_size(&self) -> u8 {
+        self.integer("pencil-size").unwrap_or(1).clamp(1, 128) as u8
+    }
+
+    pub fn set_pencil_size(&self, size: u8) {
+        self.set_integer("pencil-size", i32::from(size.clamp(1, 128)));
+    }
+
+    pub fn pencil_antialiasing(&self) -> bool {
+        self.boolean("pencil-antialiasing").unwrap_or(false)
+    }
+
+    pub fn set_pencil_antialiasing(&self, enabled: bool) {
+        self.set_boolean("pencil-antialiasing", enabled);
+    }
+
     pub fn window_size(&self) -> (i32, i32) {
         (
             self.integer("window-width").unwrap_or(1000).max(360),
@@ -244,19 +260,27 @@ impl Settings {
     fn string(&self, key: &str) -> Option<String> {
         self.inner
             .as_ref()
+            .filter(|settings| has_key(settings, key))
             .map(|settings| settings.string(key).to_string())
     }
 
     fn integer(&self, key: &str) -> Option<i32> {
-        self.inner.as_ref().map(|settings| settings.int(key))
+        self.inner
+            .as_ref()
+            .filter(|settings| has_key(settings, key))
+            .map(|settings| settings.int(key))
     }
 
     fn boolean(&self, key: &str) -> Option<bool> {
-        self.inner.as_ref().map(|settings| settings.boolean(key))
+        self.inner
+            .as_ref()
+            .filter(|settings| has_key(settings, key))
+            .map(|settings| settings.boolean(key))
     }
 
     fn set_string(&self, key: &str, value: &str) {
         if let Some(settings) = &self.inner
+            && has_key(settings, key)
             && let Err(error) = settings.set_string(key, value)
         {
             tracing::warn!(%error, key, "Could not save setting");
@@ -265,6 +289,7 @@ impl Settings {
 
     fn set_integer(&self, key: &str, value: i32) {
         if let Some(settings) = &self.inner
+            && has_key(settings, key)
             && let Err(error) = settings.set_int(key, value)
         {
             tracing::warn!(%error, key, "Could not save setting");
@@ -273,6 +298,7 @@ impl Settings {
 
     fn set_boolean(&self, key: &str, value: bool) {
         if let Some(settings) = &self.inner
+            && has_key(settings, key)
             && let Err(error) = settings.set_boolean(key, value)
         {
             tracing::warn!(%error, key, "Could not save setting");
@@ -280,12 +306,28 @@ impl Settings {
     }
 }
 
+fn has_key(settings: &gio::Settings, key: &str) -> bool {
+    settings
+        .settings_schema()
+        .is_some_and(|schema| schema.has_key(key))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ColorFormat;
+    use super::{ColorFormat, Settings};
 
     #[test]
     fn color_format_defaults_to_hex() {
         assert_eq!(ColorFormat::default(), ColorFormat::Hex);
+    }
+
+    #[test]
+    fn drawing_settings_have_pixel_perfect_fallbacks_without_a_schema() {
+        let settings = Settings { inner: None };
+
+        assert_eq!(settings.pencil_size(), 1);
+        assert!(!settings.pencil_antialiasing());
+        settings.set_pencil_size(128);
+        settings.set_pencil_antialiasing(true);
     }
 }
