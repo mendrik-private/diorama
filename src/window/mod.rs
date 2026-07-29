@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime};
 
 use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupExt};
@@ -23,6 +23,8 @@ use crate::image::{
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
 use crate::settings::{ColorFormat, Settings};
+
+static SCALE_SURFACE_STYLE_INSTALLED: Once = Once::new();
 
 #[derive(Clone)]
 pub struct ViewerWindow(Rc<WindowState>);
@@ -650,6 +652,8 @@ struct WindowState {
     render_generation: Cell<u64>,
     document: RefCell<Option<Document>>,
     rendered: RefCell<Option<image::RgbaImage>>,
+    editable_decode_pending: Cell<bool>,
+    pending_scale_activation: Cell<bool>,
     source_modified: RefCell<Option<SystemTime>>,
     external_source_conflict: Cell<bool>,
     subtitle_ready: Cell<bool>,
@@ -726,6 +730,7 @@ struct WindowState {
     scale_controls: gtk::Box,
     scale_slider: gtk::Scale,
     scale_value_label: gtk::Label,
+    scale_spinner: adw::Spinner,
     scale_width: gtk::SpinButton,
     scale_height: gtk::SpinButton,
     scale_lock: gtk::ToggleButton,
@@ -836,7 +841,7 @@ impl ViewerWindow {
         zoom_controls.append(&zoom_label);
         zoom_controls.append(&button("zoom-in-symbolic", "Zoom In", "win.zoom-in"));
         canvas_overlay.add_overlay(&zoom_controls);
-        let scale_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let scale_controls = gtk::Box::new(gtk::Orientation::Vertical, 0);
         scale_controls.set_visible(false);
         scale_controls.set_halign(gtk::Align::Fill);
         scale_controls.set_valign(gtk::Align::End);
@@ -844,7 +849,28 @@ impl ViewerWindow {
         scale_controls.set_margin_start(26);
         scale_controls.set_margin_end(26);
         scale_controls.set_margin_bottom(26);
+        let scale_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        scale_surface.add_css_class("osd");
+        scale_surface.add_css_class("diorama-scale-surface");
+        SCALE_SURFACE_STYLE_INSTALLED.call_once(|| {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_bytes(&glib::Bytes::from_static(
+                b".diorama-scale-surface { background-color: rgba(0, 0, 0, 0.5); }",
+            ));
+            gtk::style_context_add_provider_for_display(
+                &scale_surface.display(),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
+        scale_surface.set_hexpand(true);
+        let scale_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        scale_content.set_margin_start(12);
+        scale_content.set_margin_end(12);
+        scale_content.set_margin_top(12);
+        scale_content.set_margin_bottom(12);
         let scale_control_row = adw::WrapBox::builder()
+            .align(0.5)
             .child_spacing(6)
             .line_spacing(6)
             .build();
@@ -882,65 +908,48 @@ impl ViewerWindow {
             .action_name("win.scale-fit")
             .build();
         let scale_dimensions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        scale_dimensions.add_css_class("osd");
         let scale_width_label = gtk::Label::new(Some("W"));
-        scale_width_label.set_margin_start(8);
         scale_dimensions.append(&scale_width_label);
         scale_dimensions.append(&scale_width);
         scale_dimensions.append(&gtk::Label::new(Some("× H")));
         scale_dimensions.append(&scale_height);
         scale_dimensions.append(&scale_lock);
-        let scale_unit_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        scale_unit_group.add_css_class("osd");
-        scale_unit_group.append(&scale_unit);
-        let scale_algorithm_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        scale_algorithm_group.add_css_class("osd");
         scale_algorithm_label.set_margin_start(8);
         scale_algorithm_label.set_margin_end(8);
         scale_algorithm_label.set_margin_top(6);
         scale_algorithm_label.set_margin_bottom(6);
-        scale_algorithm_group.append(&scale_algorithm_label);
         let scale_view_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         scale_view_controls.add_css_class("linked");
-        scale_view_controls.add_css_class("osd");
         scale_view_controls.append(&scale_original_button);
         scale_view_controls.append(&scale_actual_button);
         scale_view_controls.append(&scale_fit_button);
         let scale_cancel_button =
             button("window-close-symbolic", "Cancel Scale", "win.cancel-scale");
-        let scale_cancel_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        scale_cancel_group.add_css_class("osd");
-        scale_cancel_group.append(&scale_cancel_button);
-        scale_control_row.append(&scale_cancel_group);
+        scale_control_row.append(&scale_cancel_button);
         scale_control_row.append(&scale_dimensions);
-        scale_control_row.append(&scale_unit_group);
-        scale_control_row.append(&scale_algorithm_group);
+        scale_control_row.append(&scale_unit);
+        scale_control_row.append(&scale_algorithm_label);
         scale_control_row.append(&scale_view_controls);
         let scale_apply_button =
             button("object-select-symbolic", "Apply Scale", "win.confirm-scale");
-        let scale_apply_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        scale_apply_group.add_css_class("osd");
-        scale_apply_group.append(&scale_apply_button);
-        scale_control_row.append(&scale_apply_group);
+        scale_control_row.append(&scale_apply_button);
         let scale_slider_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        scale_slider_row.add_css_class("osd");
+        scale_slider_row.set_hexpand(true);
         let scale_value_label = gtk::Label::new(Some("1 × 1 → 1 × 1 (100%)"));
-        scale_value_label.set_margin_start(8);
+        let scale_spinner = adw::Spinner::new();
+        scale_spinner.set_visible(false);
+        scale_spinner.set_tooltip_text(Some("Generating scale preview"));
         let scale_slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 2.0, 1.0);
         scale_slider.set_hexpand(true);
         scale_slider.set_draw_value(false);
-        scale_slider.set_margin_end(8);
         scale_slider.set_tooltip_text(Some("Scaled width in pixels"));
         scale_slider_row.append(&scale_value_label);
+        scale_slider_row.append(&scale_spinner);
         scale_slider_row.append(&scale_slider);
-        let scale_slider_clamp = adw::Clamp::builder()
-            .maximum_size(720)
-            .tightening_threshold(520)
-            .child(&scale_slider_row)
-            .build();
-        scale_slider_clamp.set_hexpand(true);
-        scale_controls.append(&scale_control_row);
-        scale_controls.append(&scale_slider_clamp);
+        scale_content.append(&scale_control_row);
+        scale_content.append(&scale_slider_row);
+        scale_surface.append(&scale_content);
+        scale_controls.append(&scale_surface);
         canvas_overlay.add_overlay(&scale_controls);
         let minimap = MiniMap::default();
         minimap.set_size_request(160, 120);
@@ -997,6 +1006,8 @@ impl ViewerWindow {
             render_generation: Cell::new(0),
             document: RefCell::new(None),
             rendered: RefCell::new(None),
+            editable_decode_pending: Cell::new(false),
+            pending_scale_activation: Cell::new(false),
             source_modified: RefCell::new(None),
             external_source_conflict: Cell::new(false),
             subtitle_ready: Cell::new(false),
@@ -1071,6 +1082,7 @@ impl ViewerWindow {
             scale_controls,
             scale_slider,
             scale_value_label,
+            scale_spinner,
             scale_width,
             scale_height,
             scale_lock,
@@ -1231,6 +1243,8 @@ impl ViewerWindow {
         }
         self.0.document.replace(None);
         self.0.rendered.replace(None);
+        self.0.editable_decode_pending.set(true);
+        self.0.pending_scale_activation.set(false);
         self.0.external_source_conflict.set(false);
         self.0.canvas.set_texture(None);
         self.0.subtitle_ready.set(false);
@@ -1287,6 +1301,7 @@ impl ViewerWindow {
                             }
                             Err(error) => {
                                 tracing::warn!(%error, "Could not read GIO-backed image for editing");
+                                ViewerWindow(state.clone()).finish_editable_decode(false);
                                 state.toasts.add_toast(adw::Toast::new(
                                     "This image can be viewed but could not be read for editing",
                                 ));
@@ -1297,7 +1312,7 @@ impl ViewerWindow {
                     if state.load_generation.get() != generation || cancellable.is_cancelled() {
                         return;
                     }
-                    match editable {
+                    let editable_available = match editable {
                         Ok(Ok(mut source)) => {
                             source.metadata = preview.metadata.clone();
                             let document = Document::new(source);
@@ -1305,21 +1320,31 @@ impl ViewerWindow {
                                 .rendered
                                 .replace(Some(document.source().pixels.as_ref().clone()));
                             state.document.replace(Some(document));
+                            true
                         }
                         Ok(Err(error)) => {
                             tracing::warn!(%error, "Editable decode unavailable");
                             state.toasts.add_toast(adw::Toast::new(
                                 "This image can be viewed but its decoder does not support editing",
                             ));
+                            false
                         }
-                        Err(_) => tracing::warn!("Editable decode worker panicked"),
-                    }
+                        Err(_) => {
+                            tracing::warn!("Editable decode worker panicked");
+                            state
+                                .toasts
+                                .add_toast(adw::Toast::new("Could not prepare image for editing"));
+                            false
+                        }
+                    };
+                    ViewerWindow(state.clone()).finish_editable_decode(editable_available);
                     if let Some(compare_file) = state.pending_comparison.borrow_mut().take() {
                         ViewerWindow(state.clone()).load_comparison(compare_file);
                     }
                     ViewerWindow(state).rebuild_navigation(file);
                 }
                 Err(error) => {
+                    ViewerWindow(state.clone()).finish_editable_decode(false);
                     state.pending_comparison.borrow_mut().take();
                     state.title.set_subtitle("Could not open image");
                     state.toasts.add_toast(adw::Toast::new(&error.to_string()));
@@ -1389,7 +1414,12 @@ impl ViewerWindow {
         }
         self.add_action("fit", {
             let this = self.clone();
-            move || this.fit(false)
+            move || {
+                if this.0.scale_button.is_active() {
+                    this.0.scale_preview_view.set(ScalePreviewView::Fit);
+                }
+                this.fit(false);
+            }
         });
         self.add_action("fill", {
             let this = self.clone();
@@ -1794,6 +1824,18 @@ impl ViewerWindow {
         self.0.scale_original_button.add_controller(original);
     }
 
+    fn finish_editable_decode(&self, editable_available: bool) {
+        self.0.editable_decode_pending.set(false);
+        if !self.0.pending_scale_activation.replace(false) {
+            return;
+        }
+        if editable_available && self.0.scale_button.is_active() {
+            self.set_scale_preview_active(true);
+        } else {
+            self.0.scale_button.set_active(false);
+        }
+    }
+
     fn set_scale_preview_active(&self, active: bool) {
         if active {
             self.cancel_zoom_rect_drag();
@@ -1805,12 +1847,20 @@ impl ViewerWindow {
             self.0.edit_button.set_active(false);
             let image = self.0.rendered.borrow().clone();
             let Some(image) = image else {
+                if self.0.editable_decode_pending.get() {
+                    self.0.pending_scale_activation.set(true);
+                    self.0
+                        .toasts
+                        .add_toast(adw::Toast::new("Preparing image for scaling…"));
+                    return;
+                }
                 self.0.scale_button.set_active(false);
                 self.0
                     .toasts
                     .add_toast(adw::Toast::new("Open an editable image first"));
                 return;
             };
+            self.0.pending_scale_activation.set(false);
             let (width, height) = image.dimensions();
             let horizontal = self.0.scrolled.hadjustment();
             let vertical = self.0.scrolled.vadjustment();
@@ -1834,12 +1884,14 @@ impl ViewerWindow {
             self.0.zoom_controls.set_visible(false);
             return;
         }
+        self.0.pending_scale_activation.set(false);
         self.0
             .scale_preview_generation
             .set(self.0.scale_preview_generation.get().wrapping_add(1));
         if let Some(cancellation) = self.0.scale_preview_cancellation.borrow_mut().take() {
             cancellation.cancel();
         }
+        self.0.scale_spinner.set_visible(false);
         self.0.scale_controls.set_visible(false);
         self.0.pending_fit.set(None);
         self.0
@@ -2005,6 +2057,7 @@ impl ViewerWindow {
 
     fn schedule_scale_preview(&self, target_width: u32, target_height: u32) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
+            self.0.scale_spinner.set_visible(false);
             return;
         };
         let generation = self.0.scale_preview_generation.get().wrapping_add(1);
@@ -2013,9 +2066,11 @@ impl ViewerWindow {
             cancellation.cancel();
         }
         if (target_width, target_height) == source.dimensions() {
+            self.0.scale_spinner.set_visible(false);
             self.display_scale_preview(source);
             return;
         }
+        self.0.scale_spinner.set_visible(true);
         self.0.scale_original_button.set_sensitive(false);
         let resampling = self.0.scale_resampling.get();
         let cancellation = CancellationToken::default();
@@ -2051,6 +2106,7 @@ impl ViewerWindow {
                     return;
                 }
                 state.scale_preview_cancellation.borrow_mut().take();
+                state.scale_spinner.set_visible(false);
                 match preview {
                     Ok(Ok(preview)) => {
                         ViewerWindow(state).display_scale_preview(Arc::new(preview));
@@ -2065,6 +2121,7 @@ impl ViewerWindow {
     }
 
     fn display_scale_preview(&self, preview: Arc<image::RgbaImage>) {
+        self.0.scale_spinner.set_visible(false);
         self.0.scale_preview.replace(Some(preview.clone()));
         self.0.scale_original_button.set_sensitive(true);
         if self.0.scale_showing_original.get() {
@@ -2112,9 +2169,13 @@ impl ViewerWindow {
             self.0.scale_preview_zoom_before_original.set(preview_zoom);
             if let Ok(texture) = texture_from_rgba(&source) {
                 self.0.canvas.set_texture(Some(&texture));
-                self.set_scale_preview_zoom(
-                    preview_zoom * f64::from(width.max(1)) / f64::from(source.width().max(1)),
-                );
+                let zoom =
+                    preview_zoom * f64::from(width.max(1)) / f64::from(source.width().max(1));
+                if self.0.scale_preview_view.get() == ScalePreviewView::Fit {
+                    self.set_scale_preview_fit_zoom(zoom);
+                } else {
+                    self.set_scale_preview_zoom(zoom);
+                }
             }
             return;
         }
@@ -2133,7 +2194,11 @@ impl ViewerWindow {
             && let Ok(texture) = texture_from_rgba(&preview)
         {
             self.0.canvas.set_texture(Some(&texture));
-            self.set_scale_preview_zoom(self.0.scale_preview_zoom_before_original.get());
+            if self.0.scale_preview_view.get() == ScalePreviewView::Fit {
+                self.fit(false);
+            } else {
+                self.set_scale_preview_zoom(self.0.scale_preview_zoom_before_original.get());
+            }
         } else {
             self.schedule_scale_preview(dimensions.0, dimensions.1);
         }
@@ -2171,6 +2236,15 @@ impl ViewerWindow {
 
     fn set_scale_preview_zoom(&self, zoom: f64) {
         self.0.canvas.set_zoom(zoom);
+        self.update_scale_preview_zoom();
+    }
+
+    fn set_scale_preview_fit_zoom(&self, zoom: f64) {
+        self.0.canvas.set_fit_zoom(zoom);
+        self.update_scale_preview_zoom();
+    }
+
+    fn update_scale_preview_zoom(&self) {
         self.0
             .zoom_label
             .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
@@ -5152,18 +5226,30 @@ impl ViewerWindow {
         let height = f64::from(viewport.1);
         let horizontal = width / f64::from(texture.width());
         let vertical = height / f64::from(texture.height());
-        self.set_zoom_with_alignment(
-            if fill {
-                horizontal.max(vertical)
+        let zoom = if fill {
+            horizontal.max(vertical)
+        } else {
+            horizontal.min(vertical)
+        };
+        let alignment = if fill {
+            ZoomAlignment::Cover
+        } else {
+            ZoomAlignment::Contain
+        };
+        if !fill
+            && self.0.scale_button.is_active()
+            && self.0.scale_preview_view.get() == ScalePreviewView::Fit
+        {
+            self.0.pending_fit.set(None);
+            let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
+                aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
             } else {
-                horizontal.min(vertical)
-            },
-            Some(if fill {
-                ZoomAlignment::Cover
-            } else {
-                ZoomAlignment::Contain
-            }),
-        );
+                zoom
+            };
+            self.set_scale_preview_fit_zoom(zoom);
+        } else {
+            self.set_zoom_with_alignment(zoom, Some(alignment));
+        }
         true
     }
 
@@ -7578,6 +7664,16 @@ mod tests {
             None
         }
 
+        fn css_class_count(widget: &gtk::Widget, class: &str) -> usize {
+            let mut count = usize::from(widget.has_css_class(class));
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                count += css_class_count(&current, class);
+                child = current.next_sibling();
+            }
+            count
+        }
+
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.ScaleLayoutTest")
@@ -7592,7 +7688,28 @@ mod tests {
         assert!(window.0.scale_controls.hexpands());
         assert_eq!(window.0.scale_controls.margin_start(), 26);
         assert_eq!(window.0.scale_controls.margin_end(), 26);
-        assert!(!window.0.scale_controls.has_css_class("osd"));
+        let scale_surface = window
+            .0
+            .scale_controls
+            .first_child()
+            .expect("shared scale surface")
+            .downcast::<gtk::Box>()
+            .expect("scale surface box");
+        assert!(scale_surface.has_css_class("osd"));
+        assert!(scale_surface.has_css_class("diorama-scale-surface"));
+        let scale_content = scale_surface
+            .first_child()
+            .expect("padded scale content")
+            .downcast::<gtk::Box>()
+            .expect("scale content box");
+        for margin in [
+            scale_content.margin_start(),
+            scale_content.margin_end(),
+            scale_content.margin_top(),
+            scale_content.margin_bottom(),
+        ] {
+            assert_eq!(margin, 12);
+        }
         for control in [
             window.0.scale_width.clone().upcast::<gtk::Widget>(),
             window.0.scale_height.clone().upcast(),
@@ -7602,22 +7719,18 @@ mod tests {
             window.0.scale_original_button.clone().upcast(),
         ] {
             assert!(
-                control
+                !control
                     .parent()
                     .expect("scale control group")
                     .has_css_class("osd"),
-                "{control:?} should have a compact OSD parent"
+                "{control:?} should not have its own OSD background"
             );
         }
         let scale_controls: gtk::Widget = window.0.scale_controls.clone().upcast();
+        assert_eq!(css_class_count(&scale_controls, "osd"), 1);
         for action in ["win.cancel-scale", "win.confirm-scale"] {
             let button = button_with_action(&scale_controls, action).expect("scale action button");
-            assert!(
-                button
-                    .parent()
-                    .expect("scale action group")
-                    .has_css_class("osd")
-            );
+            assert!(!button.has_css_class("osd"));
         }
         assert_eq!(
             window.0.scale_original_button.label().as_deref(),
@@ -7634,20 +7747,95 @@ mod tests {
             .expect("slider surface")
             .downcast::<gtk::Box>()
             .expect("slider surface box");
-        assert!(scale_slider_row.has_css_class("osd"));
-        let scale_slider_clamp = scale_slider_row
+        assert!(!scale_slider_row.has_css_class("osd"));
+        let scale_control_row = scale_slider_row
             .parent()
-            .expect("slider clamp")
-            .downcast::<adw::Clamp>()
-            .expect("responsive slider clamp");
-        assert_eq!(scale_slider_clamp.maximum_size(), 720);
+            .expect("scale content")
+            .first_child()
+            .expect("scale control row")
+            .downcast::<adw::WrapBox>()
+            .expect("responsive scale control row");
+        assert_eq!(scale_control_row.align(), 0.5);
 
         window.0.scale_controls.set_visible(true);
         window.0.canvas_overlay.allocate(1000, 600, -1, None);
         assert_eq!(window.0.scale_controls.width(), 948);
-        assert!(scale_slider_row.width() <= 720);
-        assert!(scale_slider_row.width() < window.0.scale_controls.width());
-        assert!(window.0.scale_slider.width() > 260);
+        assert!(scale_slider_row.width() > 900);
+        assert!(window.0.scale_slider.width() > 700);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn scale_action_waits_for_the_editable_decode() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ScaleActivationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.editable_decode_pending.set(true);
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "scale-preview", None);
+
+        assert!(window.0.scale_button.is_active());
+        assert!(window.0.pending_scale_activation.get());
+        assert!(!window.0.scale_controls.get_visible());
+
+        let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.finish_editable_decode(true);
+
+        assert!(window.0.scale_button.is_active());
+        assert!(!window.0.pending_scale_activation.get());
+        assert!(window.0.scale_controls.get_visible());
+        assert_eq!(window.0.scale_width.value(), 8.0);
+        assert_eq!(window.0.scale_height.value(), 6.0);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn fit_action_stays_locked_to_each_scale_preview_size() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ScaleFitTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.scale_button.set_active(true);
+        window.0.scrolled.allocate(640, 480, -1, None);
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "fit", None);
+        assert_eq!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+
+        let preview = Arc::new(image::RgbaImage::from_pixel(
+            4,
+            3,
+            image::Rgba([4, 5, 6, 255]),
+        ));
+        window.display_scale_preview(preview);
+        let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
+        assert!(usable_panel_size(viewport));
+        assert!(window.0.canvas.zoom() > 64.0);
+        assert_eq!(
+            window.0.canvas.zoom(),
+            aligned_hard_zoom(
+                panel_fit_zoom(viewport, (4, 3)),
+                window.0.render_scale.get(),
+                ZoomAlignment::Contain,
+            )
+        );
     }
 
     #[test]
@@ -7678,9 +7866,11 @@ mod tests {
         );
         assert_eq!(window.0.scale_value_label.label(), "8 × 6 → 8 × 6 (100%)");
         assert!(window.0.scale_original_button.is_sensitive());
+        assert!(!window.0.scale_spinner.get_visible());
 
         window.0.scale_width.set_value(4.0);
         assert_eq!(window.0.scale_height.value(), 3.0);
+        assert!(window.0.scale_spinner.get_visible());
 
         window.0.scale_unit.set_selected(1);
         window.0.scale_slider.set_value(25.0);
@@ -7710,6 +7900,7 @@ mod tests {
                 .dimensions(),
             (2, 2)
         );
+        assert!(!window.0.scale_spinner.get_visible());
 
         window.0.scale_resampling.set(Resampling::Linear);
         window.refresh_scale_method();

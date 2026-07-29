@@ -7,6 +7,8 @@ use gtk::subclass::prelude::*;
 
 use crate::document::{BrushPoint, StrokePath};
 
+const MAX_FIT_ZOOM: f64 = 16_384.0;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZoomFilter {
     Soft,
@@ -826,6 +828,12 @@ impl ImageCanvas {
 
     pub fn set_zoom(&self, zoom: f64) {
         self.imp().zoom.set(zoom.clamp(0.01, 64.0));
+        self.queue_resize();
+        self.queue_draw();
+    }
+
+    pub fn set_fit_zoom(&self, zoom: f64) {
+        self.imp().zoom.set(zoom.clamp(0.01, MAX_FIT_ZOOM));
         self.queue_resize();
         self.queue_draw();
     }
