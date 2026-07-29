@@ -10,15 +10,97 @@ editing and comparison tools.
 
 ## Features
 
-- Smooth and pixel-perfect zoom modes, fit-to-window, panning, and a minimap.
-- Folder navigation with natural filename ordering and neighboring-image
-  prefetching.
-- Side-by-side image comparison with synchronized navigation and a detail lens.
-- Non-destructive crop, rotate, flip, scale, palette, pencil, and object-selection
-  operations with undo and redo.
-- Animated-image playback.
-- Atomic PNG and JPEG export with configurable metadata preservation.
-- GNOME-native keyboard shortcuts, preferences, and adaptive widgets.
+### Image formats
+
+- Sandboxed Glycin decoding for PNG/APNG, JPEG, GIF, WebP, AVIF, HEIF/HEIC,
+  TIFF, SVG/SVGZ, BMP, JPEG XL, and JPEG 2000.
+- Folder browsing also recognizes QOI, ICO, OpenEXR, Netpbm, TGA, XBM, and XPM
+  images when a compatible system decoder is available.
+- Automatic EXIF orientation and bounded decoding to protect against images
+  whose dimensions or decoded memory exceed safe limits.
+- EXIF, XMP, ICC profile, format, dimensions, location, and modification-time
+  awareness.
+
+### Browsing and viewing
+
+- Open one image, several explicitly ordered images, or continue through every
+  supported image in the current folder.
+- Previous/next navigation with natural filename ordering, Nautilus folder sort
+  preferences, regular-file symlink support, and neighboring-image prefetching.
+- Live folder monitoring that follows renames, reloads externally changed
+  images, refreshes added or removed files, and finds the next image after a
+  deletion.
+- Open With integration, full-image clipboard copying, confirmed permanent
+  deletion, fullscreen viewing, and remembered window, folder, and zoom state.
+- Fit-to-window, fill, 25%–900% presets, smooth zoom, and pixel-perfect hard
+  zoom that stays aligned on HiDPI and fractionally scaled displays.
+- Pinch zoom, pointer-anchored Ctrl+scroll zoom, drag-to-zoom rectangles,
+  middle-button panning, scrollbars for enlarged images, and an interactive
+  click-and-drag minimap.
+- Checkerboard, automatic contrast, white, gray, and black transparency
+  backgrounds.
+- Animated-image playback with play/pause and manual previous/next frame
+  controls.
+
+### Inspection and comparison
+
+- A movable 4× pixel-inspection lens for a single image, with configurable lens
+  size.
+- Adaptive side-by-side or stacked comparison based on image shape, with file
+  location and resolution labels for both images.
+- Optional synchronized pan and relative zoom between differently sized
+  comparison images.
+- A cross-image detail lens that reveals the corresponding location in the
+  other image; Shift+scroll changes its size and Alt+scroll its magnification.
+- Comparison-folder navigation that follows matching filenames and monitors the
+  comparison image for external changes or renames.
+- Pixel measurement by click or rectangle, including live coordinates and
+  dimensions copied to the clipboard.
+- A color picker that updates the pencil color and copies Hex, RGB(A), OKLab, or
+  HSL values.
+- Rectangular Select and Copy, plus click-to-select object detection with an
+  automatically downloaded prompt-free segmentation model on first use.
+
+### Non-destructive editing
+
+- An operation-based document model: edits leave the source pixels untouched
+  until export and support multi-step undo and redo.
+- Crop by first marking a rectangle and then dragging any edge or corner, with
+  precise pixel-aligned bounds.
+- Clockwise and counterclockwise rotation plus horizontal and vertical
+  flipping.
+- Live image scaling with exact width and height fields, aspect-ratio locking,
+  pixel or percentage sliders, and an in-progress indicator for slower methods.
+- Scaling previews that can show the original while held, display output pixels
+  at actual size, or stay fitted to the window as the target resolution changes.
+- Nearest-neighbor, bilinear, bicubic, and content-aware seam-carving scaling.
+
+### Pencil and pixel editing
+
+- Configurable RGBA color, 1–128 px brush size, optional anti-aliasing, and
+  mouse, pen, or touch input that draws instead of scrolling in pencil mode.
+- Freehand drawing with pointer-speed-adaptive smoothing and incremental stroke
+  previews that remain responsive during long strokes.
+- Pixel-perfect raster paths for hard-edged drawing, plus smooth anti-aliased
+  paths when requested.
+- Modifier shapes while drawing: Ctrl for connected lines, Shift for
+  rectangles, and Alt for circles.
+- Right-click color sampling directly from the image and drawing on either
+  comparison panel.
+
+### Saving and GNOME integration
+
+- PNG export with compression control, optional metadata and ICC preservation,
+  and optional conversion to sRGB.
+- JPEG export with quality control, metadata preservation, and selectable white,
+  gray, or black compositing for transparent pixels.
+- Atomic writes that do not replace the destination after a failed or cancelled
+  export, plus cancellable background rendering and export progress.
+- External-change protection before overwriting, unsaved-edit confirmation when
+  opening or closing, and dirty-state tracking against the last successful save.
+- Native GTK 4 and libadwaita controls, adaptive layouts, accessible canvas
+  labels, persistent preferences, menu accelerators, and a built-in keyboard
+  shortcuts reference.
 
 ## Install a release
 
