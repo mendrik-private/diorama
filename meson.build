@@ -1,7 +1,7 @@
 project(
   'diorama',
   'rust',
-  version: '0.2.5',
+  version: '0.2.6',
   meson_version: '>= 1.3.0',
   default_options: ['warning_level=2'],
 )
