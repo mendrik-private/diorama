@@ -6,6 +6,14 @@ use crate::document::Resampling;
 use crate::navigation::SortOrder;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomMode {
+    #[default]
+    Fit,
+    Fill,
+    Manual,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ColorFormat {
     #[default]
     Hex,
@@ -45,6 +53,25 @@ impl Settings {
             match filter {
                 ZoomFilter::Soft => "soft",
                 ZoomFilter::Hard => "hard",
+            },
+        );
+    }
+
+    pub fn last_zoom_mode(&self) -> ZoomMode {
+        match self.string("last-zoom-mode").as_deref() {
+            Some("fill") => ZoomMode::Fill,
+            Some("manual") => ZoomMode::Manual,
+            _ => ZoomMode::Fit,
+        }
+    }
+
+    pub fn set_last_zoom_mode(&self, mode: ZoomMode) {
+        self.set_string(
+            "last-zoom-mode",
+            match mode {
+                ZoomMode::Fit => "fit",
+                ZoomMode::Fill => "fill",
+                ZoomMode::Manual => "manual",
             },
         );
     }
@@ -314,7 +341,7 @@ fn has_key(settings: &gio::Settings, key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColorFormat, Settings};
+    use super::{ColorFormat, Settings, ZoomMode};
 
     #[test]
     fn color_format_defaults_to_hex() {
@@ -325,6 +352,7 @@ mod tests {
     fn drawing_settings_have_pixel_perfect_fallbacks_without_a_schema() {
         let settings = Settings { inner: None };
 
+        assert_eq!(settings.last_zoom_mode(), ZoomMode::Fit);
         assert_eq!(settings.pencil_size(), 1);
         assert!(!settings.pencil_antialiasing());
         settings.set_pencil_size(128);
