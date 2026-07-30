@@ -1,4 +1,6 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::Duration;
 
 use gtk::gdk;
 use gtk::glib;
@@ -8,6 +10,7 @@ use gtk::subclass::prelude::*;
 use crate::document::{BrushPoint, StrokePath};
 
 const MAX_FIT_ZOOM: f64 = 16_384.0;
+const COORDINATE_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZoomFilter {
@@ -29,6 +32,10 @@ fn aligned_render_pixel_scale(zoom: f64, render_scale: f64) -> Option<f64> {
     let aligned = effective_scale.round();
     (aligned >= 1.0 && (effective_scale - aligned).abs() <= 1e-6 * effective_scale.abs().max(1.0))
         .then_some(aligned)
+}
+
+fn coordinate_tooltip_text((x, y): (u32, u32)) -> String {
+    format!("X {x} · Y {y}")
 }
 
 fn measured_image_dimension(
@@ -256,7 +263,7 @@ mod imp {
             let object = self.obj();
             object.set_focusable(true);
             object.set_overflow(gtk::Overflow::Hidden);
-            object.set_tooltip_text(Some("Image canvas"));
+            object.install_coordinate_tooltip();
             object.update_property(&[gtk::accessible::Property::Label("Image canvas")]);
         }
     }
@@ -796,6 +803,53 @@ impl Default for ImageCanvas {
 }
 
 impl ImageCanvas {
+    fn install_coordinate_tooltip(&self) {
+        let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion({
+            let canvas = self.downgrade();
+            let pending = pending.clone();
+            move |_, x, y| {
+                if let Some(source) = pending.borrow_mut().take() {
+                    source.remove();
+                }
+                let Some(canvas) = canvas.upgrade() else {
+                    return;
+                };
+                canvas.set_tooltip_text(None);
+                if canvas.pixel_at(x, y).is_none() {
+                    return;
+                }
+                let canvas = canvas.downgrade();
+                let pending_for_timeout = pending.clone();
+                let source = glib::timeout_add_local_once(COORDINATE_TOOLTIP_DELAY, move || {
+                    pending_for_timeout.borrow_mut().take();
+                    let Some(canvas) = canvas.upgrade() else {
+                        return;
+                    };
+                    let Some(pixel) = canvas.pixel_at(x, y) else {
+                        return;
+                    };
+                    canvas.set_tooltip_text(Some(&coordinate_tooltip_text(pixel)));
+                    canvas.trigger_tooltip_query();
+                });
+                pending.replace(Some(source));
+            }
+        });
+        motion.connect_leave({
+            let canvas = self.downgrade();
+            move |_| {
+                if let Some(source) = pending.borrow_mut().take() {
+                    source.remove();
+                }
+                if let Some(canvas) = canvas.upgrade() {
+                    canvas.set_tooltip_text(None);
+                }
+            }
+        });
+        self.add_controller(motion);
+    }
+
     fn image_bounds_for_texture(&self, texture: &gdk::Texture) -> gtk::graphene::Rect {
         canvas_image_bounds(
             gtk::graphene::Rect::new(
@@ -1369,6 +1423,12 @@ mod tests {
                 "H 17 px".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn coordinate_tooltip_reports_zero_based_source_pixel_position() {
+        assert_eq!(coordinate_tooltip_text((0, 0)), "X 0 · Y 0");
+        assert_eq!(coordinate_tooltip_text((123, 45)), "X 123 · Y 45");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::image::{
     AnimationFrame, DecodeLimits, decode_animation, decode_headless, decode_memory, load_preview,
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
-use crate::settings::{ColorFormat, Settings};
+use crate::settings::{ColorFormat, Settings, ZoomMode};
 
 static SCALE_SURFACE_STYLE_INSTALLED: Once = Once::new();
 
@@ -164,6 +164,10 @@ fn pencil_drag_path(mode: PencilDragMode) -> StrokePath {
         PencilDragMode::Line | PencilDragMode::Rectangle => StrokePath::Linear,
         PencilDragMode::Circle => StrokePath::Circle,
     }
+}
+
+fn pencil_drag_should_preview(mode: PencilDragMode, sampled_pixels: usize) -> bool {
+    mode != PencilDragMode::Freehand || sampled_pixels > 1
 }
 
 fn pencil_event_time(gesture: &gtk::GestureDrag) -> u32 {
@@ -568,6 +572,17 @@ fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
         .min(f64::from(size.1.max(1)) / f64::from(dimensions.1.max(1)))
 }
 
+fn fit_on_load(force_fit: bool, zoom_mode: ZoomMode) -> Option<bool> {
+    if force_fit {
+        return Some(false);
+    }
+    match zoom_mode {
+        ZoomMode::Fit => Some(false),
+        ZoomMode::Fill => Some(true),
+        ZoomMode::Manual => None,
+    }
+}
+
 fn normalized_render_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
         scale.round().max(1.0)
@@ -722,6 +737,7 @@ struct WindowState {
     crop_controls: gtk::Box,
     crop_apply_button: gtk::Button,
     pending_fit: Cell<Option<bool>>,
+    zoom_mode: Cell<ZoomMode>,
     fit_tick_scheduled: Cell<bool>,
     zoom_controls: gtk::Box,
     zoom_label: gtk::MenuButton,
@@ -989,6 +1005,7 @@ impl ViewerWindow {
         let lens_diameter = settings.compare_lens_size();
         let lens_magnification = settings.compare_lens_magnification();
         let pencil_antialiasing = settings.pencil_antialiasing();
+        let zoom_mode = settings.last_zoom_mode();
         let this = Self(Rc::new(WindowState {
             window,
             canvas,
@@ -1074,6 +1091,7 @@ impl ViewerWindow {
             crop_controls,
             crop_apply_button,
             pending_fit: Cell::new(None),
+            zoom_mode: Cell::new(zoom_mode),
             fit_tick_scheduled: Cell::new(false),
             zoom_controls,
             zoom_label,
@@ -1175,6 +1193,7 @@ impl ViewerWindow {
     }
 
     fn load_with_fit(&self, file: gio::File, fit: bool) {
+        let fit_on_load = fit_on_load(fit, self.0.zoom_mode.get());
         self.cancel_zoom_rect_drag();
         self.0
             .navigation_generation
@@ -1281,8 +1300,8 @@ impl ViewerWindow {
                 Ok(preview) => {
                     state.subtitle_ready.set(true);
                     state.canvas.set_texture(Some(&preview.texture));
-                    if fit {
-                        ViewerWindow(state.clone()).fit(false);
+                    if let Some(fill) = fit_on_load {
+                        ViewerWindow(state.clone()).fit(fill);
                     }
                     ViewerWindow(state.clone()).update_subtitle();
                     if preview.animation_delay.is_some() {
@@ -1417,13 +1436,15 @@ impl ViewerWindow {
             move || {
                 if this.0.scale_button.is_active() {
                     this.0.scale_preview_view.set(ScalePreviewView::Fit);
+                    this.fit(false);
+                } else {
+                    this.set_fit_mode(false);
                 }
-                this.fit(false);
             }
         });
         self.add_action("fill", {
             let this = self.clone();
-            move || this.fit(true)
+            move || this.set_fit_mode(true)
         });
         self.add_action("toggle-filter", {
             let this = self.clone();
@@ -1437,7 +1458,7 @@ impl ViewerWindow {
                     canvas.set_filter(filter);
                 }
                 this.0.settings.set_zoom_filter(filter);
-                this.set_zoom(this.0.canvas.zoom());
+                this.realign_zoom();
             }
         });
         self.add_action("previous", {
@@ -2736,7 +2757,7 @@ impl ViewerWindow {
         else {
             return;
         };
-        let (points, path) = {
+        let (points, path, should_preview) = {
             let mut pencil_drag = self.0.pencil_drag.borrow_mut();
             let Some(drag) = pencil_drag.as_mut() else {
                 return;
@@ -2754,11 +2775,17 @@ impl ViewerWindow {
                         timestamp_ms,
                     });
             }
-            (pencil_drag_points(drag), pencil_drag_path(drag.mode))
+            (
+                pencil_drag_points(drag),
+                pencil_drag_path(drag.mode),
+                pencil_drag_should_preview(drag.mode, drag.freehand_points.len()),
+            )
         };
         self.0.pencil_points.replace(points);
         self.0.pencil_path.set(path);
-        if canvas == &self.0.canvas {
+        if !should_preview {
+            canvas.clear_pencil_overlay();
+        } else if canvas == &self.0.canvas {
             self.preview_pencil_stroke();
         } else {
             self.preview_comparison_pencil_stroke(canvas);
@@ -3638,7 +3665,7 @@ impl ViewerWindow {
                 canvas.set_filter(zoom_filter);
                 canvas.set_background(background);
             }
-            this.set_zoom(this.0.canvas.zoom());
+            this.realign_zoom();
             this.0.lens_diameter.set(lens_diameter);
             this.0.settings.set_zoom_filter(zoom_filter);
             this.0.settings.set_background(background);
@@ -4196,8 +4223,6 @@ impl ViewerWindow {
         compare_canvas.set_zoom(self.0.canvas.zoom());
         compare_canvas.set_halign(gtk::Align::Center);
         compare_canvas.set_valign(gtk::Align::Center);
-        compare_canvas.set_tooltip_text(Some("Comparison image panel"));
-        self.0.canvas.set_tooltip_text(Some("Primary image panel"));
         compare_canvas.set_accessible_label("Comparison image B");
         self.0.canvas.set_accessible_label("Primary image A");
         let compare_scrolled = gtk::ScrolledWindow::builder()
@@ -4382,7 +4407,7 @@ impl ViewerWindow {
             ),
         );
         self.0.compare_fit_zooms.set(Some(fit_zooms));
-        self.set_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
+        self.apply_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
         true
     }
 
@@ -4433,7 +4458,6 @@ impl ViewerWindow {
         self.0.compare_fit_zooms.set(None);
         self.0.compare_rendered.replace(None);
         self.0.compare_file.replace(None);
-        self.0.canvas.set_tooltip_text(Some("Image canvas"));
         self.0.canvas.set_accessible_label("Image canvas");
         let this = self.clone();
         glib::idle_add_local_once(move || this.update_minimap());
@@ -4791,6 +4815,12 @@ impl ViewerWindow {
     }
 
     fn set_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
+        self.0.zoom_mode.set(ZoomMode::Manual);
+        self.0.settings.set_last_zoom_mode(ZoomMode::Manual);
+        self.apply_zoom_with_alignment(zoom, alignment);
+    }
+
+    fn apply_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
         self.0.pending_fit.set(None);
         let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
             alignment.map_or(zoom, |alignment| {
@@ -4827,6 +4857,16 @@ impl ViewerWindow {
         self.update_minimap();
     }
 
+    fn realign_zoom(&self) {
+        match self.0.zoom_mode.get() {
+            ZoomMode::Fit if self.0.canvas.texture().is_some() => self.fit(false),
+            ZoomMode::Fill if self.0.canvas.texture().is_some() => self.fit(true),
+            ZoomMode::Fit | ZoomMode::Fill | ZoomMode::Manual => {
+                self.apply_zoom_with_alignment(self.0.canvas.zoom(), Some(ZoomAlignment::Nearest))
+            }
+        }
+    }
+
     fn install_render_scale_tracking(&self) {
         self.0.window.connect_realize({
             let this = self.clone();
@@ -4854,7 +4894,7 @@ impl ViewerWindow {
         if let Some(compare) = self.0.compare_canvas.borrow().as_ref() {
             compare.set_render_scale(scale);
         }
-        self.set_zoom(self.0.canvas.zoom());
+        self.realign_zoom();
     }
 
     fn install_minimap(&self) {
@@ -5211,6 +5251,13 @@ impl ViewerWindow {
         }
     }
 
+    fn set_fit_mode(&self, fill: bool) {
+        let mode = if fill { ZoomMode::Fill } else { ZoomMode::Fit };
+        self.0.zoom_mode.set(mode);
+        self.0.settings.set_last_zoom_mode(mode);
+        self.fit(fill);
+    }
+
     fn apply_pending_fit(&self) -> bool {
         let Some(fill) = self.0.pending_fit.get() else {
             return true;
@@ -5248,7 +5295,7 @@ impl ViewerWindow {
             };
             self.set_scale_preview_fit_zoom(zoom);
         } else {
-            self.set_zoom_with_alignment(zoom, Some(alignment));
+            self.apply_zoom_with_alignment(zoom, Some(alignment));
         }
         true
     }
@@ -6669,6 +6716,14 @@ mod tests {
     }
 
     #[test]
+    fn navigation_reapplies_the_selected_fit_mode() {
+        assert_eq!(fit_on_load(false, ZoomMode::Fit), Some(false));
+        assert_eq!(fit_on_load(false, ZoomMode::Fill), Some(true));
+        assert_eq!(fit_on_load(false, ZoomMode::Manual), None);
+        assert_eq!(fit_on_load(true, ZoomMode::Manual), Some(false));
+    }
+
+    #[test]
     fn hard_zoom_aligns_to_the_integer_render_grid() {
         let render_scale = 2.0;
 
@@ -6829,6 +6884,15 @@ mod tests {
         );
         assert!(!points.contains(&hidden_freehand_point));
         assert_eq!(pencil_drag_path(drag.mode), StrokePath::Circle);
+    }
+
+    #[test]
+    fn freehand_preview_waits_until_the_pointer_enters_another_source_pixel() {
+        assert!(!pencil_drag_should_preview(PencilDragMode::Freehand, 1));
+        assert!(pencil_drag_should_preview(PencilDragMode::Freehand, 2));
+        assert!(pencil_drag_should_preview(PencilDragMode::Line, 1));
+        assert!(pencil_drag_should_preview(PencilDragMode::Rectangle, 1));
+        assert!(pencil_drag_should_preview(PencilDragMode::Circle, 1));
     }
 
     #[test]
