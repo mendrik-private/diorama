@@ -320,6 +320,17 @@ fn navigation_direction(key: gtk::gdk::Key) -> Option<bool> {
     }
 }
 
+fn has_shortcut_modifier(modifiers: gtk::gdk::ModifierType) -> bool {
+    modifiers.intersects(
+        gtk::gdk::ModifierType::SHIFT_MASK
+            | gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK
+            | gtk::gdk::ModifierType::HYPER_MASK
+            | gtk::gdk::ModifierType::META_MASK,
+    )
+}
+
 fn is_directory(file: &gio::File) -> bool {
     file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
         == gio::FileType::Directory
@@ -1714,7 +1725,7 @@ impl ViewerWindow {
         keys.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
-                if !modifiers.is_empty() {
+                if has_shortcut_modifier(modifiers) {
                     return glib::Propagation::Proceed;
                 }
                 if this.0.scale_button.is_active()
@@ -6530,6 +6541,17 @@ mod tests {
         assert_eq!(navigation_direction(gtk::gdk::Key::Right), Some(true));
         assert_eq!(navigation_direction(gtk::gdk::Key::Page_Down), Some(true));
         assert_eq!(navigation_direction(gtk::gdk::Key::space), None);
+    }
+
+    #[test]
+    fn lock_and_pointer_state_do_not_suppress_shortcuts() {
+        assert!(!has_shortcut_modifier(
+            gtk::gdk::ModifierType::LOCK_MASK | gtk::gdk::ModifierType::BUTTON1_MASK
+        ));
+        assert!(has_shortcut_modifier(
+            gtk::gdk::ModifierType::LOCK_MASK | gtk::gdk::ModifierType::CONTROL_MASK
+        ));
+        assert!(has_shortcut_modifier(gtk::gdk::ModifierType::SHIFT_MASK));
     }
 
     #[test]
