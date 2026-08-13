@@ -1,28 +1,41 @@
+use hf_hub::api::sync::Api;
 use image::RgbaImage;
-use object_detector::{DetectedObject, ObjectDetector};
+use rlx_sam2::{Sam2, Sam2Config};
 
-use crate::document::CancellationToken;
 use crate::error::{AppError, Result};
 use crate::tools::crop::CropBounds;
-use crate::tools::selection;
+
+const SAM2_REPOSITORY: &str = "Kijai/sam2-safetensors";
+const SAM2_TINY_MODEL: &str = "sam2_hiera_tiny.safetensors";
+const SAM2_INPUT_SIZE: f32 = 1024.0;
 
 pub struct SelectedObject {
-    pub image: RgbaImage,
     pub flash: RgbaImage,
     pub bounds: CropBounds,
     pub image_dimensions: (u32, u32),
-    pub tag: String,
-    pub score: f32,
 }
 
-struct MaskedCutout {
-    image: RgbaImage,
+struct MaskedFlash {
     flash: RgbaImage,
     bounds: CropBounds,
 }
 
+pub fn load_sam2() -> Result<Sam2> {
+    let path = Api::new()
+        .map_err(|error| AppError::AiInference(error.to_string()))?
+        .model(SAM2_REPOSITORY.to_owned())
+        .get(SAM2_TINY_MODEL)
+        .map_err(|error| AppError::AiInference(error.to_string()))?;
+    Sam2::from_safetensors(
+        path.to_str()
+            .ok_or_else(|| AppError::AiInference("SAM 2 model path is not UTF-8".to_owned()))?,
+        Sam2Config::hiera_tiny(),
+    )
+    .map_err(|error| AppError::AiInference(error.to_string()))
+}
+
 pub fn select_object_at(
-    detector: &ObjectDetector,
+    detector: &mut Sam2,
     image: RgbaImage,
     x: u32,
     y: u32,
@@ -31,192 +44,188 @@ pub fn select_object_at(
         return Ok(None);
     }
     let image_dimensions = image.dimensions();
-    let dynamic = image::DynamicImage::ImageRgba8(image);
-    let detections = detector
-        .predict(&dynamic)
-        .confidence_threshold(0.25)
-        .call()
+    let rgb = image
+        .pixels()
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect::<Vec<_>>();
+    let prompt = sam2_prompt_point(x, y, image.width(), image.height());
+    let prediction = detector
+        .predict_image(
+            &rgb,
+            image.height() as usize,
+            image.width() as usize,
+            Some((&prompt, &[1.0])),
+            None,
+            None,
+            true,
+        )
         .map_err(|error| AppError::AiInference(error.to_string()))?;
-    let Some(detection) = detection_at(&detections, x, y) else {
+    let Some(mask_index) = highest_quality_mask(&prediction.iou_pred) else {
         return Ok(None);
     };
-    let source = dynamic
-        .as_rgba8()
-        .expect("the detector input was constructed from RGBA pixels");
-    let cutout = masked_cutout(source, detection)?;
+    let mask = source_mask(
+        &prediction.masks,
+        mask_index,
+        prediction.h_out,
+        prediction.w_out,
+        image.width(),
+        image.height(),
+    );
+    if !mask.iter().any(|selected| *selected) {
+        return Ok(None);
+    }
+    let flash = masked_flash(&image, &mask)?;
     Ok(Some(SelectedObject {
-        image: cutout.image,
-        flash: cutout.flash,
-        bounds: cutout.bounds,
+        flash: flash.flash,
+        bounds: flash.bounds,
         image_dimensions,
-        tag: detection.tag.clone(),
-        score: detection.score,
     }))
 }
 
-fn detection_at(detections: &[DetectedObject], x: u32, y: u32) -> Option<&DetectedObject> {
-    detections
+fn sam2_prompt_point(x: u32, y: u32, width: u32, height: u32) -> [f32; 2] {
+    [
+        (x as f32 + 0.5) * SAM2_INPUT_SIZE / width as f32,
+        (y as f32 + 0.5) * SAM2_INPUT_SIZE / height as f32,
+    ]
+}
+
+fn highest_quality_mask(quality: &[f32]) -> Option<usize> {
+    quality
         .iter()
-        .filter(|detection| detection_contains(detection, x, y))
-        .max_by(|left, right| left.score.total_cmp(&right.score))
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
 }
 
-fn detection_contains(detection: &DetectedObject, x: u32, y: u32) -> bool {
-    detection.mask.as_ref().map_or_else(
-        || {
-            let x = x as f32 + 0.5;
-            let y = y as f32 + 0.5;
-            x >= detection.bbox.x1
-                && x < detection.bbox.x2
-                && y >= detection.bbox.y1
-                && y < detection.bbox.y2
-        },
-        |mask| x < mask.width && y < mask.height && mask.get(x, y),
-    )
+fn source_mask(
+    masks: &[f32],
+    mask_index: usize,
+    mask_height: usize,
+    mask_width: usize,
+    image_width: u32,
+    image_height: u32,
+) -> Vec<bool> {
+    let mask_area = mask_height * mask_width;
+    let offset = mask_index * mask_area;
+    (0..image_height)
+        .flat_map(|y| {
+            (0..image_width).map(move |x| {
+                let source_x = (x as usize * mask_width / image_width as usize).min(mask_width - 1);
+                let source_y =
+                    (y as usize * mask_height / image_height as usize).min(mask_height - 1);
+                masks
+                    .get(offset + source_y * mask_width + source_x)
+                    .is_some_and(|logit| *logit > 0.0)
+            })
+        })
+        .collect()
 }
 
-fn masked_cutout(image: &RgbaImage, detection: &DetectedObject) -> Result<MaskedCutout> {
-    let x = detection.bbox.x1.floor().max(0.0) as u32;
-    let y = detection.bbox.y1.floor().max(0.0) as u32;
-    let right = detection.bbox.x2.ceil().max(0.0) as u32;
-    let bottom = detection.bbox.y2.ceil().max(0.0) as u32;
-    let bounds = CropBounds {
-        x: x.min(image.width()),
-        y: y.min(image.height()),
-        width: right
-            .min(image.width())
-            .saturating_sub(x.min(image.width())),
-        height: bottom
-            .min(image.height())
-            .saturating_sub(y.min(image.height())),
+fn masked_flash(image: &RgbaImage, mask: &[bool]) -> Result<MaskedFlash> {
+    let (width, height) = image.dimensions();
+    let Some((left, top, right, bottom)) = mask_bounds(mask, width, height) else {
+        return Err(AppError::InvalidCrop);
     };
-    let mut cutout = selection::crop(image, bounds)?;
+    let bounds = CropBounds {
+        x: left,
+        y: top,
+        width: right - left + 1,
+        height: bottom - top + 1,
+    };
     let mut flash = RgbaImage::from_pixel(
         bounds.width,
         bounds.height,
         image::Rgba([53, 132, 228, 150]),
     );
-    if let Some(mask) = detection.mask.as_ref() {
-        for (local_x, local_y, pixel) in cutout.enumerate_pixels_mut() {
+    for local_y in 0..bounds.height {
+        for local_x in 0..bounds.width {
             let source_x = bounds.x + local_x;
             let source_y = bounds.y + local_y;
-            if source_x >= mask.width || source_y >= mask.height || !mask.get(source_x, source_y) {
-                *pixel = image::Rgba([0, 0, 0, 0]);
+            if !mask[(source_y * width + source_x) as usize] {
                 flash.put_pixel(local_x, local_y, image::Rgba([0, 0, 0, 0]));
             }
         }
     }
-    Ok(MaskedCutout {
-        image: cutout,
-        flash,
-        bounds,
-    })
+    Ok(MaskedFlash { flash, bounds })
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum PromptKind {
-    Foreground,
-    Background,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Prompt {
-    pub x: f32,
-    pub y: f32,
-    pub kind: PromptKind,
-}
-
-pub trait SegmentationBackend: Send + Sync {
-    fn name(&self) -> &str;
-    fn is_installed(&self) -> bool;
-    fn segment(
-        &self,
-        image: &RgbaImage,
-        prompts: &[Prompt],
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<u8>>;
-}
-
-#[derive(Debug, Default)]
-pub struct UnavailableBackend;
-
-impl SegmentationBackend for UnavailableBackend {
-    fn name(&self) -> &'static str {
-        "Not installed"
+fn mask_bounds(mask: &[bool], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..height {
+        for x in 0..width {
+            if !mask[(y * width + x) as usize] {
+                continue;
+            }
+            bounds = Some(match bounds {
+                Some((left, top, right, bottom)) => {
+                    (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                }
+                None => (x, y, x, y),
+            });
+        }
     }
-
-    fn is_installed(&self) -> bool {
-        false
-    }
-
-    fn segment(
-        &self,
-        _image: &RgbaImage,
-        _prompts: &[Prompt],
-        _cancellation: &CancellationToken,
-    ) -> Result<Vec<u8>> {
-        Err(AppError::AiModelUnavailable)
-    }
+    bounds
 }
 
 #[cfg(test)]
 mod tests {
     use image::{Rgba, RgbaImage};
-    use object_detector::{DetectedObject, ObjectBBox, ObjectMask};
 
-    use super::{detection_at, masked_cutout};
+    use super::{highest_quality_mask, masked_flash, sam2_prompt_point, source_mask};
 
-    fn mask(width: u32, height: u32, points: &[(u32, u32)]) -> ObjectMask {
-        let mut data = vec![0; (width as usize * height as usize).div_ceil(8)];
-        for &(x, y) in points {
-            let bit = (y * width + x) as usize;
-            data[bit >> 3] |= 1 << (bit & 7);
-        }
-        ObjectMask {
-            width,
-            height,
-            data,
-        }
-    }
-
-    fn detection(score: f32, points: &[(u32, u32)]) -> DetectedObject {
-        DetectedObject {
-            bbox: ObjectBBox {
-                x1: 0.0,
-                y1: 0.0,
-                x2: 3.0,
-                y2: 2.0,
-            },
-            score,
-            class_id: 0,
-            tag: format!("score-{score}"),
-            mask: Some(mask(3, 2, points)),
-        }
+    #[test]
+    fn scales_clicks_to_sam2s_input_grid() {
+        assert_eq!(sam2_prompt_point(0, 0, 8, 8), [64.0, 64.0]);
+        assert_eq!(sam2_prompt_point(7, 7, 8, 8), [960.0, 960.0]);
     }
 
     #[test]
-    fn point_selects_highest_scoring_containing_mask() {
-        let detections = [
-            detection(0.95, &[(0, 0)]),
-            detection(0.40, &[(1, 1)]),
-            detection(0.80, &[(1, 1)]),
-        ];
-
-        assert_eq!(detection_at(&detections, 1, 1).unwrap().score, 0.80);
-        assert!(detection_at(&detections, 2, 1).is_none());
+    fn highest_quality_mask_selects_the_best_prediction() {
+        assert_eq!(highest_quality_mask(&[0.72, 0.95, 0.81]), Some(1));
+        assert_eq!(highest_quality_mask(&[]), None);
     }
 
     #[test]
-    fn cutout_preserves_masked_rgba_and_clears_other_pixels() {
+    fn source_mask_scales_sam_logits_to_the_image() {
+        let mut logits = vec![-1.0; 2 * 4];
+        logits[4 + 3] = 1.0;
+        let mask = source_mask(&logits, 1, 2, 2, 4, 4);
+
+        assert!(!mask[0]);
+        assert!(mask[3 * 4 + 3]);
+        assert!(mask[2 * 4 + 2]);
+    }
+
+    #[test]
+    fn flash_matches_mask_bounds() {
         let image = RgbaImage::from_fn(3, 2, |x, y| Rgba([x as u8, y as u8, 9, 200]));
-        let detection = detection(0.8, &[(1, 1)]);
-        let cutout = masked_cutout(&image, &detection).unwrap();
+        let flash = masked_flash(&image, &[false, false, false, false, true, false]).unwrap();
 
-        assert_eq!(cutout.image.dimensions(), (3, 2));
-        assert_eq!(cutout.image.get_pixel(1, 1).0, [1, 1, 9, 200]);
-        assert_eq!(cutout.image.get_pixel(0, 0).0, [0, 0, 0, 0]);
-        assert_eq!(cutout.flash.get_pixel(1, 1).0, [53, 132, 228, 150]);
-        assert_eq!(cutout.flash.get_pixel(0, 0).0, [0, 0, 0, 0]);
-        assert_eq!(cutout.bounds.width, 3);
+        assert_eq!(flash.flash.get_pixel(0, 0).0, [53, 132, 228, 150]);
+        assert_eq!(
+            flash.bounds,
+            crate::tools::crop::CropBounds {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads and compiles the 156 MB SAM 2 model"]
+    fn sam2_model_loads() {
+        super::load_sam2().expect("SAM 2 Tiny model loads");
+    }
+
+    #[test]
+    #[ignore = "runs CPU inference with the 156 MB SAM 2 model"]
+    fn sam2_segments_a_click() {
+        let mut sam2 = super::load_sam2().expect("SAM 2 Tiny model loads");
+        let image = RgbaImage::from_pixel(8, 8, Rgba([20, 40, 60, 255]));
+
+        super::select_object_at(&mut sam2, image, 4, 4)
+            .expect("SAM 2 produces a valid result for a point prompt");
     }
 }

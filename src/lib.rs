@@ -5,6 +5,7 @@ pub mod compare;
 pub mod document;
 pub mod error;
 pub mod export;
+pub mod i18n;
 pub mod image;
 pub mod navigation;
 pub mod settings;

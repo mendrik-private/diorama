@@ -1,0 +1,930 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the diorama package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: diorama\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-08-07 17:00+0300\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: data/io.github.mendrik.Diorama.desktop.in:2
+#: data/io.github.mendrik.Diorama.metainfo.xml.in:4
+msgid "Diorama"
+msgstr ""
+
+#: data/io.github.mendrik.Diorama.desktop.in:3
+#: data/io.github.mendrik.Diorama.metainfo.xml.in:5
+msgid "View, compare, and edit images"
+msgstr ""
+
+#: data/io.github.mendrik.Diorama.metainfo.xml.in:7
+msgid "Mendrik"
+msgstr ""
+
+#: data/io.github.mendrik.Diorama.metainfo.xml.in:12
+msgid ""
+"Diorama is a fast native GNOME image viewer for browsing, comparing, and "
+"making focused non-destructive edits to images."
+msgstr ""
+
+#: src/canvas/mod.rs:39 src/canvas/mod.rs:706
+msgid "X {x} · Y {y}"
+msgstr ""
+
+#: src/canvas/mod.rs:270 src/window/mod.rs:1774 src/window/mod.rs:2763
+#: src/window/mod.rs:2796 src/window/mod.rs:2892 src/window/mod.rs:2927
+#: src/window/mod.rs:5005
+msgid "Image canvas"
+msgstr ""
+
+#: src/canvas/mod.rs:709
+msgid "W {width} px"
+msgstr ""
+
+#: src/canvas/mod.rs:710
+msgid "H {height} px"
+msgstr ""
+
+#: src/window/mod.rs:826
+msgid "Abort Crop"
+msgstr ""
+
+#: src/window/mod.rs:829
+msgid "Apply Crop"
+msgstr ""
+
+#: src/window/mod.rs:839 src/window/mod.rs:4232
+msgid "Zoom Out"
+msgstr ""
+
+#: src/window/mod.rs:842
+msgid "Zoom presets (0: Fit; 1–9: 100%–900%)"
+msgstr ""
+
+#: src/window/mod.rs:847
+msgid "Fit to Window (0)"
+msgstr ""
+
+#: src/window/mod.rs:869 src/window/mod.rs:4231
+msgid "Zoom In"
+msgstr ""
+
+#: src/window/mod.rs:895 src/window/mod.rs:2491
+msgid "Output width in pixels"
+msgstr ""
+
+#: src/window/mod.rs:898
+msgid "Output height in pixels"
+msgstr ""
+
+#: src/window/mod.rs:900
+msgid "Aspect"
+msgstr ""
+
+#: src/window/mod.rs:901
+msgid "Lock the source aspect ratio"
+msgstr ""
+
+#: src/window/mod.rs:904
+msgid "Pixels"
+msgstr ""
+
+#: src/window/mod.rs:904
+msgid "Percent"
+msgstr ""
+
+#: src/window/mod.rs:908
+msgid "Slider unit"
+msgstr ""
+
+#: src/window/mod.rs:910 src/window/mod.rs:2412 src/window/mod.rs:2524
+msgid "{method} · Properties"
+msgstr ""
+
+#: src/window/mod.rs:914
+msgid "Scaling method from Properties"
+msgstr ""
+
+#: src/window/mod.rs:915
+msgid "Hold Original"
+msgstr ""
+
+#: src/window/mod.rs:917
+msgid "Press and hold to show the unscaled source image"
+msgstr ""
+
+#: src/window/mod.rs:920
+msgid "Actual Pixels"
+msgstr ""
+
+#: src/window/mod.rs:921
+msgid "Show each scaled output pixel at its actual size"
+msgstr ""
+
+#: src/window/mod.rs:925
+msgid "Fit Preview"
+msgstr ""
+
+#: src/window/mod.rs:926
+msgid "Fit the complete scaled preview in the window"
+msgstr ""
+
+#: src/window/mod.rs:946
+msgid "Cancel Scale"
+msgstr ""
+
+#: src/window/mod.rs:953
+msgid "Apply Scale"
+msgstr ""
+
+#: src/window/mod.rs:960
+msgid "Generating scale preview"
+msgstr ""
+
+#: src/window/mod.rs:964
+msgid "Scaled width in pixels"
+msgstr ""
+
+#: src/window/mod.rs:979
+msgid "Image overview — click to pan"
+msgstr ""
+
+#: src/window/mod.rs:986 src/window/mod.rs:1478
+msgid "Open Image"
+msgstr ""
+
+#: src/window/mod.rs:994
+msgid "Open an Image"
+msgstr ""
+
+#: src/window/mod.rs:995
+msgid "Choose an image to view, compare, or edit."
+msgstr ""
+
+#: src/window/mod.rs:1001
+msgid "Loading Image"
+msgstr ""
+
+#: src/window/mod.rs:1002
+msgid "Preparing the image for viewing."
+msgstr ""
+
+#: src/window/mod.rs:1006
+msgid "Open Another Image"
+msgstr ""
+
+#: src/window/mod.rs:1014
+msgid "Could Not Open Image"
+msgstr ""
+
+#: src/window/mod.rs:1015
+msgid "The image could not be loaded."
+msgstr ""
+
+#: src/window/mod.rs:1031
+msgid "Open an image to begin"
+msgstr ""
+
+#: src/window/mod.rs:1046
+msgid "This image can be viewed, but its decoder does not support editing."
+msgstr ""
+
+#: src/window/mod.rs:1273 src/window/mod.rs:1303 src/window/mod.rs:5563
+msgid "Discard unsaved edits and open another image?"
+msgstr ""
+
+#: src/window/mod.rs:1370
+msgid "Loading…"
+msgstr ""
+
+#: src/window/mod.rs:1421
+msgid "This image can be viewed but could not be read for editing"
+msgstr ""
+
+#: src/window/mod.rs:1447
+msgid "Could not prepare image for editing"
+msgstr ""
+
+#: src/window/mod.rs:1461
+msgid "Could not open image"
+msgstr ""
+
+#: src/window/mod.rs:1463
+msgid "Check that the file is a supported image and try again."
+msgstr ""
+
+#: src/window/mod.rs:1777
+msgid "Active tool cancelled"
+msgstr ""
+
+#: src/window/mod.rs:1799
+msgid "Diorama contributors"
+msgstr ""
+
+#: src/window/mod.rs:1931
+msgid ""
+"Use the arrow keys to move, Shift with an arrow to move faster, and Space or "
+"Enter to act."
+msgstr ""
+
+#: src/window/mod.rs:2006
+msgid "Column {column}, row {row}"
+msgstr ""
+
+#: src/window/mod.rs:2058
+msgid "Start point set. Move to the end point and press Space or Enter."
+msgstr ""
+
+#: src/window/mod.rs:2099
+msgid "Crop selected, {width} by {height} pixels. Press Enter to apply."
+msgstr ""
+
+#: src/window/mod.rs:2206 src/window/mod.rs:2335 src/window/mod.rs:2751
+#: src/window/mod.rs:2773 src/window/mod.rs:2866 src/window/mod.rs:2902
+#: src/window/mod.rs:3347 src/window/mod.rs:3497 src/window/mod.rs:3801
+#: src/window/mod.rs:3873
+msgid "Open an editable image first"
+msgstr ""
+
+#: src/window/mod.rs:2329
+msgid "Preparing image for scaling…"
+msgstr ""
+
+#: src/window/mod.rs:2503
+msgid "Output size as a percentage"
+msgstr ""
+
+#: src/window/mod.rs:2596
+msgid "Scale preview worker failed"
+msgstr ""
+
+#: src/window/mod.rs:2697
+msgid "Seam carving currently supports shrinking only"
+msgstr ""
+
+#: src/window/mod.rs:2703
+msgid "Scaling up may reduce perceived image quality"
+msgstr ""
+
+#: src/window/mod.rs:2761
+msgid "Image canvas, Pencil tool active"
+msgstr ""
+
+#: src/window/mod.rs:2794
+msgid "Image canvas, Color Picker tool active"
+msgstr ""
+
+#: src/window/mod.rs:2811
+msgid "Copied {value}"
+msgstr ""
+
+#: src/window/mod.rs:2819
+msgid "Copied {measurement}"
+msgstr ""
+
+#: src/window/mod.rs:2827 src/window/mod.rs:2842
+msgid "Open an image first"
+msgstr ""
+
+#: src/window/mod.rs:2832
+msgid "Copied {width} × {height} image"
+msgstr ""
+
+#: src/window/mod.rs:2854
+msgid "Could not open image with another app: {error}"
+msgstr ""
+
+#: src/window/mod.rs:2890
+msgid "Image canvas, Select and Copy tool active"
+msgstr ""
+
+#: src/window/mod.rs:2925
+msgid "Image canvas, Measuring tool active"
+msgstr ""
+
+#: src/window/mod.rs:2956
+msgid "Copied {width} × {height} selection"
+msgstr ""
+
+#: src/window/mod.rs:2967
+msgid "Object detection is already running"
+msgstr ""
+
+#: src/window/mod.rs:2977
+msgid "Preparing object detector — first use downloads the Medium model"
+msgstr ""
+
+#: src/window/mod.rs:2979
+msgid "Detecting object…"
+msgstr ""
+
+#: src/window/mod.rs:3024
+#, c-format
+msgid "Copied {tag} object ({confidence}% confidence)"
+msgstr ""
+
+#: src/window/mod.rs:3030
+msgid "No detected object contains that pixel"
+msgstr ""
+
+#: src/window/mod.rs:3033
+msgid "Object detection failed: {error}"
+msgstr ""
+
+#: src/window/mod.rs:3038
+msgid "Object detection worker failed"
+msgstr ""
+
+#: src/window/mod.rs:3435
+msgid "Image processing worker failed"
+msgstr ""
+
+#: src/window/mod.rs:3515
+msgid "The file changed externally; use Save As to avoid overwriting it"
+msgstr ""
+
+#: src/window/mod.rs:3524
+msgid "Save Image"
+msgstr ""
+
+#: src/window/mod.rs:3539
+msgid "This location does not support atomic export"
+msgstr ""
+
+#: src/window/mod.rs:3549 src/window/mod.rs:3559
+msgid "Choose a file name ending in .png, .jpg, or .jpeg"
+msgstr ""
+
+#: src/window/mod.rs:3564
+msgid "Export Options"
+msgstr ""
+
+#: src/window/mod.rs:3568 src/window/mod.rs:3848 src/window/mod.rs:3881
+#: src/window/mod.rs:5704 src/window/mod.rs:6720
+msgid "Cancel"
+msgstr ""
+
+#: src/window/mod.rs:3569
+msgid "Export"
+msgstr ""
+
+#: src/window/mod.rs:3582
+msgid "Preserve compatible metadata and color profile"
+msgstr ""
+
+#: src/window/mod.rs:3586 src/window/mod.rs:3961
+msgid "White"
+msgstr ""
+
+#: src/window/mod.rs:3586 src/window/mod.rs:3962
+msgid "Gray"
+msgstr ""
+
+#: src/window/mod.rs:3586 src/window/mod.rs:3963
+msgid "Black"
+msgstr ""
+
+#: src/window/mod.rs:3593
+msgid "Convert color profile to sRGB"
+msgstr ""
+
+#: src/window/mod.rs:3602
+msgid "Compression"
+msgstr ""
+
+#: src/window/mod.rs:3613
+msgid "Quality"
+msgstr ""
+
+#: src/window/mod.rs:3621 src/window/mod.rs:3972
+msgid "Transparency background"
+msgstr ""
+
+#: src/window/mod.rs:3630
+msgid "Transparent pixels are composited onto the saved JPEG background."
+msgstr ""
+
+#: src/window/mod.rs:3707
+msgid "Exporting image…"
+msgstr ""
+
+#: src/window/mod.rs:3772
+msgid "Image exported; newer edits remain unsaved"
+msgstr ""
+
+#: src/window/mod.rs:3774
+msgid "Image saved"
+msgstr ""
+
+#: src/window/mod.rs:3782
+msgid "Export worker failed"
+msgstr ""
+
+#: src/window/mod.rs:3821
+msgid "The background could not be identified with enough confidence"
+msgstr ""
+
+#: src/window/mod.rs:3832
+msgid "Content detection worker failed"
+msgstr ""
+
+#: src/window/mod.rs:3837
+msgid "Crop to detected content?"
+msgstr ""
+
+#: src/window/mod.rs:3839
+msgid "Detected bounds: x {x}, y {y}, {width} × {height} pixels"
+msgstr ""
+
+#: src/window/mod.rs:3849 src/window/mod.rs:3882
+msgid "Apply"
+msgstr ""
+
+#: src/window/mod.rs:3877
+msgid "Reduce Palette"
+msgstr ""
+
+#: src/window/mod.rs:3905
+msgid "Colors"
+msgstr ""
+
+#: src/window/mod.rs:3908
+msgid "Dithering"
+msgstr ""
+
+#: src/window/mod.rs:3910
+msgid "Preserve accents and isolated colors"
+msgstr ""
+
+#: src/window/mod.rs:3941 src/window/mod.rs:3945 src/window/mod.rs:4225
+#: src/window/mod.rs:6867
+msgid "Preferences"
+msgstr ""
+
+#: src/window/mod.rs:3948 src/window/mod.rs:4229
+msgid "Viewing"
+msgstr ""
+
+#: src/window/mod.rs:3951
+msgid "Hard zoom"
+msgstr ""
+
+#: src/window/mod.rs:3953
+msgid "Keep pixel edges sharp with nearest-neighbor rendering"
+msgstr ""
+
+#: src/window/mod.rs:3959
+msgid "Checkerboard"
+msgstr ""
+
+#: src/window/mod.rs:3960
+msgid "Auto"
+msgstr ""
+
+#: src/window/mod.rs:3983
+msgid "Small"
+msgstr ""
+
+#: src/window/mod.rs:3983
+msgid "Medium"
+msgstr ""
+
+#: src/window/mod.rs:3983
+msgid "Large"
+msgstr ""
+
+#: src/window/mod.rs:3991
+msgid "Lens size"
+msgstr ""
+
+#: src/window/mod.rs:3992
+msgid "Diameter of the pixel-inspection lens"
+msgstr ""
+
+#: src/window/mod.rs:3998
+msgid "Nearest"
+msgstr ""
+
+#: src/window/mod.rs:3999
+msgid "Linear"
+msgstr ""
+
+#: src/window/mod.rs:4000
+msgid "Bicubic"
+msgstr ""
+
+#: src/window/mod.rs:4001
+msgid "Seam carving"
+msgstr ""
+
+#: src/window/mod.rs:4010
+msgid "Scaling method"
+msgstr ""
+
+#: src/window/mod.rs:4021
+msgid "Anti-aliasing"
+msgstr ""
+
+#: src/window/mod.rs:4022
+msgid "Smooth the edges of pencil strokes and circles"
+msgstr ""
+
+#: src/window/mod.rs:4026
+msgid "Hex"
+msgstr ""
+
+#: src/window/mod.rs:4027
+msgid "RGB(A)"
+msgstr ""
+
+#: src/window/mod.rs:4028
+msgid "OKLab"
+msgstr ""
+
+#: src/window/mod.rs:4029
+msgid "HSL"
+msgstr ""
+
+#: src/window/mod.rs:4038
+msgid "Copied color format"
+msgstr ""
+
+#: src/window/mod.rs:4039
+msgid "Format used by the Color Picker tool"
+msgstr ""
+
+#: src/window/mod.rs:4044
+msgid "Drawing"
+msgstr ""
+
+#: src/window/mod.rs:4131 src/window/mod.rs:4135 src/window/mod.rs:6866
+msgid "Image Properties"
+msgstr ""
+
+#: src/window/mod.rs:4138
+msgid "Image"
+msgstr ""
+
+#: src/window/mod.rs:4189
+msgid "Dimensions"
+msgstr ""
+
+#: src/window/mod.rs:4193
+msgid "Location"
+msgstr ""
+
+#: src/window/mod.rs:4199
+msgid "Format"
+msgstr ""
+
+#: src/window/mod.rs:4203
+msgid "Metadata"
+msgstr ""
+
+#: src/window/mod.rs:4218
+msgid "General"
+msgstr ""
+
+#: src/window/mod.rs:4220
+msgid "Open"
+msgstr ""
+
+#: src/window/mod.rs:4221 src/window/mod.rs:6845
+msgid "Copy Image"
+msgstr ""
+
+#: src/window/mod.rs:4222 src/window/mod.rs:6846
+msgid "Save"
+msgstr ""
+
+#: src/window/mod.rs:4223 src/window/mod.rs:6789
+msgid "Save As"
+msgstr ""
+
+#: src/window/mod.rs:4224
+msgid "Close"
+msgstr ""
+
+#: src/window/mod.rs:4233
+msgid "Fit to Window"
+msgstr ""
+
+#: src/window/mod.rs:4234
+msgid "Zoom 100%–900%"
+msgstr ""
+
+#: src/window/mod.rs:4235
+msgid "Toggle Soft/Hard Zoom"
+msgstr ""
+
+#: src/window/mod.rs:4236 src/window/mod.rs:6751
+msgid "Previous Image"
+msgstr ""
+
+#: src/window/mod.rs:4237 src/window/mod.rs:6752
+msgid "Next Image"
+msgstr ""
+
+#: src/window/mod.rs:4238
+msgid "Delete Image"
+msgstr ""
+
+#: src/window/mod.rs:4242
+msgid "Editing"
+msgstr ""
+
+#: src/window/mod.rs:4244
+msgid "Undo"
+msgstr ""
+
+#: src/window/mod.rs:4245
+msgid "Redo"
+msgstr ""
+
+#: src/window/mod.rs:4246 src/window/mod.rs:6860
+msgid "Rotate Clockwise"
+msgstr ""
+
+#: src/window/mod.rs:4247 src/window/mod.rs:6857
+msgid "Rotate Counterclockwise"
+msgstr ""
+
+#: src/window/mod.rs:4248 src/window/mod.rs:6861
+msgid "Flip Horizontally"
+msgstr ""
+
+#: src/window/mod.rs:4249 src/window/mod.rs:6862
+msgid "Flip Vertically"
+msgstr ""
+
+#: src/window/mod.rs:4250 src/window/mod.rs:6854
+msgid "Crop"
+msgstr ""
+
+#: src/window/mod.rs:4251 src/window/mod.rs:6850
+msgid "Measure"
+msgstr ""
+
+#: src/window/mod.rs:4252 src/window/mod.rs:6863
+msgid "Scale"
+msgstr ""
+
+#: src/window/mod.rs:4253
+msgid "Apply Crop or Scale"
+msgstr ""
+
+#: src/window/mod.rs:4254
+msgid "Move Active Tool"
+msgstr ""
+
+#: src/window/mod.rs:4255
+msgid "Set Tool Point"
+msgstr ""
+
+#: src/window/mod.rs:4256
+msgid "Cancel Crop or Scale"
+msgstr ""
+
+#: src/window/mod.rs:4257 src/window/mod.rs:6853
+msgid "Pencil"
+msgstr ""
+
+#: src/window/mod.rs:4258
+msgid "Exit Active Tool"
+msgstr ""
+
+#: src/window/mod.rs:4370
+msgid "Play animation"
+msgstr ""
+
+#: src/window/mod.rs:4372 src/window/mod.rs:6740
+msgid "Stop animation"
+msgstr ""
+
+#: src/window/mod.rs:4560
+msgid "Image location updated after an external move"
+msgstr ""
+
+#: src/window/mod.rs:4594
+msgid "The previous image was moved or deleted"
+msgstr ""
+
+#: src/window/mod.rs:4603
+msgid "File moved or deleted"
+msgstr ""
+
+#: src/window/mod.rs:4606
+msgid ""
+"The source file was moved or deleted; unsaved edits are still available via "
+"Save As"
+msgstr ""
+
+#: src/window/mod.rs:4609
+msgid "The current file was moved or deleted"
+msgstr ""
+
+#: src/window/mod.rs:4635
+msgid ""
+"The source file changed externally; unsaved edits were kept and Save As is "
+"required"
+msgstr ""
+
+#: src/window/mod.rs:4678
+msgid "Image reloaded after an external update"
+msgstr ""
+
+#: src/window/mod.rs:4684
+msgid "Could not reload the updated image: {error}"
+msgstr ""
+
+#: src/window/mod.rs:4695
+msgid "Open the first image before comparing"
+msgstr ""
+
+#: src/window/mod.rs:4700
+msgid "Choose Comparison Image"
+msgstr ""
+
+#: src/window/mod.rs:4758
+msgid "Comparison image B"
+msgstr ""
+
+#: src/window/mod.rs:4761
+msgid "Primary image A"
+msgstr ""
+
+#: src/window/mod.rs:4807
+msgid "Synchronize Pan and Zoom"
+msgstr ""
+
+#: src/window/mod.rs:4812
+msgid "Exit Compare Mode"
+msgstr ""
+
+#: src/window/mod.rs:5078
+msgid "The comparison image was moved or deleted"
+msgstr ""
+
+#: src/window/mod.rs:5129
+msgid "Open an image before using the lens"
+msgstr ""
+
+#: src/window/mod.rs:5617
+msgid "That image was moved or deleted; it was removed from the opened files"
+msgstr ""
+
+#: src/window/mod.rs:5626
+msgid "That image was moved or deleted; the folder was refreshed"
+msgstr ""
+
+#: src/window/mod.rs:5663
+msgid "Wait for the current export to finish"
+msgstr ""
+
+#: src/window/mod.rs:5669
+msgid "Image deletion is already in progress"
+msgstr ""
+
+#: src/window/mod.rs:5676
+msgid "No image is open"
+msgstr ""
+
+#: src/window/mod.rs:5691
+msgid ""
+"“{name}” and its unsaved edits will be permanently deleted. This cannot be "
+"undone."
+msgstr ""
+
+#: src/window/mod.rs:5695
+msgid "“{name}” will be permanently deleted. This cannot be undone."
+msgstr ""
+
+#: src/window/mod.rs:5699
+msgid "Delete this image?"
+msgstr ""
+
+#: src/window/mod.rs:5705
+msgid "Delete"
+msgstr ""
+
+#: src/window/mod.rs:5753
+msgid "Could not delete image: {error}"
+msgstr ""
+
+#: src/window/mod.rs:5781
+msgid "Image deleted"
+msgstr ""
+
+#: src/window/mod.rs:6529
+msgid "Sampled {color}"
+msgstr ""
+
+#: src/window/mod.rs:6704
+msgid "Discard unsaved edits?"
+msgstr ""
+
+#: src/window/mod.rs:6716
+msgid "This cannot be undone."
+msgstr ""
+
+#: src/window/mod.rs:6721
+msgid "Discard"
+msgstr ""
+
+#: src/window/mod.rs:6735
+msgid "Previous Frame"
+msgstr ""
+
+#: src/window/mod.rs:6745
+msgid "Next Frame"
+msgstr ""
+
+#: src/window/mod.rs:6753
+msgid "Scale image"
+msgstr ""
+
+#: src/window/mod.rs:6756
+msgid "Select and Copy — drag a rectangle or click an object"
+msgstr ""
+
+#: src/window/mod.rs:6760
+msgid "Pick Color — click a pixel to copy its value"
+msgstr ""
+
+#: src/window/mod.rs:6764
+msgid "Measure pixels — click or drag a rectangle"
+msgstr ""
+
+#: src/window/mod.rs:6766
+msgid "Toggle Pencil"
+msgstr ""
+
+#: src/window/mod.rs:6767
+msgid "Toggle 4× Lens"
+msgstr ""
+
+#: src/window/mod.rs:6770
+msgid "Crop image — Enter to apply, Escape to cancel"
+msgstr ""
+
+#: src/window/mod.rs:6774
+msgid "Pencil color"
+msgstr ""
+
+#: src/window/mod.rs:6778
+msgid "Paint size in pixels"
+msgstr ""
+
+#: src/window/mod.rs:6828
+msgid "Main Menu"
+msgstr ""
+
+#: src/window/mod.rs:6843
+msgid "Open…"
+msgstr ""
+
+#: src/window/mod.rs:6844
+msgid "Open With…"
+msgstr ""
+
+#: src/window/mod.rs:6847
+msgid "Save As…"
+msgstr ""
+
+#: src/window/mod.rs:6848
+msgid "Compare Images…"
+msgstr ""
+
+#: src/window/mod.rs:6851
+msgid "Select and Copy"
+msgstr ""
+
+#: src/window/mod.rs:6852
+msgid "Pick Color"
+msgstr ""
+
+#: src/window/mod.rs:6864
+msgid "Edit"
+msgstr ""
+
+#: src/window/mod.rs:6865
+msgid "Magnifying Lens"
+msgstr ""
+
+#: src/window/mod.rs:6868
+msgid "Keyboard Shortcuts"
+msgstr ""
+
+#: src/window/mod.rs:6869
+msgid "About Diorama"
+msgstr ""

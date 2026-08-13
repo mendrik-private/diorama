@@ -8,6 +8,10 @@ fn main() -> glib::ExitCode {
         )
         .init();
 
+    if let Err(error) = diorama::i18n::init() {
+        tracing::warn!(%error, "Could not initialize translations");
+    }
+
     let application = diorama::application::build();
     application.run()
 }

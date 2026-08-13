@@ -7,18 +7,21 @@ project(
 )
 
 gnome = import('gnome')
+i18n = import('i18n')
 cargo_script = find_program('build-aux/cargo-build.sh')
 
 diorama = custom_target(
   'diorama',
   output: 'diorama',
   command: [cargo_script, meson.project_source_root(), '@OUTPUT@', get_option('buildtype')],
+  build_always_stale: true,
   build_by_default: true,
   install: true,
   install_dir: get_option('bindir'),
 )
 
 subdir('data')
+subdir('po')
 
 gnome.post_install(glib_compile_schemas: true)
 
