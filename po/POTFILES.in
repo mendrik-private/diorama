@@ -1,0 +1,5 @@
+data/io.github.mendrik.Diorama.desktop.in
+data/io.github.mendrik.Diorama.metainfo.xml.in
+src/application.rs
+src/canvas/mod.rs
+src/window/mod.rs

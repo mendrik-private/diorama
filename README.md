@@ -58,8 +58,8 @@ editing and comparison tools.
   dimensions copied to the clipboard.
 - A color picker that updates the pencil color and copies Hex, RGB(A), OKLab, or
   HSL values.
-- Rectangular Select and Copy, plus click-to-select object detection with an
-  automatically downloaded prompt-free segmentation model on first use.
+- Rectangular Select and Copy, plus click-to-select SAM 2 segmentation with a
+  locally cached 156 MB Apache-2.0 model downloaded on first use.
 
 ### Non-destructive editing
 
@@ -115,6 +115,13 @@ The bundle uses the GNOME 50 runtime. Flatpak will offer to install the runtime
 from Flathub if it is not already available.
 
 ## Build from source
+
+Run the regular test suite with `cargo test`. Graphical GTK tests must each run in
+their own process because GTK initialization is bound to one thread:
+
+```sh
+build-aux/run-graphical-tests.sh
+```
 
 The Flatpak build is the recommended development environment because it provides
 the expected GNOME SDK and Rust toolchain:
@@ -184,4 +191,4 @@ workflow.
 
 ## License
 
-Diorama is available under the [MIT License](LICENSE).
+Diorama is available under the [GNU General Public License v3.0](LICENSE).

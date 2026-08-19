@@ -2,35 +2,39 @@ use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use adw::prelude::{AdwDialogExt, AlertDialogExt, ComboRowExt, PreferencesGroupExt};
+use adw::prelude::{
+    ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
+    ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt,
+};
 use gio::prelude::*;
 use gtk::prelude::*;
 use libadwaita as adw;
-use object_detector::{DetectorType, ModelScale, ObjectDetector};
 use palette::FromColor as _;
 
+use crate::ai::ObjectDetector;
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
 use crate::document::{
     BrushPoint, CancellationToken, Document, Operation, Resampling, Rotation, Stroke, StrokePath,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
+use crate::i18n::gettext;
 use crate::image::{
     AnimationFrame, DecodeLimits, decode_animation, decode_headless, decode_memory, load_preview,
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
 use crate::settings::{ColorFormat, Settings, ZoomMode};
-
-static SCALE_SURFACE_STYLE_INSTALLED: Once = Once::new();
+use crate::tools::crop::CropBounds;
 
 #[derive(Clone)]
 pub struct ViewerWindow(Rc<WindowState>);
 
 struct HeaderWidgets {
     header: adw::HeaderBar,
+    save_as_button: gtk::Button,
     animation_controls: gtk::Box,
     animation_play_button: gtk::Button,
     scale_button: gtk::ToggleButton,
@@ -42,6 +46,7 @@ struct HeaderWidgets {
     color_button: gtk::ColorDialogButton,
     pencil_size: gtk::SpinButton,
     edit_button: gtk::ToggleButton,
+    pencil_controls: gtk::Box,
 }
 
 #[derive(Clone)]
@@ -90,6 +95,12 @@ struct ZoomRectDrag {
     load_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PencilZoomKey {
+    In,
+    Out,
+}
+
 struct PencilDrag {
     canvas: ImageCanvas,
     start_screen: (f64, f64),
@@ -106,6 +117,15 @@ enum PencilDragMode {
     Line,
     Rectangle,
     Circle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardTool {
+    Measure,
+    Select,
+    PickColor,
+    Crop,
+    Pencil,
 }
 
 fn pencil_drag_mode(modifiers: gtk::gdk::ModifierType) -> PencilDragMode {
@@ -299,6 +319,30 @@ fn pencil_can_activate(edit_active: bool, has_image: bool) -> bool {
     !edit_active && has_image
 }
 
+fn image_navigation_direction(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+    contextual_mode_active: bool,
+) -> Option<bool> {
+    if contextual_mode_active
+        || modifiers.intersects(
+            gtk::gdk::ModifierType::SHIFT_MASK
+                | gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK
+                | gtk::gdk::ModifierType::HYPER_MASK
+                | gtk::gdk::ModifierType::META_MASK,
+        )
+    {
+        return None;
+    }
+    match key {
+        gtk::gdk::Key::Left => Some(false),
+        gtk::gdk::Key::Right => Some(true),
+        _ => None,
+    }
+}
+
 fn files_equal(left: &Option<gio::File>, right: &Option<gio::File>) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => left.equal(right),
@@ -310,25 +354,6 @@ fn files_equal(left: &Option<gio::File>, right: &Option<gio::File>) -> bool {
 fn is_regular_file(file: &gio::File) -> bool {
     file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
         == gio::FileType::Regular
-}
-
-fn navigation_direction(key: gtk::gdk::Key) -> Option<bool> {
-    match key {
-        gtk::gdk::Key::Left | gtk::gdk::Key::Page_Up => Some(false),
-        gtk::gdk::Key::Right | gtk::gdk::Key::Page_Down => Some(true),
-        _ => None,
-    }
-}
-
-fn has_shortcut_modifier(modifiers: gtk::gdk::ModifierType) -> bool {
-    modifiers.intersects(
-        gtk::gdk::ModifierType::SHIFT_MASK
-            | gtk::gdk::ModifierType::CONTROL_MASK
-            | gtk::gdk::ModifierType::ALT_MASK
-            | gtk::gdk::ModifierType::SUPER_MASK
-            | gtk::gdk::ModifierType::HYPER_MASK
-            | gtk::gdk::ModifierType::META_MASK,
-    )
 }
 
 fn is_directory(file: &gio::File) -> bool {
@@ -438,8 +463,36 @@ fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64>
     )
 }
 
+fn pencil_zoom_key(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+    pencil_active: bool,
+) -> Option<PencilZoomKey> {
+    if !pencil_active
+        || modifiers.intersects(
+            gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK
+                | gtk::gdk::ModifierType::HYPER_MASK
+                | gtk::gdk::ModifierType::META_MASK,
+        )
+    {
+        return None;
+    }
+    match key {
+        gtk::gdk::Key::plus | gtk::gdk::Key::equal | gtk::gdk::Key::KP_Add => {
+            Some(PencilZoomKey::In)
+        }
+        gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => Some(PencilZoomKey::Out),
+        _ => None,
+    }
+}
+
 fn no_tool_active(active_tools: &[bool]) -> bool {
     !active_tools.iter().any(|active| *active)
+}
+
+fn is_click(start: (f64, f64), end: (f64, f64)) -> bool {
+    (end.0 - start.0).hypot(end.1 - start.1) <= 4.0
 }
 
 fn measurement_clipboard_text(measurement: CropOverlay) -> String {
@@ -524,6 +577,22 @@ fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32
         .margin_start(8)
         .margin_end(8)
         .build()
+}
+
+fn image_property_row(title: &str, value: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).build();
+    let value_label = gtk::Label::builder()
+        .label(value)
+        .tooltip_text(value)
+        .selectable(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(48)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    value_label.add_css_class("dim-label");
+    row.add_suffix(&value_label);
+    row
 }
 
 fn relative_modified_time(modified: SystemTime, now: SystemTime) -> String {
@@ -666,6 +735,9 @@ struct WindowState {
     canvas: ImageCanvas,
     scrolled: gtk::ScrolledWindow,
     canvas_overlay: gtk::Overlay,
+    content_stack: gtk::Stack,
+    error_page: adw::StatusPage,
+    view_only_banner: adw::Banner,
     title: adw::WindowTitle,
     toasts: adw::ToastOverlay,
     settings: Settings,
@@ -689,17 +761,25 @@ struct WindowState {
     pencil_path: Cell<StrokePath>,
     pencil_drag: RefCell<Option<PencilDrag>>,
     pencil_line_anchor: Cell<Option<BrushPoint>>,
+    keyboard_tool_cursor: Cell<Option<(u32, u32)>>,
+    keyboard_tool_anchor: Cell<Option<(u32, u32)>>,
     pencil_color: Cell<[u8; 4]>,
     pencil_antialiasing: Cell<bool>,
     pencil_size: gtk::SpinButton,
+    pencil_controls: gtk::Box,
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
     zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
+    zoom_rect_selection: Cell<Option<CropOverlay>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     color_picker_button: gtk::ToggleButton,
-    object_detector: Arc<Mutex<Option<ObjectDetector>>>,
+    sam2: Arc<Mutex<Option<ObjectDetector>>>,
     object_detection_running: Cell<bool>,
+    object_detection_progress: gtk::Box,
+    object_detection_progress_label: gtk::Label,
+    object_detection_progress_bar: gtk::ProgressBar,
+    object_detection_progress_generation: Cell<u64>,
     mask_flash_generation: Cell<u64>,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
@@ -839,12 +919,12 @@ impl ViewerWindow {
         zoom_controls.append(&button("zoom-out-symbolic", "Zoom Out", "win.zoom-out"));
         let zoom_label = gtk::MenuButton::builder()
             .label("100%")
-            .tooltip_text("Zoom presets (0: Fit; 1–9: 100%–900%)")
+            .tooltip_text(gettext("Zoom presets (0: Fit; 1–9: 100%–900%)"))
             .build();
         zoom_label.set_margin_start(8);
         zoom_label.set_margin_end(8);
         let zoom_menu = gio::Menu::new();
-        zoom_menu.append(Some("Fit to Window (0)"), Some("win.fit"));
+        zoom_menu.append(Some(&gettext("Fit to Window (0)")), Some("win.fit"));
         zoom_menu.append(Some("25%"), Some("win.zoom-25"));
         zoom_menu.append(Some("50%"), Some("win.zoom-50"));
         zoom_menu.append(Some("75%"), Some("win.zoom-75"));
@@ -878,18 +958,6 @@ impl ViewerWindow {
         scale_controls.set_margin_bottom(26);
         let scale_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
         scale_surface.add_css_class("osd");
-        scale_surface.add_css_class("diorama-scale-surface");
-        SCALE_SURFACE_STYLE_INSTALLED.call_once(|| {
-            let provider = gtk::CssProvider::new();
-            provider.load_from_bytes(&glib::Bytes::from_static(
-                b".diorama-scale-surface { background-color: rgba(0, 0, 0, 0.5); }",
-            ));
-            gtk::style_context_add_provider_for_display(
-                &scale_surface.display(),
-                &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        });
         scale_surface.set_hexpand(true);
         let scale_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         scale_content.set_margin_start(12);
@@ -904,34 +972,38 @@ impl ViewerWindow {
         scale_control_row.set_hexpand(true);
         let scale_width = spin(1.0, 2.0, 1.0);
         scale_width.set_width_chars(6);
-        scale_width.set_tooltip_text(Some("Output width in pixels"));
+        scale_width.set_tooltip_text(Some(&gettext("Output width in pixels")));
         let scale_height = spin(1.0, 2.0, 1.0);
         scale_height.set_width_chars(6);
-        scale_height.set_tooltip_text(Some("Output height in pixels"));
+        scale_height.set_tooltip_text(Some(&gettext("Output height in pixels")));
         let scale_lock = gtk::ToggleButton::builder()
-            .label("Aspect")
-            .tooltip_text("Lock the source aspect ratio")
+            .label(gettext("Aspect"))
+            .tooltip_text(gettext("Lock the source aspect ratio"))
             .active(true)
             .build();
-        let scale_unit = gtk::DropDown::from_strings(&["Pixels", "Percent"]);
-        scale_unit.set_tooltip_text(Some("Slider unit"));
-        let scale_algorithm_label = gtk::Label::new(Some(&format!(
-            "{} · Properties",
-            resampling_label(scale_resampling)
-        )));
+        let scale_units = [gettext("Pixels"), gettext("Percent")];
+        let scale_unit = gtk::DropDown::from_strings(
+            &scale_units.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        scale_unit.set_tooltip_text(Some(&gettext("Slider unit")));
+        let scale_algorithm_label = gtk::Label::new(Some(
+            &gettext("{method} · Properties")
+                .replace("{method}", &gettext(resampling_label(scale_resampling))),
+        ));
         scale_algorithm_label.add_css_class("dim-label");
-        scale_algorithm_label.set_tooltip_text(Some("Scaling method from Properties"));
-        let scale_original_button = gtk::Button::with_label("Hold Original");
-        scale_original_button
-            .set_tooltip_text(Some("Press and hold to show the unscaled source image"));
+        scale_algorithm_label.set_tooltip_text(Some(&gettext("Scaling method from Properties")));
+        let scale_original_button = gtk::Button::with_label(&gettext("Hold Original"));
+        scale_original_button.set_tooltip_text(Some(&gettext(
+            "Press and hold to show the unscaled source image",
+        )));
         let scale_actual_button = gtk::Button::builder()
-            .label("Actual Pixels")
-            .tooltip_text("Show each scaled output pixel at its actual size")
+            .label(gettext("Actual Pixels"))
+            .tooltip_text(gettext("Show each scaled output pixel at its actual size"))
             .action_name("win.scale-actual-size")
             .build();
         let scale_fit_button = gtk::Button::builder()
-            .label("Fit Preview")
-            .tooltip_text("Fit the complete scaled preview in the window")
+            .label(gettext("Fit Preview"))
+            .tooltip_text(gettext("Fit the complete scaled preview in the window"))
             .action_name("win.scale-fit")
             .build();
         let scale_dimensions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -965,11 +1037,11 @@ impl ViewerWindow {
         let scale_value_label = gtk::Label::new(Some("1 × 1 → 1 × 1 (100%)"));
         let scale_spinner = adw::Spinner::new();
         scale_spinner.set_visible(false);
-        scale_spinner.set_tooltip_text(Some("Generating scale preview"));
+        scale_spinner.set_tooltip_text(Some(&gettext("Generating scale preview")));
         let scale_slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 2.0, 1.0);
         scale_slider.set_hexpand(true);
         scale_slider.set_draw_value(false);
-        scale_slider.set_tooltip_text(Some("Scaled width in pixels"));
+        scale_slider.set_tooltip_text(Some(&gettext("Scaled width in pixels")));
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
         scale_slider_row.append(&scale_slider);
@@ -984,31 +1056,125 @@ impl ViewerWindow {
         minimap.set_valign(gtk::Align::Start);
         minimap.set_margin_start(20);
         minimap.set_margin_top(20);
-        minimap.set_tooltip_text(Some("Image overview — click to pan"));
+        minimap.set_tooltip_text(Some(&gettext("Image overview — click to pan")));
         minimap.set_visible(false);
         canvas_overlay.add_overlay(&minimap);
+        let object_detection_progress = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        object_detection_progress.set_halign(gtk::Align::Center);
+        object_detection_progress.set_valign(gtk::Align::End);
+        object_detection_progress.set_margin_bottom(24);
+        object_detection_progress.set_width_request(280);
+        object_detection_progress.add_css_class("osd");
+        let object_detection_progress_label = gtk::Label::new(Some(&gettext("Segmenting object…")));
+        object_detection_progress_label.set_wrap(true);
+        let object_detection_progress_bar = gtk::ProgressBar::new();
+        object_detection_progress_bar.set_show_text(false);
+        object_detection_progress.append(&object_detection_progress_label);
+        object_detection_progress.append(&object_detection_progress_bar);
+        object_detection_progress.set_visible(false);
+        canvas_overlay.add_overlay(&object_detection_progress);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&canvas_overlay));
 
+        let open_button = gtk::Button::builder()
+            .label(gettext("Open Image"))
+            .action_name("win.open")
+            .halign(gtk::Align::Center)
+            .build();
+        open_button.add_css_class("suggested-action");
+        open_button.add_css_class("pill");
+        let empty_page = adw::StatusPage::builder()
+            .icon_name("image-x-generic-symbolic")
+            .title(gettext("Open an Image"))
+            .description(gettext("Choose an image to view, compare, or edit."))
+            .child(&open_button)
+            .build();
+        let loading_spinner = adw::Spinner::new();
+        loading_spinner.set_halign(gtk::Align::Center);
+        let loading_page = adw::StatusPage::builder()
+            .title(gettext("Loading Image"))
+            .description(gettext("Preparing the image for viewing."))
+            .child(&loading_spinner)
+            .build();
+        let retry_button = gtk::Button::builder()
+            .label(gettext("Open Another Image"))
+            .action_name("win.open")
+            .halign(gtk::Align::Center)
+            .build();
+        retry_button.add_css_class("suggested-action");
+        retry_button.add_css_class("pill");
+        let error_page = adw::StatusPage::builder()
+            .icon_name("dialog-error-symbolic")
+            .title(gettext("Could Not Open Image"))
+            .description(gettext("The image could not be loaded."))
+            .child(&retry_button)
+            .build();
+        let content_stack = gtk::Stack::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        content_stack.add_named(&empty_page, Some("empty"));
+        content_stack.add_named(&loading_page, Some("loading"));
+        content_stack.add_named(&error_page, Some("error"));
+        content_stack.add_named(&toasts, Some("viewer"));
+        content_stack.set_visible_child_name("empty");
+
         let title = adw::WindowTitle::builder()
             .title("Diorama")
-            .subtitle("Open an image to begin")
+            .subtitle(gettext("Open an image to begin"))
             .build();
         let header_widgets = build_header(&title);
         header_widgets
             .pencil_size
             .set_value(f64::from(settings.pencil_size()));
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&header_widgets.header);
-        content.append(&toasts);
+        header_widgets.pencil_controls.set_visible(false);
+        header_widgets.pencil_controls.set_halign(gtk::Align::Start);
+        header_widgets.pencil_controls.set_valign(gtk::Align::End);
+        header_widgets.pencil_controls.set_margin_start(26);
+        header_widgets.pencil_controls.set_margin_bottom(26);
+        canvas_overlay.add_overlay(&header_widgets.pencil_controls);
+        let view_only_banner = adw::Banner::builder()
+            .title(gettext(
+                "This image can be viewed, but its decoder does not support editing.",
+            ))
+            .revealed(false)
+            .build();
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_widgets.header);
+        toolbar_view.add_top_bar(&view_only_banner);
+        toolbar_view.set_content(Some(&content_stack));
         let (width, height) = settings.window_size();
         let window = adw::ApplicationWindow::builder()
             .application(application)
             .title("Diorama")
             .default_width(width)
             .default_height(height)
-            .content(&content)
+            .content(&toolbar_view)
             .build();
+        let compact = adw::Breakpoint::new(adw::BreakpointCondition::new_or(
+            adw::BreakpointCondition::parse("max-width: 500px")
+                .expect("valid narrow-window breakpoint"),
+            adw::BreakpointCondition::parse("max-height: 400px")
+                .expect("valid short-window breakpoint"),
+        ));
+        compact.add_setter(
+            &header_widgets.save_as_button,
+            "visible",
+            Some(&false.to_value()),
+        );
+        compact.add_setter(&title, "subtitle", Some(&"".to_value()));
+        compact.add_setter(
+            &empty_page,
+            "icon-name",
+            Some(&Option::<String>::None.to_value()),
+        );
+        compact.add_setter(
+            &error_page,
+            "icon-name",
+            Some(&Option::<String>::None.to_value()),
+        );
+        window.add_breakpoint(compact);
         if settings.maximized() {
             window.maximize();
         }
@@ -1022,6 +1188,9 @@ impl ViewerWindow {
             canvas,
             scrolled,
             canvas_overlay,
+            content_stack,
+            error_page,
+            view_only_banner,
             title,
             toasts,
             settings,
@@ -1045,17 +1214,25 @@ impl ViewerWindow {
             pencil_path: Cell::new(StrokePath::Smooth),
             pencil_drag: RefCell::new(None),
             pencil_line_anchor: Cell::new(None),
+            keyboard_tool_cursor: Cell::new(None),
+            keyboard_tool_anchor: Cell::new(None),
             pencil_color: Cell::new([0, 0, 0, 255]),
             pencil_antialiasing: Cell::new(pencil_antialiasing),
             pencil_size: header_widgets.pencil_size,
+            pencil_controls: header_widgets.pencil_controls,
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
             zoom_rect_drag: Cell::new(None),
+            zoom_rect_selection: Cell::new(None),
             selection_button: header_widgets.selection_button,
             selection_drag: Cell::new(None),
             color_picker_button: header_widgets.color_picker_button,
-            object_detector: Arc::new(Mutex::new(None)),
+            sam2: Arc::new(Mutex::new(None)),
             object_detection_running: Cell::new(false),
+            object_detection_progress,
+            object_detection_progress_label,
+            object_detection_progress_bar,
+            object_detection_progress_generation: Cell::new(0),
             mask_flash_generation: Cell::new(0),
             pencil_button: header_widgets.pencil_button,
             lens_button: header_widgets.lens_button,
@@ -1136,6 +1313,7 @@ impl ViewerWindow {
             deletion_running: Cell::new(false),
         }));
         this.install_actions();
+        this.update_action_states();
         this.install_navigation_keys();
         this.install_tool_controls();
         this.install_scale_controls();
@@ -1287,7 +1465,10 @@ impl ViewerWindow {
             || file.uri().to_string(),
             |name| name.to_string_lossy().into_owned(),
         ));
-        self.0.title.set_subtitle("Loading…");
+        self.0.title.set_subtitle(&gettext("Loading…"));
+        self.0.view_only_banner.set_revealed(false);
+        self.0.content_stack.set_visible_child_name("loading");
+        self.update_action_states();
 
         let decode = file.path().map(|path| {
             gio::spawn_blocking(move || decode_headless(&path, DecodeLimits::default()))
@@ -1311,6 +1492,8 @@ impl ViewerWindow {
                 Ok(preview) => {
                     state.subtitle_ready.set(true);
                     state.canvas.set_texture(Some(&preview.texture));
+                    state.content_stack.set_visible_child_name("viewer");
+                    ViewerWindow(state.clone()).update_action_states();
                     if let Some(fill) = fit_on_load {
                         ViewerWindow(state.clone()).fit(fill);
                     }
@@ -1332,9 +1515,9 @@ impl ViewerWindow {
                             Err(error) => {
                                 tracing::warn!(%error, "Could not read GIO-backed image for editing");
                                 ViewerWindow(state.clone()).finish_editable_decode(false);
-                                state.toasts.add_toast(adw::Toast::new(
+                                state.toasts.add_toast(adw::Toast::new(&gettext(
                                     "This image can be viewed but could not be read for editing",
-                                ));
+                                )));
                                 return;
                             }
                         }
@@ -1354,16 +1537,13 @@ impl ViewerWindow {
                         }
                         Ok(Err(error)) => {
                             tracing::warn!(%error, "Editable decode unavailable");
-                            state.toasts.add_toast(adw::Toast::new(
-                                "This image can be viewed but its decoder does not support editing",
-                            ));
                             false
                         }
                         Err(_) => {
                             tracing::warn!("Editable decode worker panicked");
-                            state
-                                .toasts
-                                .add_toast(adw::Toast::new("Could not prepare image for editing"));
+                            state.toasts.add_toast(adw::Toast::new(&gettext(
+                                "Could not prepare image for editing",
+                            )));
                             false
                         }
                     };
@@ -1376,8 +1556,13 @@ impl ViewerWindow {
                 Err(error) => {
                     ViewerWindow(state.clone()).finish_editable_decode(false);
                     state.pending_comparison.borrow_mut().take();
-                    state.title.set_subtitle("Could not open image");
-                    state.toasts.add_toast(adw::Toast::new(&error.to_string()));
+                    state.title.set_subtitle(&gettext("Could not open image"));
+                    state.error_page.set_description(Some(&gettext(
+                        "Check that the file is a supported image and try again.",
+                    )));
+                    state.content_stack.set_visible_child_name("error");
+                    tracing::warn!(%error, "Could not open image");
+                    ViewerWindow(state).update_action_states();
                 }
             }
         });
@@ -1387,7 +1572,9 @@ impl ViewerWindow {
         self.add_action("open", {
             let this = self.clone();
             move || {
-                let mut builder = gtk::FileDialog::builder().title("Open Image").modal(true);
+                let mut builder = gtk::FileDialog::builder()
+                    .title(gettext("Open Image"))
+                    .modal(true);
                 if let Some(folder) = this.preferred_initial_folder() {
                     builder = builder.initial_folder(&folder);
                 }
@@ -1411,7 +1598,7 @@ impl ViewerWindow {
         });
         self.add_action("copy-image", {
             let this = self.clone();
-            move || this.copy_current_image_to_clipboard()
+            move || this.copy_current_selection_or_image_to_clipboard()
         });
         self.add_action("zoom-in", {
             let this = self.clone();
@@ -1535,6 +1722,7 @@ impl ViewerWindow {
                 if changed {
                     this.render_document();
                 }
+                this.update_action_states();
             }
         });
         self.add_action("redo", {
@@ -1549,6 +1737,7 @@ impl ViewerWindow {
                 if changed {
                     this.render_document();
                 }
+                this.update_action_states();
             }
         });
         self.add_action("rotate-clockwise", {
@@ -1643,10 +1832,20 @@ impl ViewerWindow {
                     .set_active(!this.0.pencil_button.is_active())
             }
         });
+        self.add_action("pick-color", {
+            let this = self.clone();
+            move || {
+                this.0
+                    .color_picker_button
+                    .set_active(!this.0.color_picker_button.is_active())
+            }
+        });
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
-                if this.0.zoom_rect_drag.get().is_some() {
+                if this.0.zoom_rect_drag.get().is_some()
+                    || this.0.zoom_rect_selection.get().is_some()
+                {
                     this.cancel_zoom_rect_drag();
                     return;
                 }
@@ -1672,15 +1871,19 @@ impl ViewerWindow {
                 }
                 this.0.pencil_button.set_active(false);
                 this.0.pencil_points.borrow_mut().clear();
-                this.0.canvas.set_accessible_label("Image canvas");
+                this.0.canvas.set_accessible_label(&gettext("Image canvas"));
                 this.0
                     .toasts
-                    .add_toast(adw::Toast::new("Active tool cancelled"));
+                    .add_toast(adw::Toast::new(&gettext("Active tool cancelled")));
             }
+        });
+        self.add_action("properties", {
+            let this = self.clone();
+            move || this.show_properties()
         });
         self.add_action("preferences", {
             let this = self.clone();
-            move || this.show_properties()
+            move || this.show_preferences()
         });
         self.add_action("shortcuts", {
             let this = self.clone();
@@ -1693,7 +1896,7 @@ impl ViewerWindow {
                     .application_name("Diorama")
                     .application_icon(crate::APP_ID)
                     .version(env!("CARGO_PKG_VERSION"))
-                    .developer_name("Diorama contributors")
+                    .developer_name(gettext("Diorama contributors"))
                     .license_type(gtk::License::Gpl30)
                     .website("https://github.com/mendrik-private/diorama")
                     .issue_url("https://github.com/mendrik-private/diorama/issues")
@@ -1720,12 +1923,32 @@ impl ViewerWindow {
     }
 
     fn install_navigation_keys(&self) {
+        let pencil_zoom = gtk::EventControllerKey::new();
+        pencil_zoom.set_propagation_phase(gtk::PropagationPhase::Capture);
+        pencil_zoom.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| {
+                let Some(direction) = pencil_zoom_key(key, modifiers, this.0.pencil_active.get())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                this.step_zoom(direction == PencilZoomKey::In);
+                glib::Propagation::Stop
+            }
+        });
+        self.0.window.add_controller(pencil_zoom);
+
         let keys = gtk::EventControllerKey::new();
-        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
-                if has_shortcut_modifier(modifiers) {
+                if modifiers.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK
+                        | gtk::gdk::ModifierType::HYPER_MASK
+                        | gtk::gdk::ModifierType::META_MASK,
+                ) {
                     return glib::Propagation::Proceed;
                 }
                 if this.0.scale_button.is_active()
@@ -1734,12 +1957,38 @@ impl ViewerWindow {
                     this.confirm_scale_preview();
                     return glib::Propagation::Stop;
                 }
-                if let Some(forward) = navigation_direction(key) {
-                    this.navigate(forward);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+                if matches!(
+                    key,
+                    gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
+                ) && this.zoom_selected_rect()
+                {
+                    return glib::Propagation::Stop;
                 }
+                if this.active_keyboard_tool().is_some() {
+                    let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                        10
+                    } else {
+                        1
+                    };
+                    let moved = match key {
+                        gtk::gdk::Key::Left => this.move_keyboard_tool_cursor(-step, 0),
+                        gtk::gdk::Key::Right => this.move_keyboard_tool_cursor(step, 0),
+                        gtk::gdk::Key::Up => this.move_keyboard_tool_cursor(0, -step),
+                        gtk::gdk::Key::Down => this.move_keyboard_tool_cursor(0, step),
+                        _ => false,
+                    };
+                    if moved {
+                        return glib::Propagation::Stop;
+                    }
+                    if matches!(
+                        key,
+                        gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
+                    ) {
+                        this.activate_keyboard_tool();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
             }
         });
         keys.connect_key_released({
@@ -1750,7 +1999,259 @@ impl ViewerWindow {
                 }
             }
         });
-        self.0.window.add_controller(keys);
+        self.0.canvas.add_controller(keys);
+
+        let navigation = gtk::EventControllerKey::new();
+        navigation.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| {
+                let contextual_mode_active =
+                    this.active_keyboard_tool().is_some() || this.0.scale_button.is_active();
+                let Some(forward) =
+                    image_navigation_direction(key, modifiers, contextual_mode_active)
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                this.navigate(forward);
+                glib::Propagation::Stop
+            }
+        });
+        self.0.window.add_controller(navigation);
+    }
+
+    fn active_keyboard_tool(&self) -> Option<KeyboardTool> {
+        if self.0.measurement_button.is_active() {
+            Some(KeyboardTool::Measure)
+        } else if self.0.selection_button.is_active() {
+            Some(KeyboardTool::Select)
+        } else if self.0.color_picker_button.is_active() {
+            Some(KeyboardTool::PickColor)
+        } else if self.0.edit_button.is_active() {
+            Some(KeyboardTool::Crop)
+        } else if self.0.pencil_button.is_active() {
+            Some(KeyboardTool::Pencil)
+        } else {
+            None
+        }
+    }
+
+    fn keyboard_tool_dimensions(&self, tool: KeyboardTool) -> Option<(u32, u32)> {
+        let image = self.0.rendered.borrow();
+        let (width, height) = image.as_ref().map(image::GenericImageView::dimensions)?;
+        Some(if tool == KeyboardTool::Measure {
+            (width, height)
+        } else {
+            (width.saturating_sub(1), height.saturating_sub(1))
+        })
+    }
+
+    fn prepare_keyboard_tool(&self, active: bool) {
+        self.0.keyboard_tool_cursor.set(None);
+        self.0.keyboard_tool_anchor.set(None);
+        self.0.canvas.set_marker(None);
+        self.0.canvas.set_measurement_cursor(None);
+        if !active {
+            return;
+        }
+        let Some(tool) = self.active_keyboard_tool() else {
+            return;
+        };
+        if self.keyboard_tool_dimensions(tool).is_none() {
+            return;
+        }
+        self.0.canvas.grab_focus();
+        self.0.canvas.announce(
+            &gettext(
+                "Use the arrow keys to move, Shift with an arrow to move faster, and Space or Enter to act.",
+            ),
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+    }
+
+    fn move_keyboard_tool_cursor(&self, dx: i32, dy: i32) -> bool {
+        let Some(tool) = self.active_keyboard_tool() else {
+            return false;
+        };
+        let Some((max_x, max_y)) = self.keyboard_tool_dimensions(tool) else {
+            return false;
+        };
+        let (x, y) = self
+            .0
+            .keyboard_tool_cursor
+            .get()
+            .unwrap_or((max_x / 2, max_y / 2));
+        let x = x.saturating_add_signed(dx).min(max_x);
+        let y = y.saturating_add_signed(dy).min(max_y);
+        self.0.keyboard_tool_cursor.set(Some((x, y)));
+        self.update_keyboard_tool_cursor(true);
+        true
+    }
+
+    fn update_keyboard_tool_cursor(&self, announce: bool) {
+        let Some(tool) = self.active_keyboard_tool() else {
+            return;
+        };
+        let Some((x, y)) = self.0.keyboard_tool_cursor.get() else {
+            return;
+        };
+        let Some(image) = self.0.rendered.borrow().as_ref().cloned() else {
+            return;
+        };
+        let (width, height) = image.dimensions();
+        if tool == KeyboardTool::Measure {
+            self.0.canvas.set_marker(None);
+            self.0.canvas.set_measurement_cursor(Some((
+                x as f32 / width.max(1) as f32,
+                y as f32 / height.max(1) as f32,
+            )));
+        } else {
+            self.0.canvas.set_measurement_cursor(None);
+            self.0.canvas.set_marker(Some((
+                (x as f32 + 0.5) / width.max(1) as f32,
+                (y as f32 + 0.5) / height.max(1) as f32,
+            )));
+        }
+        if let Some(start) = self.0.keyboard_tool_anchor.get() {
+            let dimensions = (width, height);
+            match tool {
+                KeyboardTool::Measure => {
+                    self.0
+                        .canvas
+                        .set_measurement_overlay(Some(measurement_overlay(MeasurementDrag {
+                            start,
+                            current: (x, y),
+                            start_screen: (0.0, 0.0),
+                            image_dimensions: dimensions,
+                        })));
+                }
+                KeyboardTool::Select | KeyboardTool::Crop => {
+                    self.0
+                        .canvas
+                        .set_crop_overlay(selection_overlay(SelectionDrag {
+                            start,
+                            current: (x, y),
+                            start_screen: (0.0, 0.0),
+                            image_dimensions: dimensions,
+                        }));
+                }
+                KeyboardTool::PickColor | KeyboardTool::Pencil => {}
+            }
+        }
+        if announce {
+            self.0.canvas.announce(
+                &gettext("Column {column}, row {row}")
+                    .replace("{column}", &(x + 1).to_string())
+                    .replace("{row}", &(y + 1).to_string()),
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+        }
+    }
+
+    fn activate_keyboard_tool(&self) {
+        let Some(tool) = self.active_keyboard_tool() else {
+            return;
+        };
+        let Some(image_dimensions) = self
+            .0
+            .rendered
+            .borrow()
+            .as_ref()
+            .map(image::GenericImageView::dimensions)
+        else {
+            return;
+        };
+        if tool == KeyboardTool::Crop && self.0.edit_crop.borrow().is_some() {
+            self.confirm_crop();
+            return;
+        }
+        let current = if let Some(current) = self.0.keyboard_tool_cursor.get() {
+            current
+        } else {
+            let Some((max_x, max_y)) = self.keyboard_tool_dimensions(tool) else {
+                return;
+            };
+            let current = (max_x / 2, max_y / 2);
+            self.0.keyboard_tool_cursor.set(Some(current));
+            current
+        };
+        self.update_keyboard_tool_cursor(false);
+        match tool {
+            KeyboardTool::PickColor => {
+                if let Some(color) = self
+                    .0
+                    .rendered
+                    .borrow()
+                    .as_ref()
+                    .and_then(|image| crate::tools::pencil::sample(image, current.0, current.1))
+                {
+                    self.copy_color_to_clipboard(color);
+                }
+            }
+            KeyboardTool::Pencil => self.commit_pencil_stroke(
+                &[BrushPoint {
+                    x: current.0 as f32 + 0.5,
+                    y: current.1 as f32 + 0.5,
+                    pressure: 1.0,
+                }],
+                StrokePath::Smooth,
+            ),
+            KeyboardTool::Measure | KeyboardTool::Select | KeyboardTool::Crop => {
+                let Some(start) = self.0.keyboard_tool_anchor.replace(Some(current)) else {
+                    self.0.canvas.announce(
+                        &gettext(
+                            "Start point set. Move to the end point and press Space or Enter.",
+                        ),
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    );
+                    return;
+                };
+                self.0.keyboard_tool_anchor.set(None);
+                match tool {
+                    KeyboardTool::Measure => {
+                        let drag = MeasurementDrag {
+                            start,
+                            current,
+                            start_screen: (0.0, 0.0),
+                            image_dimensions,
+                        };
+                        let measurement = measurement_overlay(drag);
+                        self.0.canvas.set_measurement_overlay(Some(measurement));
+                        self.copy_measurement_to_clipboard(measurement);
+                    }
+                    KeyboardTool::Select => {
+                        self.0.canvas.set_crop_overlay(None);
+                        self.complete_selection(SelectionDrag {
+                            start,
+                            current,
+                            start_screen: (0.0, 0.0),
+                            image_dimensions,
+                        });
+                    }
+                    KeyboardTool::Crop => {
+                        let crop = selection_overlay(SelectionDrag {
+                            start,
+                            current,
+                            start_screen: (0.0, 0.0),
+                            image_dimensions,
+                        });
+                        self.0.edit_crop.replace(crop);
+                        self.0.canvas.set_crop_overlay(crop);
+                        self.0.crop_apply_button.set_sensitive(crop.is_some());
+                        if let Some(crop) = crop {
+                            self.0.canvas.announce(
+                                &gettext(
+                                    "Crop selected, {width} by {height} pixels. Press Enter to apply.",
+                                )
+                                .replace("{width}", &crop.width.to_string())
+                                .replace("{height}", &crop.height.to_string()),
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
+                    }
+                    KeyboardTool::PickColor | KeyboardTool::Pencil => unreachable!(),
+                }
+            }
+        }
     }
 
     fn add_action(&self, name: &str, callback: impl Fn() + 'static) {
@@ -1759,17 +2260,99 @@ impl ViewerWindow {
         self.0.window.add_action(&action);
     }
 
+    fn set_action_enabled(&self, name: &str, enabled: bool) {
+        if let Some(action) = self
+            .0
+            .window
+            .lookup_action(name)
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+        {
+            action.set_enabled(enabled);
+        }
+    }
+
+    fn update_action_states(&self) {
+        let has_image = self.0.canvas.texture().is_some();
+        let has_file = self.0.current_file.borrow().is_some();
+        let document = self.0.document.borrow();
+        let editable = document.is_some() && self.0.rendered.borrow().is_some();
+        let has_neighbors = self
+            .0
+            .sequence
+            .borrow()
+            .as_ref()
+            .is_some_and(|sequence| sequence.len() > 1);
+
+        for action in [
+            "copy-image",
+            "zoom-in",
+            "zoom-out",
+            "actual-size",
+            "zoom-25",
+            "zoom-50",
+            "zoom-75",
+            "zoom-100",
+            "zoom-200",
+            "zoom-300",
+            "zoom-400",
+            "zoom-500",
+            "zoom-600",
+            "zoom-700",
+            "zoom-800",
+            "zoom-900",
+            "fit",
+            "fill",
+            "toggle-filter",
+            "compare",
+            "lens",
+            "properties",
+        ] {
+            self.set_action_enabled(action, has_image);
+        }
+        self.set_action_enabled("open-with", has_file && has_image);
+        self.set_action_enabled("delete-file", has_file && has_image);
+        self.set_action_enabled("previous", has_image && has_neighbors);
+        self.set_action_enabled("next", has_image && has_neighbors);
+
+        for action in [
+            "save-as",
+            "rotate-clockwise",
+            "rotate-counterclockwise",
+            "flip-horizontal",
+            "flip-vertical",
+            "crop",
+            "measure",
+            "scale-preview",
+            "crop-content",
+            "scale",
+            "palette",
+            "pencil",
+            "pick-color",
+            "select-object",
+        ] {
+            self.set_action_enabled(action, editable);
+        }
+        self.set_action_enabled("save", document.as_ref().is_some_and(Document::is_dirty));
+        self.set_action_enabled("undo", document.as_ref().is_some_and(Document::can_undo));
+        self.set_action_enabled("redo", document.as_ref().is_some_and(Document::can_redo));
+        let has_animation = self.0.animation_frames.borrow().len() > 1;
+        self.set_action_enabled("play-pause", has_animation);
+        self.set_action_enabled("previous-frame", has_animation);
+        self.set_action_enabled("next-frame", has_animation);
+    }
+
     fn apply(&self, operation: Operation) {
         {
             let mut document = self.0.document.borrow_mut();
             let Some(document) = document.as_mut() else {
                 self.0
                     .toasts
-                    .add_toast(adw::Toast::new("Open an editable image first"));
+                    .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
                 return;
             };
             document.apply(operation);
         }
+        self.update_action_states();
         self.render_document();
     }
 
@@ -1858,6 +2441,10 @@ impl ViewerWindow {
 
     fn finish_editable_decode(&self, editable_available: bool) {
         self.0.editable_decode_pending.set(false);
+        self.0
+            .view_only_banner
+            .set_revealed(self.0.canvas.texture().is_some() && !editable_available);
+        self.update_action_states();
         if !self.0.pending_scale_activation.replace(false) {
             return;
         }
@@ -1883,13 +2470,13 @@ impl ViewerWindow {
                     self.0.pending_scale_activation.set(true);
                     self.0
                         .toasts
-                        .add_toast(adw::Toast::new("Preparing image for scaling…"));
+                        .add_toast(adw::Toast::new(&gettext("Preparing image for scaling…")));
                     return;
                 }
                 self.0.scale_button.set_active(false);
                 self.0
                     .toasts
-                    .add_toast(adw::Toast::new("Open an editable image first"));
+                    .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
                 return;
             };
             self.0.pending_scale_activation.set(false);
@@ -1964,10 +2551,12 @@ impl ViewerWindow {
         self.0
             .scale_height
             .set_range(1.0, f64::from(source_height.saturating_mul(factor)));
-        self.0.scale_algorithm_label.set_label(&format!(
-            "{} · Properties",
-            resampling_label(self.0.scale_resampling.get())
-        ));
+        self.0
+            .scale_algorithm_label
+            .set_label(&gettext("{method} · Properties").replace(
+                "{method}",
+                &gettext(resampling_label(self.0.scale_resampling.get())),
+            ));
     }
 
     fn scale_dimension_changed(&self, width_changed: bool) {
@@ -2043,7 +2632,7 @@ impl ViewerWindow {
                 self.0.scale_slider.set_value(f64::from(width));
                 self.0
                     .scale_slider
-                    .set_tooltip_text(Some("Output width in pixels"));
+                    .set_tooltip_text(Some(&gettext("Output width in pixels")));
             }
             ScaleUnit::Percent => {
                 let maximum = if self.0.scale_resampling.get() == Resampling::SeamCarving {
@@ -2055,7 +2644,7 @@ impl ViewerWindow {
                 self.0.scale_slider.set_value(percent.clamp(1.0, maximum));
                 self.0
                     .scale_slider
-                    .set_tooltip_text(Some("Output size as a percentage"));
+                    .set_tooltip_text(Some(&gettext("Output size as a percentage")));
             }
         }
         self.0.scale_updating_controls.set(false);
@@ -2074,10 +2663,12 @@ impl ViewerWindow {
     }
 
     fn refresh_scale_method(&self) {
-        self.0.scale_algorithm_label.set_label(&format!(
-            "{} · Properties",
-            resampling_label(self.0.scale_resampling.get())
-        ));
+        self.0
+            .scale_algorithm_label
+            .set_label(&gettext("{method} · Properties").replace(
+                "{method}",
+                &gettext(resampling_label(self.0.scale_resampling.get())),
+            ));
         let Some(source) = self.0.scale_source.borrow().clone() else {
             return;
         };
@@ -2146,7 +2737,7 @@ impl ViewerWindow {
                     Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                     Err(_) => state
                         .toasts
-                        .add_toast(adw::Toast::new("Scale preview worker failed")),
+                        .add_toast(adw::Toast::new(&gettext("Scale preview worker failed"))),
                 }
             });
         });
@@ -2246,15 +2837,15 @@ impl ViewerWindow {
         if resampling == Resampling::SeamCarving
             && (width > source.width() || height > source.height())
         {
-            self.0.toasts.add_toast(adw::Toast::new(
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
                 "Seam carving currently supports shrinking only",
-            ));
+            )));
             return;
         }
         if width > source.width() || height > source.height() {
-            self.0.toasts.add_toast(adw::Toast::new(
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
                 "Scaling up may reduce perceived image quality",
-            ));
+            )));
         }
         self.set_scale_original_visible(false);
         self.0.scale_committing.set(true);
@@ -2301,7 +2892,7 @@ impl ViewerWindow {
             if self.0.rendered.borrow().is_none() {
                 self.0
                     .toasts
-                    .add_toast(adw::Toast::new("Open an editable image first"));
+                    .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             }
             return;
         }
@@ -2309,11 +2900,13 @@ impl ViewerWindow {
             self.abort_pencil_drag();
         }
         self.0.pencil_active.set(active);
-        self.0.canvas.set_accessible_label(if active {
-            "Image canvas, Pencil tool active"
+        self.0.pencil_controls.set_visible(active);
+        self.0.canvas.set_accessible_label(&if active {
+            gettext("Image canvas, Pencil tool active")
         } else {
-            "Image canvas"
+            gettext("Image canvas")
         });
+        self.prepare_keyboard_tool(active);
     }
 
     fn set_color_picker_active(&self, active: bool) {
@@ -2321,7 +2914,7 @@ impl ViewerWindow {
             self.0.color_picker_button.set_active(false);
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
         if active {
@@ -2341,11 +2934,12 @@ impl ViewerWindow {
         if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
             canvas.set_cursor_from_name(cursor);
         }
-        self.0.canvas.set_accessible_label(if active {
-            "Image canvas, Color Picker tool active"
+        self.0.canvas.set_accessible_label(&if active {
+            gettext("Image canvas, Color Picker tool active")
         } else {
-            "Image canvas"
+            gettext("Image canvas")
         });
+        self.prepare_keyboard_tool(active);
     }
 
     fn apply_picked_color(&self, color: [u8; 4]) -> String {
@@ -2357,39 +2951,47 @@ impl ViewerWindow {
     fn copy_color_to_clipboard(&self, color: [u8; 4]) {
         let value = self.apply_picked_color(color);
         self.0.window.clipboard().set_text(&value);
-        self.0
-            .toasts
-            .add_toast(adw::Toast::new(&format!("Copied {value}")));
+        self.0.toasts.add_toast(adw::Toast::new(
+            &gettext("Copied {value}").replace("{value}", &value),
+        ));
     }
 
     fn copy_measurement_to_clipboard(&self, measurement: CropOverlay) {
         let text = measurement_clipboard_text(measurement);
         self.0.window.clipboard().set_text(&text);
-        self.0
-            .toasts
-            .add_toast(adw::Toast::new(&format!("Copied {text}")));
+        self.0.toasts.add_toast(adw::Toast::new(
+            &gettext("Copied {measurement}").replace("{measurement}", &text),
+        ));
     }
 
     fn copy_current_image_to_clipboard(&self) {
         let Some(texture) = self.0.canvas.texture() else {
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an image first")));
             return;
         };
         self.0.window.clipboard().set_texture(&texture);
-        self.0.toasts.add_toast(adw::Toast::new(&format!(
-            "Copied {} × {} image",
-            texture.width(),
-            texture.height()
-        )));
+        self.0.toasts.add_toast(adw::Toast::new(
+            &gettext("Copied {width} × {height} image")
+                .replace("{width}", &texture.width().to_string())
+                .replace("{height}", &texture.height().to_string()),
+        ));
+    }
+
+    fn copy_current_selection_or_image_to_clipboard(&self) {
+        if let Some(selection) = self.0.zoom_rect_selection.get() {
+            self.copy_zoom_rect_to_clipboard(selection);
+        } else {
+            self.copy_current_image_to_clipboard();
+        }
     }
 
     fn open_with(&self) {
         let Some(file) = self.0.current_file.borrow().clone() else {
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an image first")));
             return;
         };
         let launcher = open_with_launcher(&file);
@@ -2400,9 +3002,10 @@ impl ViewerWindow {
                 && !open_with_was_cancelled(&error)
                 && let Some(state) = weak.upgrade()
             {
-                state.toasts.add_toast(adw::Toast::new(&format!(
-                    "Could not open image with another app: {error}"
-                )));
+                state.toasts.add_toast(adw::Toast::new(
+                    &gettext("Could not open image with another app: {error}")
+                        .replace("{error}", &error.to_string()),
+                ));
             }
         });
     }
@@ -2412,7 +3015,7 @@ impl ViewerWindow {
             self.0.selection_button.set_active(false);
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
         if active {
@@ -2435,11 +3038,12 @@ impl ViewerWindow {
         self.0
             .canvas
             .set_cursor_from_name(active.then_some("crosshair"));
-        self.0.canvas.set_accessible_label(if active {
-            "Image canvas, Select and Copy tool active"
+        self.0.canvas.set_accessible_label(&if active {
+            gettext("Image canvas, Select and Copy tool active")
         } else {
-            "Image canvas"
+            gettext("Image canvas")
         });
+        self.prepare_keyboard_tool(active);
     }
 
     fn set_measurement_active(&self, active: bool) {
@@ -2447,7 +3051,7 @@ impl ViewerWindow {
             self.0.measurement_button.set_active(false);
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
         if active {
@@ -2469,11 +3073,12 @@ impl ViewerWindow {
             self.0.canvas.set_measurement_overlay(None);
         }
         self.0.canvas.set_cursor_from_name(active.then_some("none"));
-        self.0.canvas.set_accessible_label(if active {
-            "Image canvas, Measuring tool active"
+        self.0.canvas.set_accessible_label(&if active {
+            gettext("Image canvas, Measuring tool active")
         } else {
-            "Image canvas"
+            gettext("Image canvas")
         });
+        self.prepare_keyboard_tool(active);
     }
 
     fn complete_selection(&self, drag: SelectionDrag) {
@@ -2481,7 +3086,7 @@ impl ViewerWindow {
             let Some(image) = self.0.rendered.borrow().clone() else {
                 return;
             };
-            self.detect_and_copy_object(image, drag.start);
+            self.detect_and_select_object(image, drag.start);
             return;
         }
         let image = self.0.rendered.borrow();
@@ -2500,63 +3105,81 @@ impl ViewerWindow {
         match result {
             Ok((bounds, selected)) => self.copy_image_to_clipboard(
                 &selected,
-                &format!("Copied {} × {} selection", bounds.width, bounds.height),
+                &gettext("Copied {width} × {height} selection")
+                    .replace("{width}", &bounds.width.to_string())
+                    .replace("{height}", &bounds.height.to_string()),
             ),
             Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error.to_string())),
         }
     }
 
-    fn detect_and_copy_object(&self, image: image::RgbaImage, point: (u32, u32)) {
+    fn detect_and_select_object(&self, image: image::RgbaImage, point: (u32, u32)) {
         if self.0.object_detection_running.replace(true) {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Object detection is already running"));
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Object detection is already running",
+            )));
             return;
         }
-        let first_use = self
+        let detector_unloaded = self
             .0
-            .object_detector
+            .sam2
             .lock()
             .map_or(true, |detector| detector.is_none());
-        self.0.toasts.add_toast(adw::Toast::new(if first_use {
-            "Preparing object detector — first use downloads the Medium model"
+        let message = if detector_unloaded && !crate::ai::sam2_is_cached() {
+            gettext("Downloading SAM 2 Tiny (156 MB, Apache-2.0) — first use may take a while")
         } else {
-            "Detecting object…"
-        }));
-        let detector = Arc::clone(&self.0.object_detector);
+            gettext("Segmenting object…")
+        };
+        self.0.object_detection_progress_label.set_label(&message);
+        self.0.object_detection_progress_bar.set_fraction(0.0);
+        self.0.object_detection_progress.set_visible(true);
+        let progress_generation = self
+            .0
+            .object_detection_progress_generation
+            .get()
+            .wrapping_add(1);
+        self.0
+            .object_detection_progress_generation
+            .set(progress_generation);
+        let progress_weak = Rc::downgrade(&self.0);
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let Some(state) = progress_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !state.object_detection_running.get()
+                || state.object_detection_progress_generation.get() != progress_generation
+            {
+                return glib::ControlFlow::Break;
+            }
+            state.object_detection_progress_bar.pulse();
+            glib::ControlFlow::Continue
+        });
+        let sam2 = Arc::clone(&self.0.sam2);
         let generation = self.0.load_generation.get();
+        let render_generation = self.0.render_generation.get();
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || {
-                let mut detector = detector
+                let mut sam2 = sam2
                     .lock()
                     .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
-                if detector.is_none() {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
-                    let loaded = runtime
-                        .block_on(
-                            ObjectDetector::from_hf(DetectorType::PromptFree)
-                                .scale(ModelScale::Medium)
-                                .include_mask(true)
-                                .build(),
-                        )
-                        .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
-                    *detector = Some(loaded);
-                }
-                let detector = detector
-                    .as_ref()
-                    .ok_or(crate::error::AppError::AiModelUnavailable)?;
-                crate::ai::select_object_at(detector, image, point.0, point.1)
+                crate::ai::select_object_at(
+                    &mut sam2,
+                    image,
+                    point.0,
+                    point.1,
+                    (generation, render_generation),
+                )
             })
             .await;
             let Some(state) = weak.upgrade() else {
                 return;
             };
             state.object_detection_running.set(false);
-            if state.load_generation.get() != generation {
+            state.object_detection_progress.set_visible(false);
+            if state.load_generation.get() != generation
+                || state.render_generation.get() != render_generation
+            {
                 return;
             }
             let this = ViewerWindow(state.clone());
@@ -2565,22 +3188,21 @@ impl ViewerWindow {
                     this.flash_object_mask(&selected);
                     this.copy_image_to_clipboard(
                         &selected.image,
-                        &format!(
-                            "Copied {} object ({:.0}% confidence)",
-                            selected.tag,
-                            selected.score * 100.0
-                        ),
+                        &gettext("Copied {width} × {height} selection")
+                            .replace("{width}", &selected.bounds.width.to_string())
+                            .replace("{height}", &selected.bounds.height.to_string()),
                     );
                 }
-                Ok(Ok(None)) => state
-                    .toasts
-                    .add_toast(adw::Toast::new("No detected object contains that pixel")),
-                Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&format!(
-                    "Object detection failed: {error}"
+                Ok(Ok(None)) => state.toasts.add_toast(adw::Toast::new(&gettext(
+                    "No detected object contains that pixel",
                 ))),
+                Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(
+                    &gettext("Object detection failed: {error}")
+                        .replace("{error}", &error.to_string()),
+                )),
                 Err(_) => state
                     .toasts
-                    .add_toast(adw::Toast::new("Object detection worker failed")),
+                    .add_toast(adw::Toast::new(&gettext("Object detection worker failed"))),
             }
         });
     }
@@ -2614,7 +3236,7 @@ impl ViewerWindow {
             },
         );
         let weak = Rc::downgrade(&self.0);
-        glib::timeout_add_local_once(Duration::from_millis(350), move || {
+        glib::timeout_add_local_once(Duration::from_millis(1_200), move || {
             let Some(state) = weak.upgrade() else {
                 return;
             };
@@ -2851,6 +3473,9 @@ impl ViewerWindow {
     }
 
     fn set_edit_active(&self, active: bool) {
+        if !active {
+            self.prepare_keyboard_tool(false);
+        }
         if active {
             self.cancel_zoom_rect_drag();
             self.0.measurement_button.set_active(false);
@@ -2886,7 +3511,7 @@ impl ViewerWindow {
             self.0.edit_button.set_active(false);
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
         self.0.edit_crop.replace(None);
@@ -2894,6 +3519,7 @@ impl ViewerWindow {
         self.0.crop_apply_button.set_sensitive(false);
         self.0.canvas.set_cursor_from_name(Some("crosshair"));
         self.fit(false);
+        self.prepare_keyboard_tool(true);
     }
 
     fn confirm_crop(&self) {
@@ -2961,8 +3587,10 @@ impl ViewerWindow {
                                 .set_auto_background_from_image(&rendered.pixels);
                             state.canvas.set_texture(Some(&texture));
                             state.rendered.replace(Some(rendered.pixels));
-                            ViewerWindow(state.clone()).update_minimap();
-                            ViewerWindow(state.clone()).update_subtitle();
+                            let window = ViewerWindow(state.clone());
+                            window.update_minimap();
+                            window.update_subtitle();
+                            window.update_action_states();
                         }
                         Err(error) => state.toasts.add_toast(adw::Toast::new(&error)),
                     }
@@ -2971,7 +3599,7 @@ impl ViewerWindow {
                 Ok((_, Err(error))) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                 Err(_) => state
                     .toasts
-                    .add_toast(adw::Toast::new("Image processing worker failed")),
+                    .add_toast(adw::Toast::new(&gettext("Image processing worker failed"))),
             }
         });
     }
@@ -3033,7 +3661,7 @@ impl ViewerWindow {
         let Some(document) = self.0.document.borrow().clone() else {
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         };
         let current = self.0.current_file.borrow().clone();
@@ -3050,9 +3678,9 @@ impl ViewerWindow {
 
         if let Some(path) = direct_path {
             if self.source_changed(&path) {
-                self.0.toasts.add_toast(adw::Toast::new(
+                self.0.toasts.add_toast(adw::Toast::new(&gettext(
                     "The file changed externally; use Save As to avoid overwriting it",
-                ));
+                )));
                 return;
             }
             self.export_document(snapshot, path);
@@ -3060,7 +3688,7 @@ impl ViewerWindow {
         }
 
         let mut builder = gtk::FileDialog::builder()
-            .title("Save Image")
+            .title(gettext("Save Image"))
             .initial_name("image.png")
             .modal(true);
         if let Some(folder) = self.preferred_initial_folder() {
@@ -3074,9 +3702,9 @@ impl ViewerWindow {
                 if let Some(path) = file.path() {
                     this.show_export_options(snapshot, path);
                 } else {
-                    this.0.toasts.add_toast(adw::Toast::new(
+                    this.0.toasts.add_toast(adw::Toast::new(&gettext(
                         "This location does not support atomic export",
-                    ));
+                    )));
                 }
             }
         });
@@ -3084,9 +3712,9 @@ impl ViewerWindow {
 
     fn export_document(&self, snapshot: ExportSnapshot, path: PathBuf) {
         let Some(options) = export_options(&path, &self.0.settings) else {
-            self.0.toasts.add_toast(adw::Toast::new(
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
                 "Choose a file name ending in .png, .jpg, or .jpeg",
-            ));
+            )));
             return;
         };
         self.export_document_with_options(snapshot, path, options, false);
@@ -3094,18 +3722,18 @@ impl ViewerWindow {
 
     fn show_export_options(&self, snapshot: ExportSnapshot, path: PathBuf) {
         let Some(defaults) = export_options(&path, &self.0.settings) else {
-            self.0.toasts.add_toast(adw::Toast::new(
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
                 "Choose a file name ending in .png, .jpg, or .jpeg",
-            ));
+            )));
             return;
         };
         let dialog = adw::Dialog::builder()
-            .title("Export Options")
+            .title(gettext("Export Options"))
             .content_width(420)
             .build();
         let header = adw::HeaderBar::new();
-        let cancel = gtk::Button::with_label("Cancel");
-        let export = gtk::Button::with_label("Export");
+        let cancel = gtk::Button::with_label(&gettext("Cancel"));
+        let export = gtk::Button::with_label(&gettext("Export"));
         export.add_css_class("suggested-action");
         header.pack_start(&cancel);
         header.pack_end(&export);
@@ -3117,12 +3745,19 @@ impl ViewerWindow {
             .margin_start(18)
             .margin_end(18)
             .build();
-        let preserve =
-            gtk::CheckButton::with_label("Preserve compatible metadata and color profile");
+        let preserve = gtk::CheckButton::with_label(&gettext(
+            "Preserve compatible metadata and color profile",
+        ));
         preserve.set_active(self.0.settings.preserve_metadata());
         content.append(&preserve);
-        let jpeg_background = gtk::DropDown::from_strings(&["White", "Gray", "Black"]);
-        let convert_srgb = gtk::CheckButton::with_label("Convert color profile to sRGB");
+        let background_labels = [gettext("White"), gettext("Gray"), gettext("Black")];
+        let jpeg_background = gtk::DropDown::from_strings(
+            &background_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let convert_srgb = gtk::CheckButton::with_label(&gettext("Convert color profile to sRGB"));
         let control: gtk::Widget = match &defaults {
             ExportOptions::Png(options) => {
                 let compression =
@@ -3131,7 +3766,7 @@ impl ViewerWindow {
                 compression.set_digits(0);
                 compression.set_hexpand(true);
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                row.append(&gtk::Label::new(Some("Compression")));
+                row.append(&gtk::Label::new(Some(&gettext("Compression"))));
                 row.append(&compression);
                 content.append(&convert_srgb);
                 row.upcast()
@@ -3142,7 +3777,7 @@ impl ViewerWindow {
                 quality.set_digits(0);
                 quality.set_hexpand(true);
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                row.append(&gtk::Label::new(Some("Quality")));
+                row.append(&gtk::Label::new(Some(&gettext("Quality"))));
                 row.append(&quality);
                 jpeg_background.set_selected(match options.background {
                     [128, 128, 128] => 1,
@@ -3150,7 +3785,7 @@ impl ViewerWindow {
                     _ => 0,
                 });
                 let background_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                background_row.append(&gtk::Label::new(Some("Transparency background")));
+                background_row.append(&gtk::Label::new(Some(&gettext("Transparency background"))));
                 background_row.append(&jpeg_background);
                 content.append(&background_row);
                 row.upcast()
@@ -3158,9 +3793,9 @@ impl ViewerWindow {
         };
         content.append(&control);
         if matches!(defaults, ExportOptions::Jpeg(_)) {
-            content.append(&gtk::Label::new(Some(
+            content.append(&gtk::Label::new(Some(&gettext(
                 "Transparent pixels are composited onto the saved JPEG background.",
-            )));
+            ))));
         }
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         outer.append(&header);
@@ -3236,7 +3871,7 @@ impl ViewerWindow {
         } = snapshot;
         self.0.toasts.add_toast(
             adw::Toast::builder()
-                .title("Exporting image…")
+                .title(gettext("Exporting image…"))
                 .button_label("Cancel")
                 .action_name("win.cancel-export")
                 .build(),
@@ -3300,17 +3935,18 @@ impl ViewerWindow {
                         .borrow()
                         .as_ref()
                         .is_some_and(Document::is_dirty);
-                    state.toasts.add_toast(adw::Toast::new(if has_newer_edits {
-                        "Image exported; newer edits remain unsaved"
+                    let message = if has_newer_edits {
+                        gettext("Image exported; newer edits remain unsaved")
                     } else {
-                        "Image saved"
-                    }));
+                        gettext("Image saved")
+                    };
+                    state.toasts.add_toast(adw::Toast::new(&message));
                     ViewerWindow(state.clone()).update_title();
                 }
                 Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                 Err(_) => state
                     .toasts
-                    .add_toast(adw::Toast::new("Export worker failed")),
+                    .add_toast(adw::Toast::new(&gettext("Export worker failed"))),
             }
         });
     }
@@ -3329,7 +3965,7 @@ impl ViewerWindow {
         let Some(image) = self.0.rendered.borrow().clone() else {
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         };
         let weak = Rc::downgrade(&self.0);
@@ -3348,9 +3984,9 @@ impl ViewerWindow {
             let bounds = match result {
                 Ok(Ok(Some(bounds))) => bounds,
                 Ok(Ok(None)) => {
-                    state.toasts.add_toast(adw::Toast::new(
+                    state.toasts.add_toast(adw::Toast::new(&gettext(
                         "The background could not be identified with enough confidence",
-                    ));
+                    )));
                     return;
                 }
                 Ok(Err(error)) => {
@@ -3360,21 +3996,24 @@ impl ViewerWindow {
                 Err(_) => {
                     state
                         .toasts
-                        .add_toast(adw::Toast::new("Content detection worker failed"));
+                        .add_toast(adw::Toast::new(&gettext("Content detection worker failed")));
                     return;
                 }
             };
             let dialog = adw::AlertDialog::builder()
-                .heading("Crop to detected content?")
-                .body(format!(
-                    "Detected bounds: x {}, y {}, {} × {} pixels",
-                    bounds.x, bounds.y, bounds.width, bounds.height
-                ))
+                .heading(gettext("Crop to detected content?"))
+                .body(
+                    gettext("Detected bounds: x {x}, y {y}, {width} × {height} pixels")
+                        .replace("{x}", &bounds.x.to_string())
+                        .replace("{y}", &bounds.y.to_string())
+                        .replace("{width}", &bounds.width.to_string())
+                        .replace("{height}", &bounds.height.to_string()),
+                )
                 .close_response("cancel")
                 .default_response("apply")
                 .build();
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("apply", "Apply");
+            dialog.add_response("cancel", &gettext("Cancel"));
+            dialog.add_response("apply", &gettext("Apply"));
             dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
             let weak = Rc::downgrade(&state);
             dialog.connect_response(None, move |_, response| {
@@ -3398,16 +4037,16 @@ impl ViewerWindow {
         if self.0.rendered.borrow().is_none() {
             self.0
                 .toasts
-                .add_toast(adw::Toast::new("Open an editable image first"));
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
         let dialog = adw::Dialog::builder()
-            .title("Reduce Palette")
+            .title(gettext("Reduce Palette"))
             .content_width(420)
             .build();
         let header = adw::HeaderBar::new();
-        let cancel = gtk::Button::with_label("Cancel");
-        let apply = gtk::Button::with_label("Apply");
+        let cancel = gtk::Button::with_label(&gettext("Cancel"));
+        let apply = gtk::Button::with_label(&gettext("Apply"));
         apply.add_css_class("suggested-action");
         header.pack_start(&cancel);
         header.pack_end(&apply);
@@ -3430,11 +4069,12 @@ impl ViewerWindow {
             .bidirectional()
             .build();
         let count_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        count_row.append(&gtk::Label::new(Some("Colors")));
+        count_row.append(&gtk::Label::new(Some(&gettext("Colors"))));
         count_row.append(&colors);
         count_row.append(&count);
-        let dithering = gtk::CheckButton::with_label("Dithering");
-        let accents = gtk::CheckButton::with_label("Preserve accents and isolated colors");
+        let dithering = gtk::CheckButton::with_label(&gettext("Dithering"));
+        let accents =
+            gtk::CheckButton::with_label(&gettext("Preserve accents and isolated colors"));
         accents.set_active(true);
         content.append(&count_row);
         content.append(&dithering);
@@ -3463,38 +4103,41 @@ impl ViewerWindow {
         dialog.present(Some(&self.0.window));
     }
 
-    fn show_properties(&self) {
-        let dialog = adw::Dialog::builder()
-            .title("Properties")
-            .content_width(480)
-            .content_height(650)
+    fn show_preferences(&self) {
+        let dialog = adw::PreferencesDialog::builder()
+            .title(gettext("Preferences"))
+            .search_enabled(false)
             .build();
-        let header = adw::HeaderBar::new();
-        let done = gtk::Button::with_label("Done");
-        done.add_css_class("suggested-action");
-        header.pack_end(&done);
+        let page = adw::PreferencesPage::builder()
+            .title(gettext("Preferences"))
+            .build();
         let viewing_group = adw::PreferencesGroup::builder()
-            .title("Viewing")
-            .margin_top(18)
-            .margin_bottom(12)
-            .margin_start(18)
-            .margin_end(18)
+            .title(gettext("Viewing"))
             .build();
         let filter = adw::SwitchRow::builder()
-            .title("Hard zoom")
-            .subtitle("Keep pixel edges sharp with nearest-neighbor rendering")
+            .title(gettext("Hard zoom"))
+            .subtitle(gettext(
+                "Keep pixel edges sharp with nearest-neighbor rendering",
+            ))
             .active(self.0.canvas.filter() == ZoomFilter::Hard)
             .build();
         viewing_group.add(&filter);
+        let background_labels = [
+            gettext("Checkerboard"),
+            gettext("Auto"),
+            gettext("White"),
+            gettext("Gray"),
+            gettext("Black"),
+        ];
+        let background_model = gtk::StringList::new(
+            &background_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         let background = adw::ComboRow::builder()
-            .title("Transparency background")
-            .model(&gtk::StringList::new(&[
-                "Checkerboard",
-                "Auto",
-                "White",
-                "Gray",
-                "Black",
-            ]))
+            .title(gettext("Transparency background"))
+            .model(&background_model)
             .selected(match self.0.canvas.background() {
                 Background::Checkerboard => 0,
                 Background::Auto => 1,
@@ -3504,21 +4147,35 @@ impl ViewerWindow {
             })
             .build();
         viewing_group.add(&background);
+        let lens_size_labels = [gettext("Small"), gettext("Medium"), gettext("Large")];
+        let lens_size_model = gtk::StringList::new(
+            &lens_size_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         let lens_size = adw::ComboRow::builder()
-            .title("Lens size")
-            .subtitle("Diameter of the pixel-inspection lens")
-            .model(&gtk::StringList::new(&["Small", "Medium", "Large"]))
+            .title(gettext("Lens size"))
+            .subtitle(gettext("Diameter of the pixel-inspection lens"))
+            .model(&lens_size_model)
             .selected(lens_size_index(self.0.lens_diameter.get()))
             .build();
         viewing_group.add(&lens_size);
+        let resampling_labels = [
+            gettext("Nearest"),
+            gettext("Linear"),
+            gettext("Bicubic"),
+            gettext("Seam carving"),
+        ];
+        let resampling_model = gtk::StringList::new(
+            &resampling_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         let resampling = adw::ComboRow::builder()
-            .title("Scaling method")
-            .model(&gtk::StringList::new(&[
-                "Nearest",
-                "Linear",
-                "Bicubic",
-                "Seam carving",
-            ]))
+            .title(gettext("Scaling method"))
+            .model(&resampling_model)
             .selected(match self.0.scale_resampling.get() {
                 Resampling::Nearest => 0,
                 Resampling::Linear => 1,
@@ -3528,177 +4185,183 @@ impl ViewerWindow {
             .build();
         viewing_group.add(&resampling);
         let anti_aliasing = adw::SwitchRow::builder()
-            .title("Anti-aliasing")
-            .subtitle("Smooth the edges of pencil strokes and circles")
+            .title(gettext("Anti-aliasing"))
+            .subtitle(gettext("Smooth the edges of pencil strokes and circles"))
             .active(self.0.pencil_antialiasing.get())
             .build();
+        let color_format_labels = [
+            gettext("Hex"),
+            gettext("RGB(A)"),
+            gettext("OKLab"),
+            gettext("HSL"),
+        ];
+        let color_format_model = gtk::StringList::new(
+            &color_format_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         let color_format = adw::ComboRow::builder()
-            .title("Copied color format")
-            .subtitle("Format used by the Color Picker tool")
-            .model(&gtk::StringList::new(&["Hex", "RGB(A)", "OKLab", "HSL"]))
+            .title(gettext("Copied color format"))
+            .subtitle(gettext("Format used by the Color Picker tool"))
+            .model(&color_format_model)
             .selected(color_format_index(self.0.settings.color_picker_format()))
             .build();
         let drawing_group = adw::PreferencesGroup::builder()
-            .title("Drawing")
-            .margin_bottom(12)
-            .margin_start(18)
-            .margin_end(18)
+            .title(gettext("Drawing"))
             .build();
         drawing_group.add(&anti_aliasing);
         drawing_group.add(&color_format);
 
+        page.add(&viewing_group);
+        page.add(&drawing_group);
+        dialog.add(&page);
+
+        filter.connect_active_notify({
+            let this = self.clone();
+            move |row| {
+                let filter = if row.is_active() {
+                    ZoomFilter::Hard
+                } else {
+                    ZoomFilter::Soft
+                };
+                this.0.canvas.set_filter(filter);
+                if let Some(canvas) = this.0.compare_canvas.borrow().as_ref() {
+                    canvas.set_filter(filter);
+                }
+                this.0.settings.set_zoom_filter(filter);
+                this.realign_zoom();
+            }
+        });
+        background.connect_selected_notify({
+            let this = self.clone();
+            move |row| {
+                let background = match row.selected() {
+                    1 => Background::Auto,
+                    2 => Background::White,
+                    3 => Background::Gray,
+                    4 => Background::Black,
+                    _ => Background::Checkerboard,
+                };
+                this.0.canvas.set_background(background);
+                if let Some(canvas) = this.0.compare_canvas.borrow().as_ref() {
+                    canvas.set_background(background);
+                }
+                this.0.settings.set_background(background);
+            }
+        });
+        lens_size.connect_selected_notify({
+            let this = self.clone();
+            move |row| {
+                let diameter = match row.selected() {
+                    1 => 280.0,
+                    2 => 400.0,
+                    _ => 180.0,
+                };
+                this.0.lens_diameter.set(diameter);
+                this.0.settings.set_compare_lens_size(diameter);
+            }
+        });
+        resampling.connect_selected_notify({
+            let this = self.clone();
+            move |row| {
+                let resampling = match row.selected() {
+                    0 => Resampling::Nearest,
+                    1 => Resampling::Linear,
+                    3 => Resampling::SeamCarving,
+                    _ => Resampling::Bicubic,
+                };
+                this.0.scale_resampling.set(resampling);
+                this.0.settings.set_scale_resampling(resampling);
+                this.refresh_scale_method();
+            }
+        });
+        anti_aliasing.connect_active_notify({
+            let this = self.clone();
+            move |row| {
+                this.0.pencil_antialiasing.set(row.is_active());
+                this.0.settings.set_pencil_antialiasing(row.is_active());
+            }
+        });
+        color_format.connect_selected_notify({
+            let settings = self.0.settings.clone();
+            move |row| settings.set_color_picker_format(color_format_at(row.selected()))
+        });
+        dialog.present(Some(&self.0.window));
+    }
+
+    fn show_properties(&self) {
+        if self.0.canvas.texture().is_none() {
+            return;
+        }
+        let dialog = adw::PreferencesDialog::builder()
+            .title(gettext("Image Properties"))
+            .search_enabled(false)
+            .build();
+        let page = adw::PreferencesPage::builder()
+            .title(gettext("Image Properties"))
+            .build();
         let image_group = adw::PreferencesGroup::builder()
-            .title("Image")
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
+            .title(gettext("Image"))
             .build();
         let document = self.0.document.borrow().clone();
         let current_file = self.0.current_file.borrow().clone();
-        if document.is_none() && current_file.is_none() && self.0.canvas.texture().is_none() {
-            image_group.add(
-                &adw::ActionRow::builder()
-                    .title("No image open")
-                    .subtitle("Open an image to view its properties")
-                    .build(),
-            );
-        } else {
-            let dimensions = self
-                .0
-                .rendered
-                .borrow()
-                .as_ref()
-                .map(image::GenericImageView::dimensions)
-                .or_else(|| {
-                    self.0
-                        .canvas
-                        .texture()
-                        .map(|texture| (texture.width() as u32, texture.height() as u32))
-                })
-                .unwrap_or((0, 0));
-            let location = current_file.as_ref().map_or_else(
-                || {
-                    document
-                        .as_ref()
-                        .and_then(|document| document.source().path.as_ref())
-                        .map_or_else(
-                            || "Unavailable".to_owned(),
-                            |path| path.display().to_string(),
-                        )
-                },
-                |file| {
-                    file.path()
-                        .map_or_else(|| file.uri().to_string(), |path| path.display().to_string())
-                },
-            );
-            let metadata = document
-                .as_ref()
-                .map(|document| &document.source().metadata);
-            let format = metadata
-                .and_then(|metadata| metadata.mime_type.as_deref())
-                .unwrap_or("Unknown");
-            let metadata_summary = metadata.map_or_else(
-                || "EXIF: Unknown · XMP: Unknown · ICC profile: Unknown".to_owned(),
-                |metadata| {
-                    format!(
-                        "EXIF: {} · XMP: {} · ICC profile: {}",
-                        if metadata.exif.is_some() { "Yes" } else { "No" },
-                        if metadata.xmp.is_some() { "Yes" } else { "No" },
-                        if metadata.icc.is_some() { "Yes" } else { "No" },
+        let dimensions = self
+            .0
+            .rendered
+            .borrow()
+            .as_ref()
+            .map(image::GenericImageView::dimensions)
+            .or_else(|| {
+                self.0
+                    .canvas
+                    .texture()
+                    .map(|texture| (texture.width() as u32, texture.height() as u32))
+            })
+            .unwrap_or((0, 0));
+        let location = current_file.as_ref().map_or_else(
+            || {
+                document
+                    .as_ref()
+                    .and_then(|document| document.source().path.as_ref())
+                    .map_or_else(
+                        || "Unavailable".to_owned(),
+                        |path| path.display().to_string(),
                     )
-                },
-            );
-            image_group.add(
-                &adw::ActionRow::builder()
-                    .title("Dimensions")
-                    .subtitle(format!("{} × {}", dimensions.0, dimensions.1))
-                    .build(),
-            );
-            image_group.add(
-                &adw::ActionRow::builder()
-                    .title("Location")
-                    .subtitle(location)
-                    .subtitle_lines(2)
-                    .subtitle_selectable(true)
-                    .build(),
-            );
-            image_group.add(
-                &adw::ActionRow::builder()
-                    .title("Format")
-                    .subtitle(format)
-                    .build(),
-            );
-            image_group.add(
-                &adw::ActionRow::builder()
-                    .title("Metadata")
-                    .subtitle(metadata_summary)
-                    .build(),
-            );
+            },
+            |file| {
+                file.path()
+                    .map_or_else(|| file.uri().to_string(), |path| path.display().to_string())
+            },
+        );
+        let metadata = document
+            .as_ref()
+            .map(|document| &document.source().metadata);
+        let format = metadata
+            .and_then(|metadata| metadata.mime_type.as_deref())
+            .unwrap_or("Unknown");
+        let metadata_summary = metadata.map_or_else(
+            || "EXIF: Unknown · XMP: Unknown · ICC profile: Unknown".to_owned(),
+            |metadata| {
+                format!(
+                    "EXIF: {} · XMP: {} · ICC profile: {}",
+                    if metadata.exif.is_some() { "Yes" } else { "No" },
+                    if metadata.xmp.is_some() { "Yes" } else { "No" },
+                    if metadata.icc.is_some() { "Yes" } else { "No" },
+                )
+            },
+        );
+        let dimensions = format!("{} × {}", dimensions.0, dimensions.1);
+        for row in [
+            image_property_row(&gettext("Dimensions"), &dimensions),
+            image_property_row(&gettext("Location"), &location),
+            image_property_row(&gettext("Format"), format),
+            image_property_row(&gettext("Metadata"), &metadata_summary),
+        ] {
+            image_group.add(&row);
         }
-
-        let preferences = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        preferences.append(&viewing_group);
-        preferences.append(&drawing_group);
-        preferences.append(&image_group);
-        let scrolled = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .vexpand(true)
-            .child(&preferences)
-            .build();
-        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        outer.append(&header);
-        outer.append(&scrolled);
-        dialog.set_child(Some(&outer));
-        let this = self.clone();
-        let apply_dialog = dialog.clone();
-        done.connect_clicked(move |_| {
-            let zoom_filter = if filter.is_active() {
-                ZoomFilter::Hard
-            } else {
-                ZoomFilter::Soft
-            };
-            let background = match background.selected() {
-                1 => Background::Auto,
-                2 => Background::White,
-                3 => Background::Gray,
-                4 => Background::Black,
-                _ => Background::Checkerboard,
-            };
-            let lens_diameter = match lens_size.selected() {
-                1 => 280.0,
-                2 => 400.0,
-                _ => 180.0,
-            };
-            this.0.canvas.set_filter(zoom_filter);
-            this.0.canvas.set_background(background);
-            if let Some(canvas) = this.0.compare_canvas.borrow().as_ref() {
-                canvas.set_filter(zoom_filter);
-                canvas.set_background(background);
-            }
-            this.realign_zoom();
-            this.0.lens_diameter.set(lens_diameter);
-            this.0.settings.set_zoom_filter(zoom_filter);
-            this.0.settings.set_background(background);
-            this.0.settings.set_compare_lens_size(lens_diameter);
-            this.0.pencil_antialiasing.set(anti_aliasing.is_active());
-            this.0
-                .settings
-                .set_pencil_antialiasing(anti_aliasing.is_active());
-            this.0
-                .settings
-                .set_color_picker_format(color_format_at(color_format.selected()));
-            let scale_resampling = match resampling.selected() {
-                0 => Resampling::Nearest,
-                1 => Resampling::Linear,
-                3 => Resampling::SeamCarving,
-                _ => Resampling::Bicubic,
-            };
-            this.0.scale_resampling.set(scale_resampling);
-            this.0.settings.set_scale_resampling(scale_resampling);
-            this.refresh_scale_method();
-            apply_dialog.close();
-        });
+        page.add(&image_group);
+        dialog.add(&page);
         dialog.present(Some(&self.0.window));
     }
 
@@ -3706,51 +4369,53 @@ impl ViewerWindow {
         let dialog = adw::ShortcutsDialog::new();
         for (title, shortcuts) in [
             (
-                "General",
+                gettext("General"),
                 vec![
-                    ("Open", "<Control>o"),
-                    ("Copy Image", "<Control>c"),
-                    ("Save", "<Control>s"),
-                    ("Save As", "<Control><Shift>s"),
-                    ("Close", "<Control>w"),
-                    ("Properties", "<Control>comma"),
+                    (gettext("Open"), "<Control>o"),
+                    (gettext("Copy Image or Selection"), "<Control>c"),
+                    (gettext("Save"), "<Control>s"),
+                    (gettext("Save As"), "<Control><Shift>s"),
+                    (gettext("Close"), "<Control>w"),
+                    (gettext("Preferences"), "<Control>comma"),
                 ],
             ),
             (
-                "Viewing",
+                gettext("Viewing"),
                 vec![
-                    ("Zoom In", "plus"),
-                    ("Zoom Out", "minus"),
-                    ("Fit to Window", "0"),
-                    ("Zoom 100%–900%", "1–9"),
-                    ("Toggle Soft/Hard Zoom", "x"),
-                    ("Previous Image", "Left"),
-                    ("Next Image", "Right"),
-                    ("Delete Image", "Delete"),
+                    (gettext("Zoom In"), "plus"),
+                    (gettext("Zoom Out"), "minus"),
+                    (gettext("Fit to Window"), "0"),
+                    (gettext("Zoom 100%–900%"), "1–9"),
+                    (gettext("Toggle Soft/Hard Zoom"), "x"),
+                    (gettext("Previous Image"), "Left"),
+                    (gettext("Next Image"), "Right"),
+                    (gettext("Delete Image"), "Delete"),
                 ],
             ),
             (
-                "Editing",
+                gettext("Editing"),
                 vec![
-                    ("Undo", "<Control>z"),
-                    ("Redo", "<Control><Shift>z"),
-                    ("Rotate Clockwise", "r"),
-                    ("Rotate Counterclockwise", "<Shift>r"),
-                    ("Flip Horizontally", "h"),
-                    ("Flip Vertically", "v"),
-                    ("Crop", "c"),
-                    ("Measure", "m"),
-                    ("Scale", "s"),
-                    ("Apply Crop or Scale", "Return"),
-                    ("Cancel Crop or Scale", "Escape"),
-                    ("Pencil", "p"),
-                    ("Exit Active Tool", "Escape"),
+                    (gettext("Undo"), "<Control>z"),
+                    (gettext("Redo"), "<Control><Shift>z"),
+                    (gettext("Rotate Clockwise"), "r"),
+                    (gettext("Rotate Counterclockwise"), "<Shift>r"),
+                    (gettext("Flip Horizontally"), "h"),
+                    (gettext("Flip Vertically"), "v"),
+                    (gettext("Crop"), "c"),
+                    (gettext("Measure"), "m"),
+                    (gettext("Scale"), "s"),
+                    (gettext("Apply Crop or Scale"), "Return"),
+                    (gettext("Move Active Tool"), "Left Right Up Down"),
+                    (gettext("Set Tool Point"), "space"),
+                    (gettext("Cancel Crop or Scale"), "Escape"),
+                    (gettext("Pencil"), "p"),
+                    (gettext("Exit Active Tool"), "Escape"),
                 ],
             ),
         ] {
-            let section = adw::ShortcutsSection::new(Some(title));
+            let section = adw::ShortcutsSection::new(Some(&title));
             for (item_title, accelerator) in shortcuts {
-                section.add(adw::ShortcutsItem::new(item_title, accelerator));
+                section.add(adw::ShortcutsItem::new(&item_title, accelerator));
             }
             dialog.add(section);
         }
@@ -3783,7 +4448,9 @@ impl ViewerWindow {
             state.animation_index.set(0);
             state.animation_paused.set(false);
             state.animation_controls.set_visible(true);
-            ViewerWindow(state.clone()).sync_animation_play_button();
+            let window = ViewerWindow(state.clone());
+            window.sync_animation_play_button();
+            window.update_action_states();
             loop {
                 if state.load_generation.get() != generation || cancellable.is_cancelled() {
                     break;
@@ -3853,10 +4520,10 @@ impl ViewerWindow {
         });
         self.0
             .animation_play_button
-            .set_tooltip_text(Some(if paused {
-                "Play animation"
+            .set_tooltip_text(Some(&if paused {
+                gettext("Play animation")
             } else {
-                "Stop animation"
+                gettext("Stop animation")
             }));
     }
 
@@ -3900,6 +4567,7 @@ impl ViewerWindow {
             }
             self.prefetch_neighbors();
             self.monitor_directory();
+            self.update_action_states();
             return;
         }
         self.0.sequence.replace(None);
@@ -3939,6 +4607,7 @@ impl ViewerWindow {
                     state.sequence.replace(Some(sequence));
                     let this = ViewerWindow(state.clone());
                     this.prefetch_neighbors();
+                    this.update_action_states();
                 }
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "Directory navigation unavailable")
@@ -4041,9 +4710,9 @@ impl ViewerWindow {
                 self.0.settings.set_last_open_folder(&parent);
             }
             self.update_title();
-            self.0.toasts.add_toast(adw::Toast::new(
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
                 "Image location updated after an external move",
-            ));
+            )));
             self.rebuild_navigation(target);
             return;
         }
@@ -4075,9 +4744,9 @@ impl ViewerWindow {
                     .pending_comparison
                     .replace(self.0.compare_file.borrow().clone());
                 self.load(replacement);
-                self.0
-                    .toasts
-                    .add_toast(adw::Toast::new("The previous image was moved or deleted"));
+                self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                    "The previous image was moved or deleted",
+                )));
                 return;
             }
             if !self.0.explicit_navigation.get() {
@@ -4085,12 +4754,15 @@ impl ViewerWindow {
             }
             self.prefetch_neighbors();
             self.0.external_source_conflict.set(true);
-            self.0.title.set_subtitle("File moved or deleted");
-            self.0.toasts.add_toast(adw::Toast::new(if dirty {
-                "The source file was moved or deleted; unsaved edits are still available via Save As"
+            self.0.title.set_subtitle(&gettext("File moved or deleted"));
+            let message = if dirty {
+                gettext(
+                    "The source file was moved or deleted; unsaved edits are still available via Save As",
+                )
             } else {
-                "The current file was moved or deleted"
-            }));
+                gettext("The current file was moved or deleted")
+            };
+            self.0.toasts.add_toast(adw::Toast::new(&message));
             return;
         }
 
@@ -4113,7 +4785,9 @@ impl ViewerWindow {
             if dirty {
                 self.0.external_source_conflict.set(true);
                 self.0.toasts.add_toast(adw::Toast::new(
-                    "The source file changed externally; unsaved edits were kept and Save As is required",
+                    &gettext(
+                        "The source file changed externally; unsaved edits were kept and Save As is required",
+                    ),
                 ));
             } else if changed {
                 self.reload_current_after_external_update(current);
@@ -4154,15 +4828,16 @@ impl ViewerWindow {
                         .replace(state.compare_file.borrow().clone());
                     let this = ViewerWindow(state.clone());
                     this.load(file);
-                    state
-                        .toasts
-                        .add_toast(adw::Toast::new("Image reloaded after an external update"));
+                    state.toasts.add_toast(adw::Toast::new(&gettext(
+                        "Image reloaded after an external update",
+                    )));
                 }
                 Err(error) => {
                     tracing::warn!(%error, "Could not reload externally updated image");
-                    state.toasts.add_toast(adw::Toast::new(&format!(
-                        "Could not reload the updated image: {error}"
-                    )));
+                    state.toasts.add_toast(adw::Toast::new(
+                        &gettext("Could not reload the updated image: {error}")
+                            .replace("{error}", &error.to_string()),
+                    ));
                 }
             }
         });
@@ -4170,13 +4845,13 @@ impl ViewerWindow {
 
     fn choose_comparison(&self) {
         if self.0.canvas.texture().is_none() {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Open the first image before comparing"));
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Open the first image before comparing",
+            )));
             return;
         }
         let mut builder = gtk::FileDialog::builder()
-            .title("Choose Comparison Image")
+            .title(gettext("Choose Comparison Image"))
             .modal(true);
         if let Some(folder) = self.preferred_initial_folder() {
             builder = builder.initial_folder(&folder);
@@ -4234,8 +4909,10 @@ impl ViewerWindow {
         compare_canvas.set_zoom(self.0.canvas.zoom());
         compare_canvas.set_halign(gtk::Align::Center);
         compare_canvas.set_valign(gtk::Align::Center);
-        compare_canvas.set_accessible_label("Comparison image B");
-        self.0.canvas.set_accessible_label("Primary image A");
+        compare_canvas.set_accessible_label(&gettext("Comparison image B"));
+        self.0
+            .canvas
+            .set_accessible_label(&gettext("Primary image A"));
         let compare_scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -4256,6 +4933,16 @@ impl ViewerWindow {
             .shrink_start_child(false)
             .shrink_end_child(false)
             .build();
+        let narrow_compare = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 600px").expect("valid compare breakpoint"),
+        );
+        narrow_compare.add_setter(
+            &paned,
+            "orientation",
+            Some(&gtk::Orientation::Vertical.to_value()),
+        );
+        let compare_bin = adw::BreakpointBin::builder().child(&paned).build();
+        compare_bin.add_breakpoint(narrow_compare);
 
         self.0.canvas_overlay.set_child(None::<&gtk::Widget>);
         self.0.toasts.set_child(None::<&gtk::Widget>);
@@ -4271,12 +4958,12 @@ impl ViewerWindow {
         toolbar.add_css_class("toolbar");
         let lock = gtk::ToggleButton::builder()
             .icon_name("changes-prevent-symbolic")
-            .tooltip_text("Synchronize Pan and Zoom")
+            .tooltip_text(gettext("Synchronize Pan and Zoom"))
             .active(true)
             .build();
         let close = gtk::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Exit Compare Mode")
+            .tooltip_text(gettext("Exit Compare Mode"))
             .build();
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&lock);
@@ -4298,7 +4985,7 @@ impl ViewerWindow {
         )));
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&toolbar);
-        root.append(&paned);
+        root.append(&compare_bin);
         self.0.toasts.set_child(Some(&root));
         self.0.compare_canvas.replace(Some(compare_canvas.clone()));
         self.0.compare_file.replace(Some(file));
@@ -4469,7 +5156,7 @@ impl ViewerWindow {
         self.0.compare_fit_zooms.set(None);
         self.0.compare_rendered.replace(None);
         self.0.compare_file.replace(None);
-        self.0.canvas.set_accessible_label("Image canvas");
+        self.0.canvas.set_accessible_label(&gettext("Image canvas"));
         let this = self.clone();
         glib::idle_add_local_once(move || this.update_minimap());
     }
@@ -4541,9 +5228,9 @@ impl ViewerWindow {
                 this.load_comparison(candidate);
             } else {
                 this.exit_compare();
-                state
-                    .toasts
-                    .add_toast(adw::Toast::new("The comparison image was moved or deleted"));
+                state.toasts.add_toast(adw::Toast::new(&gettext(
+                    "The comparison image was moved or deleted",
+                )));
             }
         });
     }
@@ -4592,9 +5279,9 @@ impl ViewerWindow {
         if self.0.canvas.texture().is_none() {
             if active {
                 self.0.lens_button.set_active(false);
-                self.0
-                    .toasts
-                    .add_toast(adw::Toast::new("Open an image before using the lens"));
+                self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                    "Open an image before using the lens",
+                )));
             }
             return;
         }
@@ -4762,22 +5449,40 @@ impl ViewerWindow {
     }
 
     fn zoom_rect_drag_available(&self) -> bool {
-        self.0.canvas.texture().is_some()
-            && no_tool_active(&[
-                self.0.measurement_button.is_active(),
-                self.0.selection_button.is_active(),
-                self.0.color_picker_button.is_active(),
-                self.0.scale_button.is_active(),
-                self.0.edit_button.is_active(),
-                self.0.pencil_active.get(),
-                self.0.lens_active.get(),
-            ])
+        self.0.canvas.texture().is_some() && self.no_tool_active()
+    }
+
+    fn object_detection_click_available(&self) -> bool {
+        self.0.rendered.borrow().is_some() && self.no_tool_active()
+    }
+
+    fn no_tool_active(&self) -> bool {
+        no_tool_active(&[
+            self.0.measurement_button.is_active(),
+            self.0.selection_button.is_active(),
+            self.0.color_picker_button.is_active(),
+            self.0.scale_button.is_active(),
+            self.0.edit_button.is_active(),
+            self.0.pencil_active.get(),
+            self.0.lens_active.get(),
+        ])
     }
 
     fn cancel_zoom_rect_drag(&self) {
-        if self.0.zoom_rect_drag.take().is_some() {
+        let had_drag = self.0.zoom_rect_drag.take().is_some();
+        let had_selection = self.0.zoom_rect_selection.take().is_some();
+        if had_drag || had_selection {
             self.0.canvas.set_crop_overlay(None);
         }
+    }
+
+    fn zoom_selected_rect(&self) -> bool {
+        let Some(selection) = self.0.zoom_rect_selection.take() else {
+            return false;
+        };
+        self.0.canvas.set_crop_overlay(None);
+        self.zoom_to_rect(selection);
+        true
     }
 
     fn zoom_to_rect(&self, selection: CropOverlay) {
@@ -4812,7 +5517,45 @@ impl ViewerWindow {
         });
     }
 
+    fn copy_zoom_rect_to_clipboard(&self, selection: CropOverlay) {
+        if selection.width == 0 || selection.height == 0 {
+            return;
+        }
+        let Some(texture) = self.0.canvas.texture() else {
+            return;
+        };
+        if texture.width() as u32 != selection.image_width
+            || texture.height() as u32 != selection.image_height
+        {
+            return;
+        }
+        let Some(image) = rgba_from_texture(&texture) else {
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Could not copy the selected image area",
+            )));
+            return;
+        };
+        let bounds = CropBounds {
+            x: selection.x,
+            y: selection.y,
+            width: selection.width,
+            height: selection.height,
+        };
+        match crate::tools::selection::crop(&image, bounds) {
+            Ok(fragment) => self.copy_image_to_clipboard(
+                &fragment,
+                &gettext("Copied {width} × {height} selection")
+                    .replace("{width}", &bounds.width.to_string())
+                    .replace("{height}", &bounds.height.to_string()),
+            ),
+            Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error.to_string())),
+        }
+    }
+
     fn step_zoom(&self, zoom_in: bool) {
+        if self.0.pencil_active.get() {
+            self.abort_pencil_drag();
+        }
         let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
             stepped_hard_zoom(self.0.canvas.zoom(), self.0.render_scale.get(), zoom_in)
         } else {
@@ -5064,6 +5807,7 @@ impl ViewerWindow {
                 match sequence {
                     Ok(Ok(sequence)) => {
                         state.sequence.replace(Some(sequence));
+                        ViewerWindow(state.clone()).update_action_states();
                         ViewerWindow(state).navigate(forward);
                     }
                     Ok(Err(error)) => tracing::debug!(%error, "Directory navigation unavailable"),
@@ -5079,18 +5823,18 @@ impl ViewerWindow {
                         sequence.remove_file(&file);
                     }
                     self.prefetch_neighbors();
-                    self.0.toasts.add_toast(adw::Toast::new(
+                    self.0.toasts.add_toast(adw::Toast::new(&gettext(
                         "That image was moved or deleted; it was removed from the opened files",
-                    ));
+                    )));
                     self.navigate(forward);
                     return;
                 }
                 if let Some(current) = self.0.current_file.borrow().clone() {
                     self.refresh_navigation(current, false);
                 }
-                self.0.toasts.add_toast(adw::Toast::new(
+                self.0.toasts.add_toast(adw::Toast::new(&gettext(
                     "That image was moved or deleted; the folder was refreshed",
-                ));
+                )));
                 return;
             }
             self.0.sequence.replace(Some(next_sequence));
@@ -5125,19 +5869,21 @@ impl ViewerWindow {
 
     fn confirm_delete_current_file(&self) {
         if self.0.export_cancellation.borrow().is_some() {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Wait for the current export to finish"));
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Wait for the current export to finish",
+            )));
             return;
         }
         if self.0.deletion_running.get() {
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new("Image deletion is already in progress"));
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Image deletion is already in progress",
+            )));
             return;
         }
         let Some(file) = self.0.current_file.borrow().clone() else {
-            self.0.toasts.add_toast(adw::Toast::new("No image is open"));
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("No image is open")));
             return;
         };
         let name = file.basename().map_or_else(
@@ -5151,20 +5897,22 @@ impl ViewerWindow {
             .as_ref()
             .is_some_and(Document::is_dirty);
         let body = if has_unsaved_edits {
-            format!(
-                "“{name}” and its unsaved edits will be permanently deleted. This cannot be undone."
+            gettext(
+                "“{name}” and its unsaved edits will be permanently deleted. This cannot be undone.",
             )
+            .replace("{name}", &name)
         } else {
-            format!("“{name}” will be permanently deleted. This cannot be undone.")
+            gettext("“{name}” will be permanently deleted. This cannot be undone.")
+                .replace("{name}", &name)
         };
         let dialog = adw::AlertDialog::builder()
-            .heading("Delete this image?")
+            .heading(gettext("Delete this image?"))
             .body(body)
             .close_response("cancel")
             .default_response("cancel")
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("delete", "Delete");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("delete", &gettext("Delete"));
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         let this = self.clone();
         dialog.connect_response(Some("delete"), move |_, _| {
@@ -5211,9 +5959,10 @@ impl ViewerWindow {
             let this = ViewerWindow(state.clone());
             if let Err(error) = result {
                 state.deletion_running.set(false);
-                state
-                    .toasts
-                    .add_toast(adw::Toast::new(&format!("Could not delete image: {error}")));
+                state.toasts.add_toast(adw::Toast::new(
+                    &gettext("Could not delete image: {error}")
+                        .replace("{error}", &error.to_string()),
+                ));
                 this.monitor_directory();
                 return;
             }
@@ -5237,7 +5986,9 @@ impl ViewerWindow {
                 replacement
             };
             state.deletion_running.set(false);
-            state.toasts.add_toast(adw::Toast::new("Image deleted"));
+            state
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("Image deleted")));
             if let Some(replacement) = replacement {
                 this.load(replacement);
             } else {
@@ -5602,6 +6353,38 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(selection);
 
+        let object_click = gtk::GestureClick::new();
+        object_click.set_button(1);
+        let press_point = Rc::new(Cell::new(None::<(f64, f64)>));
+        object_click.connect_pressed({
+            let this = self.clone();
+            let press_point = press_point.clone();
+            move |_, _, x, y| {
+                press_point.set(this.object_detection_click_available().then_some((x, y)));
+            }
+        });
+        object_click.connect_released({
+            let this = self.clone();
+            move |gesture, _, x, y| {
+                let Some((start_x, start_y)) = press_point.take() else {
+                    return;
+                };
+                if !is_click((start_x, start_y), (x, y)) || !this.object_detection_click_available()
+                {
+                    return;
+                }
+                let Some(point) = this.0.canvas.pixel_at(x, y) else {
+                    return;
+                };
+                let Some(image) = this.0.rendered.borrow().clone() else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.detect_and_select_object(image, point);
+            }
+        });
+        self.0.canvas.add_controller(object_click);
+
         let color_picker = gtk::GestureClick::new();
         color_picker.set_button(1);
         color_picker.connect_pressed({
@@ -5888,6 +6671,8 @@ impl ViewerWindow {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.0.zoom_rect_selection.set(None);
+                this.0.canvas.grab_focus();
                 let drag = ZoomRectDrag {
                     start,
                     current: start,
@@ -5936,11 +6721,28 @@ impl ViewerWindow {
                 ) {
                     drag.current = current;
                 }
-                this.0.canvas.set_crop_overlay(None);
                 if drag.load_generation == this.0.load_generation.get()
                     && this.zoom_rect_drag_available()
                 {
-                    this.zoom_to_rect(zoom_rect_overlay(drag));
+                    let selection = zoom_rect_overlay(drag);
+                    if selection.width > 0 && selection.height > 0 {
+                        this.0.zoom_rect_selection.set(Some(selection));
+                        this.0.canvas.set_crop_overlay(Some(selection));
+                        this.0.canvas.announce(
+                            &gettext(
+                                "Area selected, {width} by {height} pixels. Press Ctrl+C to copy or Space or Enter to zoom.",
+                            )
+                            .replace("{width}", &selection.width.to_string())
+                            .replace("{height}", &selection.height.to_string()),
+                            gtk::AccessibleAnnouncementPriority::Medium,
+                        );
+                    } else {
+                        this.0.zoom_rect_selection.set(None);
+                        this.0.canvas.set_crop_overlay(None);
+                    }
+                } else {
+                    this.0.zoom_rect_selection.set(None);
+                    this.0.canvas.set_crop_overlay(None);
                 }
             }
         });
@@ -5973,8 +6775,8 @@ impl ViewerWindow {
                 if let Some(color) = pixel {
                     this.0.pencil_color.set(color);
                     this.0.color_button.set_rgba(&u8_to_rgba(color));
-                    this.0.toasts.add_toast(adw::Toast::new(&format!(
-                        "Sampled #{:02X}{:02X}{:02X}{:02X} · rgba({}, {}, {}, {})",
+                    let color_value = format!(
+                        "#{:02X}{:02X}{:02X}{:02X} · rgba({}, {}, {}, {})",
                         color[0],
                         color[1],
                         color[2],
@@ -5983,7 +6785,10 @@ impl ViewerWindow {
                         color[1],
                         color[2],
                         color[3]
-                    )));
+                    );
+                    this.0.toasts.add_toast(adw::Toast::new(
+                        &gettext("Sampled {color}").replace("{color}", &color_value),
+                    ));
                 }
             }
         });
@@ -6168,13 +6973,13 @@ impl ViewerWindow {
 
     fn confirm_discard(&self, heading: &str, on_discard: impl Fn() + 'static) {
         let dialog = adw::AlertDialog::builder()
-            .heading(heading)
-            .body("This cannot be undone.")
+            .heading(gettext(heading))
+            .body(gettext("This cannot be undone."))
             .close_response("cancel")
             .default_response("cancel")
             .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("discard", "Discard");
+        dialog.add_response("cancel", &gettext("Cancel"));
+        dialog.add_response("discard", &gettext("Discard"));
         dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
         dialog.connect_response(Some("discard"), move |_, _| on_discard());
         dialog.present(Some(&self.0.window));
@@ -6227,26 +7032,27 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     );
     let color_button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     color_button.set_rgba(&u8_to_rgba([0, 0, 0, 255]));
-    color_button.set_tooltip_text(Some("Pencil color"));
+    color_button.set_tooltip_text(Some(&gettext("Pencil color")));
     let pencil_size = spin(1.0, 128.0, 1.0);
     pencil_size.set_width_chars(2);
     pencil_size.set_max_width_chars(3);
-    pencil_size.set_tooltip_text(Some("Paint size in pixels"));
-    let pencil_controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    pencil_size.set_tooltip_text(Some(&gettext("Paint size in pixels")));
+    let pencil_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    pencil_controls.add_css_class("linked");
     pencil_controls.append(&pencil_button);
     pencil_controls.append(&color_button);
     pencil_controls.append(&color_picker_button);
+    pencil_controls.append(&lens_button);
     pencil_controls.append(&pencil_size);
     header.pack_start(&animation_controls);
     header.pack_start(&previous);
     header.pack_start(&next);
-    header.pack_start(&pencil_controls);
     header.pack_end(&menu_button());
-    header.pack_end(&button("media-floppy-symbolic", "Save As", "win.save-as"));
-    header.pack_end(&selection_button);
-    header.pack_end(&lens_button);
+    let save_as_button = button("media-floppy-symbolic", "Save As", "win.save-as");
+    header.pack_end(&save_as_button);
     HeaderWidgets {
         header,
+        save_as_button,
         animation_controls,
         animation_play_button: play,
         scale_button,
@@ -6258,13 +7064,14 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
         color_button,
         pencil_size,
         edit_button,
+        pencil_controls,
     }
 }
 
 fn button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
     gtk::Button::builder()
         .icon_name(icon)
-        .tooltip_text(tooltip)
+        .tooltip_text(gettext(tooltip))
         .action_name(action)
         .build()
 }
@@ -6272,7 +7079,7 @@ fn button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
 fn toggle_button(icon: &str, tooltip: &str) -> gtk::ToggleButton {
     gtk::ToggleButton::builder()
         .icon_name(icon)
-        .tooltip_text(tooltip)
+        .tooltip_text(gettext(tooltip))
         .build()
 }
 
@@ -6280,34 +7087,47 @@ fn menu_button() -> gtk::MenuButton {
     let menu = main_menu();
     gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text("Main Menu")
+        .tooltip_text(gettext("Main Menu"))
         .menu_model(&menu)
         .build()
 }
 
+fn menu_item(menu: &gio::Menu, label: &str, action: &str) {
+    menu.append(Some(&gettext(label)), Some(action));
+}
+
+fn menu_submenu(menu: &gio::Menu, label: &str, submenu: &gio::Menu) {
+    menu.append_submenu(Some(&gettext(label)), submenu);
+}
+
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(Some("Open…"), Some("win.open"));
-    menu.append(Some("Open With…"), Some("win.open-with"));
-    menu.append(Some("Copy Image"), Some("win.copy-image"));
-    menu.append(Some("Save"), Some("win.save"));
-    menu.append(Some("Save As…"), Some("win.save-as"));
-    menu.append(Some("Compare Images…"), Some("win.compare"));
+    menu_item(&menu, "Open…", "win.open");
+    menu_item(&menu, "Open With…", "win.open-with");
+    menu_item(&menu, "Copy Image or Selection", "win.copy-image");
+    menu_item(&menu, "Save", "win.save");
+    menu_item(&menu, "Save As…", "win.save-as");
+    menu_item(&menu, "Compare Images…", "win.compare");
     let edit_menu = gio::Menu::new();
-    edit_menu.append(Some("Measure"), Some("win.measure"));
-    edit_menu.append(Some("Crop"), Some("win.crop"));
-    edit_menu.append(
-        Some("Rotate Counterclockwise"),
-        Some("win.rotate-counterclockwise"),
+    menu_item(&edit_menu, "Measure", "win.measure");
+    menu_item(&edit_menu, "Pick Color", "win.pick-color");
+    menu_item(&edit_menu, "Pencil", "win.pencil");
+    menu_item(&edit_menu, "Crop", "win.crop");
+    menu_item(
+        &edit_menu,
+        "Rotate Counterclockwise",
+        "win.rotate-counterclockwise",
     );
-    edit_menu.append(Some("Rotate Clockwise"), Some("win.rotate-clockwise"));
-    edit_menu.append(Some("Flip Horizontally"), Some("win.flip-horizontal"));
-    edit_menu.append(Some("Flip Vertically"), Some("win.flip-vertical"));
-    edit_menu.append(Some("Scale"), Some("win.scale-preview"));
-    menu.append_submenu(Some("Edit"), &edit_menu);
-    menu.append(Some("Properties"), Some("win.preferences"));
-    menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-    menu.append(Some("About Diorama"), Some("win.about"));
+    menu_item(&edit_menu, "Rotate Clockwise", "win.rotate-clockwise");
+    menu_item(&edit_menu, "Flip Horizontally", "win.flip-horizontal");
+    menu_item(&edit_menu, "Flip Vertically", "win.flip-vertical");
+    menu_item(&edit_menu, "Scale", "win.scale-preview");
+    menu_submenu(&menu, "Edit", &edit_menu);
+    menu_item(&menu, "Magnifying Lens", "win.lens");
+    menu_item(&menu, "Image Properties", "win.properties");
+    menu_item(&menu, "Preferences", "win.preferences");
+    menu_item(&menu, "Keyboard Shortcuts", "win.shortcuts");
+    menu_item(&menu, "About Diorama", "win.about");
     menu
 }
 
@@ -6528,30 +7348,78 @@ mod tests {
     }
 
     #[test]
+    fn unmodified_horizontal_arrows_navigate_images() {
+        assert_eq!(
+            image_navigation_direction(gtk::gdk::Key::Left, gtk::gdk::ModifierType::empty(), false),
+            Some(false)
+        );
+        assert_eq!(
+            image_navigation_direction(
+                gtk::gdk::Key::Right,
+                gtk::gdk::ModifierType::LOCK_MASK,
+                false
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            image_navigation_direction(
+                gtk::gdk::Key::Left,
+                gtk::gdk::ModifierType::SHIFT_MASK,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            image_navigation_direction(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty(), true),
+            None
+        );
+        assert_eq!(
+            image_navigation_direction(gtk::gdk::Key::Up, gtk::gdk::ModifierType::empty(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn pencil_mode_claims_zoom_keys_without_treating_control_as_a_line_modifier() {
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::plus,
+                gtk::gdk::ModifierType::SHIFT_MASK,
+                true,
+            ),
+            Some(PencilZoomKey::In)
+        );
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::equal,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                true,
+            ),
+            Some(PencilZoomKey::In)
+        );
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::KP_Subtract,
+                gtk::gdk::ModifierType::empty(),
+                true,
+            ),
+            Some(PencilZoomKey::Out)
+        );
+        assert_eq!(
+            pencil_zoom_key(gtk::gdk::Key::minus, gtk::gdk::ModifierType::ALT_MASK, true),
+            None
+        );
+        assert_eq!(
+            pencil_zoom_key(gtk::gdk::Key::plus, gtk::gdk::ModifierType::empty(), false),
+            None
+        );
+    }
+
+    #[test]
     fn folder_path_uses_the_file_parent() {
         let file = gio::File::for_path("/images/comparison/frame.png");
 
         assert_eq!(folder_path(&file), "/images/comparison");
-    }
-
-    #[test]
-    fn arrow_and_page_keys_have_navigation_directions() {
-        assert_eq!(navigation_direction(gtk::gdk::Key::Left), Some(false));
-        assert_eq!(navigation_direction(gtk::gdk::Key::Page_Up), Some(false));
-        assert_eq!(navigation_direction(gtk::gdk::Key::Right), Some(true));
-        assert_eq!(navigation_direction(gtk::gdk::Key::Page_Down), Some(true));
-        assert_eq!(navigation_direction(gtk::gdk::Key::space), None);
-    }
-
-    #[test]
-    fn lock_and_pointer_state_do_not_suppress_shortcuts() {
-        assert!(!has_shortcut_modifier(
-            gtk::gdk::ModifierType::LOCK_MASK | gtk::gdk::ModifierType::BUTTON1_MASK
-        ));
-        assert!(has_shortcut_modifier(
-            gtk::gdk::ModifierType::LOCK_MASK | gtk::gdk::ModifierType::CONTROL_MASK
-        ));
-        assert!(has_shortcut_modifier(gtk::gdk::ModifierType::SHIFT_MASK));
     }
 
     #[test]
@@ -6974,6 +7842,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "Measure".to_owned(),
+                "Pick Color".to_owned(),
+                "Pencil".to_owned(),
                 "Crop".to_owned(),
                 "Rotate Counterclockwise".to_owned(),
                 "Rotate Clockwise".to_owned(),
@@ -6984,12 +7854,14 @@ mod tests {
         );
         for (index, action) in [
             (0, "win.measure"),
-            (1, "win.crop"),
-            (2, "win.rotate-counterclockwise"),
-            (3, "win.rotate-clockwise"),
-            (4, "win.flip-horizontal"),
-            (5, "win.flip-vertical"),
-            (6, "win.scale-preview"),
+            (1, "win.pick-color"),
+            (2, "win.pencil"),
+            (3, "win.crop"),
+            (4, "win.rotate-counterclockwise"),
+            (5, "win.rotate-clockwise"),
+            (6, "win.flip-horizontal"),
+            (7, "win.flip-vertical"),
+            (8, "win.scale-preview"),
         ] {
             assert_eq!(string_attribute(&edit_menu, index, "action"), action);
         }
@@ -6999,27 +7871,22 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_has_one_unified_properties_entry() {
+    fn main_menu_separates_image_properties_from_preferences() {
         let menu: gio::MenuModel = main_menu().upcast();
         let string_attribute = |index, name| {
             menu.item_attribute_value(index, name, None)
                 .and_then(|value| value.get::<String>())
         };
-        let properties: Vec<_> = (0..menu.n_items())
-            .filter(|index| string_attribute(*index, "label").as_deref() == Some("Properties"))
-            .collect();
-
-        assert_eq!(properties.len(), 1);
-        assert_eq!(
-            string_attribute(properties[0], "action").as_deref(),
-            Some("win.preferences")
-        );
-        assert!((0..menu.n_items()).all(|index| {
-            !matches!(
-                string_attribute(index, "label").as_deref(),
-                Some("Image Properties" | "Preferences")
-            )
-        }));
+        let entries = (0..menu.n_items())
+            .filter_map(|index| {
+                Some((
+                    string_attribute(index, "label")?,
+                    string_attribute(index, "action")?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert!(entries.contains(&("Image Properties".to_owned(), "win.properties".to_owned())));
+        assert!(entries.contains(&("Preferences".to_owned(), "win.preferences".to_owned())));
     }
 
     #[test]
@@ -7300,6 +8167,12 @@ mod tests {
     }
 
     #[test]
+    fn object_detection_responds_only_to_clicks() {
+        assert!(is_click((10.0, 20.0), (13.0, 22.0)));
+        assert!(!is_click((10.0, 20.0), (15.0, 20.0)));
+    }
+
+    #[test]
     fn downloaded_comparison_texture_keeps_rgba_pixels() {
         let image = image::RgbaImage::from_raw(1, 1, vec![12, 34, 56, 78]).unwrap();
         let texture = texture_from_rgba(&image).unwrap();
@@ -7357,6 +8230,7 @@ mod tests {
         });
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
+        window.update_action_states();
 
         assert!(window.0.window.lookup_action("copy-image").is_some());
         gio::prelude::ActionGroupExt::activate_action(&window.0.window, "copy-image", None);
@@ -7443,7 +8317,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn pencil_controls_share_the_left_group_and_define_each_stroke() {
+    fn pencil_controls_use_a_contextual_canvas_group_and_define_each_stroke() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.PencilControlsTest")
@@ -7458,13 +8332,19 @@ mod tests {
             .pencil_button
             .parent()
             .expect("pencil control group");
+        assert_eq!(controls.downcast_ref::<gtk::Box>().unwrap().spacing(), 0);
 
         assert_eq!(window.0.color_button.parent().as_ref(), Some(&controls));
         assert_eq!(
             window.0.color_picker_button.parent().as_ref(),
             Some(&controls)
         );
+        assert_eq!(window.0.lens_button.parent().as_ref(), Some(&controls));
         assert_eq!(window.0.pencil_size.parent().as_ref(), Some(&controls));
+        assert!(controls.has_css_class("linked"));
+        assert!(!controls.has_css_class("osd"));
+        assert!(window.0.zoom_controls.has_css_class("linked"));
+        assert!(!window.0.zoom_controls.has_css_class("osd"));
         assert_eq!(
             window.0.color_button.prev_sibling().as_ref(),
             Some(window.0.pencil_button.upcast_ref())
@@ -7474,23 +8354,17 @@ mod tests {
             Some(window.0.color_button.upcast_ref())
         );
         assert_eq!(
-            window.0.pencil_size.prev_sibling().as_ref(),
+            window.0.lens_button.prev_sibling().as_ref(),
             Some(window.0.color_picker_button.upcast_ref())
         );
+        assert_eq!(
+            window.0.pencil_size.prev_sibling().as_ref(),
+            Some(window.0.lens_button.upcast_ref())
+        );
 
-        window.0.window.set_default_size(1_200, 700);
-        window.present();
-        while glib::MainContext::default().iteration(false) {}
-        let header = controls
-            .ancestor(adw::HeaderBar::static_type())
-            .expect("header ancestor");
-        let controls_bounds = controls.compute_bounds(&header).expect("control bounds");
-        let title_bounds = window
-            .0
-            .title
-            .compute_bounds(&header)
-            .expect("title bounds");
-        assert!(controls_bounds.x() < title_bounds.x());
+        assert!(controls.ancestor(adw::HeaderBar::static_type()).is_none());
+        assert!(controls.ancestor(gtk::Overlay::static_type()).is_some());
+        assert!(!controls.is_visible());
 
         window.0.pencil_size.set_value(7.0);
         window.0.pencil_antialiasing.set(true);
@@ -7566,7 +8440,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn properties_combines_app_drawing_and_current_image_settings() {
+    fn preferences_apply_immediately_and_image_properties_are_read_only() {
         use adw::prelude::{
             ActionRowExt as _, AdwApplicationWindowExt as _, PreferencesRowExt as _,
         };
@@ -7587,16 +8461,16 @@ mod tests {
             None
         }
 
-        fn button_with_label(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
-            if let Ok(button) = widget.clone().downcast::<gtk::Button>()
-                && button.label().as_deref() == Some(label)
+        fn label_with_text(widget: &gtk::Widget, text: &str) -> Option<gtk::Label> {
+            if let Ok(label) = widget.clone().downcast::<gtk::Label>()
+                && label.text() == text
             {
-                return Some(button);
+                return Some(label);
             }
             let mut child = widget.first_child();
             while let Some(current) = child {
-                if let Some(button) = button_with_label(&current, label) {
-                    return Some(button);
+                if let Some(label) = label_with_text(&current, text) {
+                    return Some(label);
                 }
                 child = current.next_sibling();
             }
@@ -7624,6 +8498,8 @@ mod tests {
                     ..crate::document::Metadata::default()
                 },
             })));
+        let texture = texture_from_rgba(&pixels).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(pixels));
         window
             .0
@@ -7631,7 +8507,7 @@ mod tests {
             .replace(Some(gio::File::for_path("/images/current.png")));
         window.present();
 
-        window.show_properties();
+        window.show_preferences();
 
         let dialog = window
             .0
@@ -7648,22 +8524,63 @@ mod tests {
             .expect("anti-aliasing switch");
         assert!(row_with_title(&dialog_widget, "Hard zoom").is_some());
         assert!(row_with_title(&dialog_widget, "Copied color format").is_some());
-        let dimensions = row_with_title(&dialog_widget, "Dimensions")
-            .expect("dimensions row")
-            .downcast::<adw::ActionRow>()
-            .expect("dimensions action row");
-        assert_eq!(dimensions.subtitle().as_deref(), Some("2 × 1"));
-        assert!(row_with_title(&dialog_widget, "Location").is_some());
-        assert!(row_with_title(&dialog_widget, "Format").is_some());
-        assert!(row_with_title(&dialog_widget, "Metadata").is_some());
-        let done = button_with_label(&dialog_widget, "Done").expect("Done button");
+        assert!(row_with_title(&dialog_widget, "Dimensions").is_none());
         let initial = anti_aliasing.is_active();
 
         anti_aliasing.set_active(!initial);
-        assert_eq!(window.0.pencil_antialiasing.get(), initial);
-        done.emit_clicked();
-
         assert_eq!(window.0.pencil_antialiasing.get(), !initial);
+        dialog.close();
+        while glib::MainContext::default().iteration(false) {}
+
+        window.show_properties();
+        let properties = window
+            .0
+            .window
+            .dialogs()
+            .item(0)
+            .expect("image properties dialog")
+            .downcast::<adw::Dialog>()
+            .expect("dialog");
+        let properties_widget = properties.upcast::<gtk::Widget>();
+        let dimensions = row_with_title(&properties_widget, "Dimensions")
+            .expect("dimensions row")
+            .downcast::<adw::ActionRow>()
+            .expect("dimensions action row");
+        assert!(
+            dimensions
+                .subtitle()
+                .is_none_or(|subtitle| subtitle.is_empty())
+        );
+        let dimensions_value = label_with_text(&dimensions.upcast::<gtk::Widget>(), "2 × 1")
+            .expect("dimensions value");
+        assert!(dimensions_value.has_css_class("dim-label"));
+        assert_eq!(dimensions_value.halign(), gtk::Align::End);
+        assert_eq!(
+            dimensions_value.ellipsize(),
+            gtk::pango::EllipsizeMode::Middle
+        );
+        assert!(dimensions_value.is_selectable());
+        assert_eq!(dimensions_value.tooltip_text().as_deref(), Some("2 × 1"));
+        let location = row_with_title(&properties_widget, "Location")
+            .expect("location row")
+            .downcast::<adw::ActionRow>()
+            .expect("location action row");
+        assert!(
+            location
+                .subtitle()
+                .is_none_or(|subtitle| subtitle.is_empty())
+        );
+        let location_value =
+            label_with_text(&location.upcast::<gtk::Widget>(), "/images/current.png")
+                .expect("location value");
+        assert_eq!(location_value.halign(), gtk::Align::End);
+        assert_eq!(
+            location_value.tooltip_text().as_deref(),
+            Some("/images/current.png")
+        );
+        assert!(row_with_title(&properties_widget, "Format").is_some());
+        assert!(row_with_title(&properties_widget, "Metadata").is_some());
+        assert!(row_with_title(&properties_widget, "Hard zoom").is_none());
         window.0.pencil_antialiasing.set(initial);
         window.0.settings.set_pencil_antialiasing(initial);
     }
@@ -7687,6 +8604,14 @@ mod tests {
         assert!(window.0.window.lookup_action("measure").is_some());
         assert!(window.0.window.lookup_action("crop").is_some());
         assert!(window.0.window.lookup_action("scale-preview").is_some());
+        assert!(window.0.selection_button.parent().is_none());
+        assert!(
+            window
+                .0
+                .lens_button
+                .ancestor(adw::HeaderBar::static_type())
+                .is_none()
+        );
         let crop_children = window.0.crop_controls.observe_children();
         assert_eq!(crop_children.n_items(), 2);
         assert_eq!(
@@ -7713,6 +8638,98 @@ mod tests {
 
         assert!(window.0.edit_crop.borrow().is_none());
         assert!(!window.0.crop_apply_button.is_sensitive());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn empty_and_loaded_states_drive_content_and_action_availability() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ContentStateTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let enabled = |name: &str| {
+            window
+                .0
+                .window
+                .lookup_action(name)
+                .expect("window action")
+                .is_enabled()
+        };
+
+        assert_eq!(
+            window.0.content_stack.visible_child_name().as_deref(),
+            Some("empty")
+        );
+        assert!(enabled("open"));
+        assert!(enabled("preferences"));
+        assert!(!enabled("copy-image"));
+        assert!(!enabled("crop"));
+        assert!(!enabled("properties"));
+
+        let pixels = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&pixels).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(pixels.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(pixels));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+
+        assert!(enabled("copy-image"));
+        assert!(enabled("crop"));
+        assert!(enabled("properties"));
+        assert!(!enabled("save"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn keyboard_crop_cursor_selects_source_pixels_without_pointer_input() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.KeyboardCropTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let pixels = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&pixels).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(pixels));
+
+        window.0.edit_button.set_active(true);
+        assert_eq!(window.0.keyboard_tool_cursor.get(), None);
+        assert!(window.move_keyboard_tool_cursor(0, 0));
+        let start = window
+            .0
+            .keyboard_tool_cursor
+            .get()
+            .expect("keyboard tool cursor");
+        window.activate_keyboard_tool();
+        assert_eq!(window.0.keyboard_tool_anchor.get(), Some(start));
+        assert!(window.move_keyboard_tool_cursor(2, 1));
+        window.activate_keyboard_tool();
+
+        let crop = window
+            .0
+            .edit_crop
+            .borrow()
+            .expect("keyboard crop selection");
+        assert_eq!(crop.width, 3);
+        assert_eq!(crop.height, 2);
+        assert!(window.0.crop_apply_button.is_sensitive());
     }
 
     #[test]
@@ -7782,7 +8799,6 @@ mod tests {
             .downcast::<gtk::Box>()
             .expect("scale surface box");
         assert!(scale_surface.has_css_class("osd"));
-        assert!(scale_surface.has_css_class("diorama-scale-surface"));
         let scale_content = scale_surface
             .first_child()
             .expect("padded scale content")
@@ -7852,7 +8868,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn scale_action_waits_for_the_editable_decode() {
+    fn scale_action_enables_after_the_editable_decode() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.ScaleActivationTest")
@@ -7862,19 +8878,28 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
-        window.0.editable_decode_pending.set(true);
-
-        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "scale-preview", None);
-
-        assert!(window.0.scale_button.is_active());
-        assert!(window.0.pending_scale_activation.get());
-        assert!(!window.0.scale_controls.get_visible());
-
         let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
+        window.0.editable_decode_pending.set(true);
+        window.update_action_states();
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "scale-preview", None);
+
+        assert!(!window.0.scale_button.is_active());
+        assert!(!window.0.scale_controls.get_visible());
+
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
         window.0.rendered.replace(Some(image));
         window.finish_editable_decode(true);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "scale-preview", None);
 
         assert!(window.0.scale_button.is_active());
         assert!(!window.0.pending_scale_activation.get());
@@ -7899,6 +8924,7 @@ mod tests {
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(image));
+        window.update_action_states();
         window.0.scale_button.set_active(true);
         window.0.scrolled.allocate(640, 480, -1, None);
 
@@ -8053,6 +9079,7 @@ mod tests {
         let image = image::RgbaImage::from_pixel(200, 100, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
 
         assert!(!usable_panel_size((
             window.0.scrolled.width(),
@@ -8103,7 +9130,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn zoom_rectangle_fits_and_centers_the_selected_region() {
+    fn zoom_rectangle_waits_for_copy_or_zoom_command() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
@@ -8135,7 +9162,27 @@ mod tests {
             ZoomAlignment::Contain,
         );
 
-        window.zoom_to_rect(selection);
+        let initial_zoom = window.0.canvas.zoom();
+        window.0.zoom_rect_selection.set(Some(selection));
+        window.0.canvas.set_crop_overlay(Some(selection));
+        window.copy_current_selection_or_image_to_clipboard();
+        let copied = glib::MainContext::default()
+            .block_on(window.0.window.clipboard().read_texture_future())
+            .expect("clipboard read")
+            .expect("clipboard texture");
+        assert_eq!(
+            rgba_from_texture(&copied),
+            Some(image::RgbaImage::from_pixel(
+                20,
+                10,
+                image::Rgba([1, 2, 3, 255])
+            ))
+        );
+        assert_eq!(window.0.canvas.zoom(), initial_zoom);
+        assert!(window.0.zoom_rect_selection.get().is_some());
+
+        assert!(window.zoom_selected_rect());
+        assert!(window.0.zoom_rect_selection.get().is_none());
         window.0.scrolled.allocate(800, 600, -1, None);
         let context = glib::MainContext::default();
         while context.pending() {

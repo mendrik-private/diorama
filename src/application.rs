@@ -14,8 +14,26 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.shortcuts", &["<Control>question"]),
     ("win.undo", &["<Control>z"]),
     ("win.redo", &["<Control><Shift>z"]),
-    ("win.zoom-in", &["plus", "<Control>plus"]),
-    ("win.zoom-out", &["minus", "<Control>minus"]),
+    (
+        "win.zoom-in",
+        &[
+            "plus",
+            "equal",
+            "KP_Add",
+            "<Control>plus",
+            "<Control>equal",
+            "<Control>KP_Add",
+        ],
+    ),
+    (
+        "win.zoom-out",
+        &[
+            "minus",
+            "KP_Subtract",
+            "<Control>minus",
+            "<Control>KP_Subtract",
+        ],
+    ),
     ("win.fit", &["0"]),
     ("win.zoom-100", &["1"]),
     ("win.zoom-200", &["2"]),
@@ -27,8 +45,8 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.zoom-800", &["8"]),
     ("win.zoom-900", &["9"]),
     ("win.toggle-filter", &["x"]),
-    ("win.previous", &["Left", "Page_Up"]),
-    ("win.next", &["Right", "Page_Down"]),
+    ("win.previous", &["<Alt>Left", "Page_Up"]),
+    ("win.next", &["<Alt>Right", "Page_Down"]),
     ("win.delete-file", &["Delete"]),
     ("win.rotate-clockwise", &["r"]),
     ("win.rotate-counterclockwise", &["<Shift>r"]),
@@ -37,10 +55,8 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.crop", &["c"]),
     ("win.measure", &["m"]),
     ("win.scale-preview", &["s"]),
-    ("win.confirm-crop", &["Return", "KP_Enter"]),
     ("win.compare", &["d"]),
     ("win.pencil", &["p"]),
-    ("win.select-object", &["a"]),
     ("win.fullscreen", &["F11"]),
     ("win.cancel-tool", &["Escape"]),
 ];
@@ -79,13 +95,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_c_is_reserved_for_copying_the_full_image() {
+    fn control_c_uses_the_contextual_copy_action() {
         assert!(SHORTCUTS.contains(&("win.copy-image", &["<Control>c"])));
+        assert!(
+            !SHORTCUTS
+                .iter()
+                .any(|(action, _)| *action == "win.select-object")
+        );
+    }
+
+    #[test]
+    fn zoom_shortcuts_cover_main_and_keypad_keys() {
+        let zoom_in = SHORTCUTS
+            .iter()
+            .find(|(action, _)| *action == "win.zoom-in")
+            .map(|(_, shortcuts)| *shortcuts)
+            .expect("zoom-in shortcuts");
+        let zoom_out = SHORTCUTS
+            .iter()
+            .find(|(action, _)| *action == "win.zoom-out")
+            .map(|(_, shortcuts)| *shortcuts)
+            .expect("zoom-out shortcuts");
+
+        assert!(zoom_in.contains(&"equal"));
+        assert!(zoom_in.contains(&"KP_Add"));
+        assert!(zoom_out.contains(&"minus"));
+        assert!(zoom_out.contains(&"KP_Subtract"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn configured_accelerators_are_valid_gtk_syntax() {
+        gtk::init().expect("GTK display initialization");
+        for (action, accelerators) in SHORTCUTS {
+            for accelerator in *accelerators {
+                assert!(
+                    gtk::accelerator_parse(*accelerator).is_some(),
+                    "invalid accelerator {accelerator:?} for {action}"
+                );
+            }
+        }
     }
 
     #[test]
     fn edit_tools_have_single_key_accelerators() {
         assert!(SHORTCUTS.contains(&("win.measure", &["m"])));
         assert!(SHORTCUTS.contains(&("win.scale-preview", &["s"])));
+    }
+
+    #[test]
+    fn image_navigation_keeps_unmodified_arrows_out_of_global_accelerators() {
+        assert!(SHORTCUTS.contains(&("win.previous", &["<Alt>Left", "Page_Up"])));
+        assert!(SHORTCUTS.contains(&("win.next", &["<Alt>Right", "Page_Down"])));
+        assert!(!SHORTCUTS.iter().any(|(_, accelerators)| {
+            accelerators
+                .iter()
+                .any(|accelerator| matches!(*accelerator, "Left" | "Right"))
+        }));
+    }
+
+    #[test]
+    fn enter_is_scoped_to_the_focused_canvas() {
+        assert!(!SHORTCUTS.iter().any(|(_, accelerators)| {
+            accelerators
+                .iter()
+                .any(|accelerator| matches!(*accelerator, "Return" | "KP_Enter"))
+        }));
     }
 }

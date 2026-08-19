@@ -8,6 +8,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crate::document::{BrushPoint, StrokePath};
+use crate::i18n::gettext;
 
 const MAX_FIT_ZOOM: f64 = 16_384.0;
 const COORDINATE_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
@@ -35,7 +36,9 @@ fn aligned_render_pixel_scale(zoom: f64, render_scale: f64) -> Option<f64> {
 }
 
 fn coordinate_tooltip_text((x, y): (u32, u32)) -> String {
-    format!("X {x} · Y {y}")
+    gettext("X {x} · Y {y}")
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string())
 }
 
 fn measured_image_dimension(
@@ -264,7 +267,7 @@ mod imp {
             object.set_focusable(true);
             object.set_overflow(gtk::Overflow::Hidden);
             object.install_coordinate_tooltip();
-            object.update_property(&[gtk::accessible::Property::Label("Image canvas")]);
+            object.update_property(&[gtk::accessible::Property::Label(&gettext("Image canvas"))]);
         }
     }
 
@@ -332,11 +335,9 @@ mod imp {
                 }
                 image_bounds
             });
-            if let Some(lens) = self.lens.borrow().as_ref() {
-                draw_lens(snapshot, bounds, lens);
-            }
+            let pencil_overlay = self.pencil_overlay.borrow();
             if let Some(image_bounds) = image_bounds
-                && let Some(overlay) = self.pencil_overlay.borrow().as_ref()
+                && let Some(overlay) = pencil_overlay.as_ref()
             {
                 draw_pencil_overlay(
                     snapshot,
@@ -347,6 +348,9 @@ mod imp {
                         .map_or((1, 1), |texture| (texture.width(), texture.height())),
                     overlay,
                 );
+            }
+            if let Some(lens) = self.lens.borrow().as_ref() {
+                draw_lens(snapshot, bounds, lens, pencil_overlay.as_ref());
             }
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
@@ -464,7 +468,12 @@ mod imp {
         snapshot.pop();
     }
 
-    fn draw_lens(snapshot: &gtk::Snapshot, bounds: gtk::graphene::Rect, lens: &Lens) {
+    pub(super) fn draw_lens(
+        snapshot: &gtk::Snapshot,
+        bounds: gtk::graphene::Rect,
+        lens: &Lens,
+        pencil_overlay: Option<&PencilOverlay>,
+    ) {
         let center_x = lens.normalized_x.clamp(0.0, 1.0) * bounds.width();
         let center_y = lens.normalized_y.clamp(0.0, 1.0) * bounds.height();
         let diameter = lens.diameter.max(32.0);
@@ -491,6 +500,14 @@ mod imp {
         snapshot.push_blend(gtk::gsk::BlendMode::Difference);
         snapshot.append_scaled_texture(&lens.texture, gtk::gsk::ScalingFilter::Nearest, &scaled);
         snapshot.pop();
+        if let Some(overlay) = pencil_overlay {
+            draw_pencil_overlay(
+                snapshot,
+                scaled,
+                (lens.texture.width(), lens.texture.height()),
+                overlay,
+            );
+        }
         if lens.show_cross {
             let cross = gdk::RGBA::WHITE;
             snapshot.append_color(
@@ -552,11 +569,11 @@ mod imp {
         image_bounds: gtk::graphene::Rect,
         flash: &MaskFlash,
     ) {
-        snapshot.append_scaled_texture(
-            &flash.texture,
-            gtk::gsk::ScalingFilter::Nearest,
-            &overlay_rect(image_bounds, &flash.bounds),
-        );
+        let bounds = overlay_rect(image_bounds, &flash.bounds);
+        snapshot.append_scaled_texture(&flash.texture, gtk::gsk::ScalingFilter::Nearest, &bounds);
+        let blue = gdk::RGBA::new(0.21, 0.52, 0.89, 0.95);
+        let rounded = gtk::gsk::RoundedRect::from_rect(bounds, 0.0);
+        snapshot.append_border(&rounded, &[2.0; 4], &[blue; 4]);
     }
 
     fn draw_measurement_layer(
@@ -700,9 +717,11 @@ mod imp {
 
     pub(super) fn measurement_labels(measurement: CropOverlay) -> (String, String, String) {
         (
-            format!("X {} · Y {}", measurement.x, measurement.y),
-            format!("W {} px", measurement.width),
-            format!("H {} px", measurement.height),
+            gettext("X {x} · Y {y}")
+                .replace("{x}", &measurement.x.to_string())
+                .replace("{y}", &measurement.y.to_string()),
+            gettext("W {width} px").replace("{width}", &measurement.width.to_string()),
+            gettext("H {height} px").replace("{height}", &measurement.height.to_string()),
         )
     }
 
@@ -1289,6 +1308,73 @@ mod tests {
             );
             assert!(snapshot.to_node().is_some());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn lens_magnifies_the_active_pencil_overlay() {
+        fn find_stroke(node: &gtk::gsk::RenderNode) -> Option<gtk::gsk::StrokeNode> {
+            if let Ok(stroke) = node.clone().downcast::<gtk::gsk::StrokeNode>() {
+                return Some(stroke);
+            }
+            if let Ok(container) = node.clone().downcast::<gtk::gsk::ContainerNode>() {
+                return (0..container.n_children())
+                    .map(|index| container.child(index))
+                    .find_map(|child| find_stroke(&child));
+            }
+            if let Ok(clip) = node.clone().downcast::<gtk::gsk::ClipNode>() {
+                return find_stroke(&clip.child());
+            }
+            if let Ok(clip) = node.clone().downcast::<gtk::gsk::RoundedClipNode>() {
+                return find_stroke(&clip.child());
+            }
+            if let Ok(blend) = node.clone().downcast::<gtk::gsk::BlendNode>() {
+                return find_stroke(&blend.bottom_child())
+                    .or_else(|| find_stroke(&blend.top_child()));
+            }
+            None
+        }
+
+        gtk::init().expect("GTK display initialization");
+        let pixels = glib::Bytes::from_owned(vec![0_u8; 10 * 10 * 4]);
+        let texture: gdk::Texture =
+            gdk::MemoryTexture::new(10, 10, gdk::MemoryFormat::R8g8b8a8, &pixels, 10 * 4).upcast();
+        let lens = Lens {
+            texture,
+            normalized_x: 0.5,
+            normalized_y: 0.5,
+            diameter: 80.0,
+            magnification: 4.0,
+            show_cross: true,
+        };
+        let overlay = PencilOverlay {
+            points: vec![
+                BrushPoint {
+                    x: 4.5,
+                    y: 4.5,
+                    pressure: 1.0,
+                },
+                BrushPoint {
+                    x: 5.5,
+                    y: 5.5,
+                    pressure: 1.0,
+                },
+            ],
+            path: StrokePath::Linear,
+            color: [255, 0, 0, 255],
+            width: 1.0,
+        };
+        let snapshot = gtk::Snapshot::new();
+        imp::draw_lens(
+            &snapshot,
+            gtk::graphene::Rect::new(0.0, 0.0, 100.0, 100.0),
+            &lens,
+            Some(&overlay),
+        );
+
+        let node = snapshot.to_node().expect("lens render node");
+        let stroke = find_stroke(&node).expect("magnified pencil stroke inside lens");
+        assert_eq!(stroke.stroke().line_width(), 40.0);
     }
 
     #[test]
