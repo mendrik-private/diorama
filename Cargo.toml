@@ -32,6 +32,9 @@ rlx-sam2 = { path = "vendor/rlx-sam2" }
 [dev-dependencies]
 base64 = "0.22.1"
 
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

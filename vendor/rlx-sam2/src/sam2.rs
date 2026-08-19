@@ -67,9 +67,19 @@ struct HieraOutputShapes {
     stage_dims: Vec<usize>,
 }
 
+/// Encoded image features that can be reused for multiple prompts.
+///
+/// Construct with [`Sam2::encode_image`] and pass to
+/// [`Sam2::predict_image_with_features`]. Keeping this value alive avoids
+/// rerunning the expensive image encoder for each point or box prompt.
+pub struct Sam2ImageFeatures {
+    stride4: Vec<f32>,
+    stride8: Vec<f32>,
+    stride16: Vec<f32>,
+}
+
 /// Full SAM 2 model — owns the compiled image encoder + every
-/// host-side weight bundle. The encoder result is recomputed per call
-/// (no encoder-caching here; layer above can wrap if needed).
+/// host-side weight bundle.
 pub struct Sam2 {
     cfg: Sam2Config,
     encoder: CompiledGraph,
@@ -210,13 +220,19 @@ impl Sam2 {
         };
         let base_q_n = s_tok + 1 + mask_dec.num_mask_tokens;
         let grid = SAM2_PROMPT_GRID;
-        let tw_ir = super::transformer_ir::compile_two_way_transformer_with_profile(
-            &mask_dec.transformer,
-            base_q_n,
-            grid,
-            device,
-            &compile_profile,
-        )?;
+        // Compile the common single-point prompt shape exactly. The masked
+        // sparse-slot graph is unreliable on the CPU attention backend at the
+        // full 64x64 SAM 2 grid. Other prompt shapes safely use the host
+        // transformer fallback in `mask_decoder_forward`.
+        let tw_ir =
+            rlx_sam_ir::twoway_transformer_ir::TwoWayTransformerCompiled::compile_with_profile(
+                &super::transformer_ir::transformer_spec(&mask_dec.transformer),
+                base_q_n + 2, // foreground point + padding point
+                grid * grid,
+                device,
+                false,
+                &compile_profile,
+            )?;
         let fpn_ir = compile_fpn_neck_ir(
             &fpn,
             &hiera_shapes.stage_hw,
@@ -319,6 +335,26 @@ impl Sam2 {
         )
     }
 
+    /// Encode an image once for reuse across interactive prompts.
+    pub fn encode_image(
+        &mut self,
+        image_u8: &[u8],
+        h_in: usize,
+        w_in: usize,
+    ) -> Result<Sam2ImageFeatures> {
+        let mut levels = self.encode(image_u8, h_in, w_in)?;
+        ensure!(
+            levels.len() >= 3,
+            "image encoder produced {} FPN levels (expected at least 3)",
+            levels.len()
+        );
+        Ok(Sam2ImageFeatures {
+            stride4: std::mem::take(&mut levels[0].features),
+            stride8: std::mem::take(&mut levels[1].features),
+            stride16: std::mem::take(&mut levels[2].features),
+        })
+    }
+
     /// Image-segmentation API.
     ///
     /// `image_u8`: row-major RGB `h_in × w_in × 3` u8.
@@ -344,12 +380,36 @@ impl Sam2 {
         mask_input: Option<&[f32]>,
         multimask_output: bool,
     ) -> Result<Sam2ImagePrediction> {
-        let levels = self.encode(image_u8, h_in, w_in)?;
-        // FPN levels are fine→coarse: stride 4, 8, 16, 32.
-        // Image embedding for the mask decoder is the stride-16 level
-        // (index 2). High-res features are stride-4 + stride-8.
+        let features = self.encode_image(image_u8, h_in, w_in)?;
+        self.predict_image_with_features(
+            &features,
+            points,
+            boxes,
+            mask_input,
+            multimask_output,
+        )
+    }
+
+    /// Predict a mask from image features produced by [`Sam2::encode_image`].
+    ///
+    /// This is the low-latency interactive path: the prompt encoder and mask
+    /// decoder run, while the image encoder is not recomputed.
+    pub fn predict_image_with_features(
+        &mut self,
+        features: &Sam2ImageFeatures,
+        points: Option<(&[f32], &[f32])>,
+        boxes: Option<&[f32]>,
+        mask_input: Option<&[f32]>,
+        multimask_output: bool,
+    ) -> Result<Sam2ImagePrediction> {
         let prompt = self.run_prompt(points, boxes, mask_input)?;
-        let dec = self.run_decoder(&levels, &prompt, multimask_output)?;
+        let dec = self.run_decoder(
+            &features.stride4,
+            &features.stride8,
+            &features.stride16,
+            &prompt,
+            multimask_output,
+        )?;
 
         Ok(Sam2ImagePrediction {
             masks: dec.masks,
@@ -379,30 +439,24 @@ impl Sam2 {
 
     fn run_decoder(
         &mut self,
-        levels: &[FpnLevel],
+        stride4: &[f32],
+        stride8: &[f32],
+        stride16: &[f32],
         prompt: &Sam2PromptEncoderOutput,
         multimask_output: bool,
     ) -> Result<Sam2MaskDecoderOutput> {
-        let lvl_stride16 = &levels[2]; // stride 16 → 64×64
-        let lvl_stride8 = &levels[1]; // stride 8  → 128×128
-        let lvl_stride4 = &levels[0]; // stride 4  → 256×256
-
         let high_res_features = if self.mask_dec.use_high_res_features {
-            Some((
-                lvl_stride4.features.as_slice(),
-                lvl_stride8.features.as_slice(),
-            ))
+            Some((stride4, stride8))
         } else {
             None
         };
 
         ensure!(
-            lvl_stride16.h == SAM2_PROMPT_GRID && lvl_stride16.w == SAM2_PROMPT_GRID,
-            "stride-16 FPN level must be {}×{} (got {}×{})",
-            SAM2_PROMPT_GRID,
-            SAM2_PROMPT_GRID,
-            lvl_stride16.h,
-            lvl_stride16.w
+            stride16.len()
+                == self.cfg.decoder.transformer_dim * SAM2_PROMPT_GRID * SAM2_PROMPT_GRID,
+            "stride-16 FPN feature length must be {} (got {})",
+            self.cfg.decoder.transformer_dim * SAM2_PROMPT_GRID * SAM2_PROMPT_GRID,
+            stride16.len()
         );
 
         mask_decoder_forward(
@@ -414,8 +468,8 @@ impl Sam2 {
             self.obj_score_head_ir.as_mut(),
             self.obj_ptr_proj_ir.as_mut(),
             Some(&mut self.tw_ir),
-            &lvl_stride16.features,
-            &lvl_stride16.pos,
+            stride16,
+            &prompt.image_pe,
             &prompt.sparse_embeddings,
             prompt.num_sparse_tokens,
             &prompt.dense_embeddings,
@@ -507,7 +561,13 @@ impl Sam2 {
         levels[3].features = conditioned_stride32;
 
         let prompt = self.run_prompt(points, boxes, mask_input)?;
-        let dec = self.run_decoder(&levels, &prompt, multimask_output)?;
+        let dec = self.run_decoder(
+            &levels[0].features,
+            &levels[1].features,
+            &levels[2].features,
+            &prompt,
+            multimask_output,
+        )?;
 
         // Encode the chosen mask + stride-16 features into memory and
         // push them onto the state's bank.

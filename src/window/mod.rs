@@ -13,8 +13,8 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use libadwaita as adw;
 use palette::FromColor as _;
-use rlx_sam2::Sam2;
 
+use crate::ai::ObjectDetector;
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
 use crate::document::{
@@ -27,6 +27,7 @@ use crate::image::{
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
 use crate::settings::{ColorFormat, Settings, ZoomMode};
+use crate::tools::crop::CropBounds;
 
 #[derive(Clone)]
 pub struct ViewerWindow(Rc<WindowState>);
@@ -92,6 +93,12 @@ struct ZoomRectDrag {
     start_screen: (f64, f64),
     image_dimensions: (u32, u32),
     load_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PencilZoomKey {
+    In,
+    Out,
 }
 
 struct PencilDrag {
@@ -456,6 +463,30 @@ fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64>
     )
 }
 
+fn pencil_zoom_key(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+    pencil_active: bool,
+) -> Option<PencilZoomKey> {
+    if !pencil_active
+        || modifiers.intersects(
+            gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK
+                | gtk::gdk::ModifierType::HYPER_MASK
+                | gtk::gdk::ModifierType::META_MASK,
+        )
+    {
+        return None;
+    }
+    match key {
+        gtk::gdk::Key::plus | gtk::gdk::Key::equal | gtk::gdk::Key::KP_Add => {
+            Some(PencilZoomKey::In)
+        }
+        gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => Some(PencilZoomKey::Out),
+        _ => None,
+    }
+}
+
 fn no_tool_active(active_tools: &[bool]) -> bool {
     !active_tools.iter().any(|active| *active)
 }
@@ -739,10 +770,11 @@ struct WindowState {
     measurement_button: gtk::ToggleButton,
     measurement_drag: Cell<Option<MeasurementDrag>>,
     zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
+    zoom_rect_selection: Cell<Option<CropOverlay>>,
     selection_button: gtk::ToggleButton,
     selection_drag: Cell<Option<SelectionDrag>>,
     color_picker_button: gtk::ToggleButton,
-    sam2: Arc<Mutex<Option<Sam2>>>,
+    sam2: Arc<Mutex<Option<ObjectDetector>>>,
     object_detection_running: Cell<bool>,
     object_detection_progress: gtk::Box,
     object_detection_progress_label: gtk::Label,
@@ -1191,6 +1223,7 @@ impl ViewerWindow {
             measurement_button: header_widgets.measurement_button,
             measurement_drag: Cell::new(None),
             zoom_rect_drag: Cell::new(None),
+            zoom_rect_selection: Cell::new(None),
             selection_button: header_widgets.selection_button,
             selection_drag: Cell::new(None),
             color_picker_button: header_widgets.color_picker_button,
@@ -1565,7 +1598,7 @@ impl ViewerWindow {
         });
         self.add_action("copy-image", {
             let this = self.clone();
-            move || this.copy_current_image_to_clipboard()
+            move || this.copy_current_selection_or_image_to_clipboard()
         });
         self.add_action("zoom-in", {
             let this = self.clone();
@@ -1810,7 +1843,9 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
-                if this.0.zoom_rect_drag.get().is_some() {
+                if this.0.zoom_rect_drag.get().is_some()
+                    || this.0.zoom_rect_selection.get().is_some()
+                {
                     this.cancel_zoom_rect_drag();
                     return;
                 }
@@ -1888,6 +1923,21 @@ impl ViewerWindow {
     }
 
     fn install_navigation_keys(&self) {
+        let pencil_zoom = gtk::EventControllerKey::new();
+        pencil_zoom.set_propagation_phase(gtk::PropagationPhase::Capture);
+        pencil_zoom.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| {
+                let Some(direction) = pencil_zoom_key(key, modifiers, this.0.pencil_active.get())
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                this.step_zoom(direction == PencilZoomKey::In);
+                glib::Propagation::Stop
+            }
+        });
+        self.0.window.add_controller(pencil_zoom);
+
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed({
             let this = self.clone();
@@ -1905,6 +1955,13 @@ impl ViewerWindow {
                     && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
                 {
                     this.confirm_scale_preview();
+                    return glib::Propagation::Stop;
+                }
+                if matches!(
+                    key,
+                    gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
+                ) && this.zoom_selected_rect()
+                {
                     return glib::Propagation::Stop;
                 }
                 if this.active_keyboard_tool().is_some() {
@@ -2922,6 +2979,14 @@ impl ViewerWindow {
         ));
     }
 
+    fn copy_current_selection_or_image_to_clipboard(&self) {
+        if let Some(selection) = self.0.zoom_rect_selection.get() {
+            self.copy_zoom_rect_to_clipboard(selection);
+        } else {
+            self.copy_current_image_to_clipboard();
+        }
+    }
+
     fn open_with(&self) {
         let Some(file) = self.0.current_file.borrow().clone() else {
             self.0
@@ -3055,12 +3120,12 @@ impl ViewerWindow {
             )));
             return;
         }
-        let first_use = self
+        let detector_unloaded = self
             .0
             .sam2
             .lock()
             .map_or(true, |detector| detector.is_none());
-        let message = if first_use {
+        let message = if detector_unloaded && !crate::ai::sam2_is_cached() {
             gettext("Downloading SAM 2 Tiny (156 MB, Apache-2.0) — first use may take a while")
         } else {
             gettext("Segmenting object…")
@@ -3091,19 +3156,20 @@ impl ViewerWindow {
         });
         let sam2 = Arc::clone(&self.0.sam2);
         let generation = self.0.load_generation.get();
+        let render_generation = self.0.render_generation.get();
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || {
                 let mut sam2 = sam2
                     .lock()
                     .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
-                if sam2.is_none() {
-                    *sam2 = Some(crate::ai::load_sam2()?);
-                }
-                let sam2 = sam2
-                    .as_mut()
-                    .ok_or(crate::error::AppError::AiModelUnavailable)?;
-                crate::ai::select_object_at(sam2, image, point.0, point.1)
+                crate::ai::select_object_at(
+                    &mut sam2,
+                    image,
+                    point.0,
+                    point.1,
+                    (generation, render_generation),
+                )
             })
             .await;
             let Some(state) = weak.upgrade() else {
@@ -3111,16 +3177,21 @@ impl ViewerWindow {
             };
             state.object_detection_running.set(false);
             state.object_detection_progress.set_visible(false);
-            if state.load_generation.get() != generation {
+            if state.load_generation.get() != generation
+                || state.render_generation.get() != render_generation
+            {
                 return;
             }
             let this = ViewerWindow(state.clone());
             match result {
                 Ok(Ok(Some(selected))) => {
                     this.flash_object_mask(&selected);
-                    state
-                        .toasts
-                        .add_toast(adw::Toast::new(&gettext("Selected object with SAM 2")));
+                    this.copy_image_to_clipboard(
+                        &selected.image,
+                        &gettext("Copied {width} × {height} selection")
+                            .replace("{width}", &selected.bounds.width.to_string())
+                            .replace("{height}", &selected.bounds.height.to_string()),
+                    );
                 }
                 Ok(Ok(None)) => state.toasts.add_toast(adw::Toast::new(&gettext(
                     "No detected object contains that pixel",
@@ -4301,7 +4372,7 @@ impl ViewerWindow {
                 gettext("General"),
                 vec![
                     (gettext("Open"), "<Control>o"),
-                    (gettext("Copy Image"), "<Control>c"),
+                    (gettext("Copy Image or Selection"), "<Control>c"),
                     (gettext("Save"), "<Control>s"),
                     (gettext("Save As"), "<Control><Shift>s"),
                     (gettext("Close"), "<Control>w"),
@@ -5398,9 +5469,20 @@ impl ViewerWindow {
     }
 
     fn cancel_zoom_rect_drag(&self) {
-        if self.0.zoom_rect_drag.take().is_some() {
+        let had_drag = self.0.zoom_rect_drag.take().is_some();
+        let had_selection = self.0.zoom_rect_selection.take().is_some();
+        if had_drag || had_selection {
             self.0.canvas.set_crop_overlay(None);
         }
+    }
+
+    fn zoom_selected_rect(&self) -> bool {
+        let Some(selection) = self.0.zoom_rect_selection.take() else {
+            return false;
+        };
+        self.0.canvas.set_crop_overlay(None);
+        self.zoom_to_rect(selection);
+        true
     }
 
     fn zoom_to_rect(&self, selection: CropOverlay) {
@@ -5435,7 +5517,45 @@ impl ViewerWindow {
         });
     }
 
+    fn copy_zoom_rect_to_clipboard(&self, selection: CropOverlay) {
+        if selection.width == 0 || selection.height == 0 {
+            return;
+        }
+        let Some(texture) = self.0.canvas.texture() else {
+            return;
+        };
+        if texture.width() as u32 != selection.image_width
+            || texture.height() as u32 != selection.image_height
+        {
+            return;
+        }
+        let Some(image) = rgba_from_texture(&texture) else {
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Could not copy the selected image area",
+            )));
+            return;
+        };
+        let bounds = CropBounds {
+            x: selection.x,
+            y: selection.y,
+            width: selection.width,
+            height: selection.height,
+        };
+        match crate::tools::selection::crop(&image, bounds) {
+            Ok(fragment) => self.copy_image_to_clipboard(
+                &fragment,
+                &gettext("Copied {width} × {height} selection")
+                    .replace("{width}", &bounds.width.to_string())
+                    .replace("{height}", &bounds.height.to_string()),
+            ),
+            Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error.to_string())),
+        }
+    }
+
     fn step_zoom(&self, zoom_in: bool) {
+        if self.0.pencil_active.get() {
+            self.abort_pencil_drag();
+        }
         let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
             stepped_hard_zoom(self.0.canvas.zoom(), self.0.render_scale.get(), zoom_in)
         } else {
@@ -6551,6 +6671,8 @@ impl ViewerWindow {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.0.zoom_rect_selection.set(None);
+                this.0.canvas.grab_focus();
                 let drag = ZoomRectDrag {
                     start,
                     current: start,
@@ -6599,11 +6721,28 @@ impl ViewerWindow {
                 ) {
                     drag.current = current;
                 }
-                this.0.canvas.set_crop_overlay(None);
                 if drag.load_generation == this.0.load_generation.get()
                     && this.zoom_rect_drag_available()
                 {
-                    this.zoom_to_rect(zoom_rect_overlay(drag));
+                    let selection = zoom_rect_overlay(drag);
+                    if selection.width > 0 && selection.height > 0 {
+                        this.0.zoom_rect_selection.set(Some(selection));
+                        this.0.canvas.set_crop_overlay(Some(selection));
+                        this.0.canvas.announce(
+                            &gettext(
+                                "Area selected, {width} by {height} pixels. Press Ctrl+C to copy or Space or Enter to zoom.",
+                            )
+                            .replace("{width}", &selection.width.to_string())
+                            .replace("{height}", &selection.height.to_string()),
+                            gtk::AccessibleAnnouncementPriority::Medium,
+                        );
+                    } else {
+                        this.0.zoom_rect_selection.set(None);
+                        this.0.canvas.set_crop_overlay(None);
+                    }
+                } else {
+                    this.0.zoom_rect_selection.set(None);
+                    this.0.canvas.set_crop_overlay(None);
                 }
             }
         });
@@ -6965,7 +7104,7 @@ fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu_item(&menu, "Open…", "win.open");
     menu_item(&menu, "Open With…", "win.open-with");
-    menu_item(&menu, "Copy Image", "win.copy-image");
+    menu_item(&menu, "Copy Image or Selection", "win.copy-image");
     menu_item(&menu, "Save", "win.save");
     menu_item(&menu, "Save As…", "win.save-as");
     menu_item(&menu, "Compare Images…", "win.compare");
@@ -7236,6 +7375,42 @@ mod tests {
         );
         assert_eq!(
             image_navigation_direction(gtk::gdk::Key::Up, gtk::gdk::ModifierType::empty(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn pencil_mode_claims_zoom_keys_without_treating_control_as_a_line_modifier() {
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::plus,
+                gtk::gdk::ModifierType::SHIFT_MASK,
+                true,
+            ),
+            Some(PencilZoomKey::In)
+        );
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::equal,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                true,
+            ),
+            Some(PencilZoomKey::In)
+        );
+        assert_eq!(
+            pencil_zoom_key(
+                gtk::gdk::Key::KP_Subtract,
+                gtk::gdk::ModifierType::empty(),
+                true,
+            ),
+            Some(PencilZoomKey::Out)
+        );
+        assert_eq!(
+            pencil_zoom_key(gtk::gdk::Key::minus, gtk::gdk::ModifierType::ALT_MASK, true),
+            None
+        );
+        assert_eq!(
+            pencil_zoom_key(gtk::gdk::Key::plus, gtk::gdk::ModifierType::empty(), false),
             None
         );
     }
@@ -8955,7 +9130,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn zoom_rectangle_fits_and_centers_the_selected_region() {
+    fn zoom_rectangle_waits_for_copy_or_zoom_command() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
@@ -8987,7 +9162,27 @@ mod tests {
             ZoomAlignment::Contain,
         );
 
-        window.zoom_to_rect(selection);
+        let initial_zoom = window.0.canvas.zoom();
+        window.0.zoom_rect_selection.set(Some(selection));
+        window.0.canvas.set_crop_overlay(Some(selection));
+        window.copy_current_selection_or_image_to_clipboard();
+        let copied = glib::MainContext::default()
+            .block_on(window.0.window.clipboard().read_texture_future())
+            .expect("clipboard read")
+            .expect("clipboard texture");
+        assert_eq!(
+            rgba_from_texture(&copied),
+            Some(image::RgbaImage::from_pixel(
+                20,
+                10,
+                image::Rgba([1, 2, 3, 255])
+            ))
+        );
+        assert_eq!(window.0.canvas.zoom(), initial_zoom);
+        assert!(window.0.zoom_rect_selection.get().is_some());
+
+        assert!(window.zoom_selected_rect());
+        assert!(window.0.zoom_rect_selection.get().is_none());
         window.0.scrolled.allocate(800, 600, -1, None);
         let context = glib::MainContext::default();
         while context.pending() {

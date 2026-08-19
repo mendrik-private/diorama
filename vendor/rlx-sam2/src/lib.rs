@@ -90,7 +90,7 @@ pub use prompt_encoder::{
     prompt_encoder_forward,
 };
 pub use rlx_sam_ir::twoway_transformer_ir::TwoWayTransformerCompiled;
-pub use sam2::{Sam2, Sam2ImagePrediction, Sam2VideoState};
+pub use sam2::{Sam2, Sam2ImageFeatures, Sam2ImagePrediction, Sam2VideoState};
 pub use transformer::{Sam2TwoWayTransformerWeights, two_way_transformer_forward};
 pub use transformer_ir::compile_two_way_transformer;
 

@@ -263,8 +263,6 @@ pub fn assemble_patch_tokens(pre: &Sam2PreprocessWeights, image_nchw: &[f32]) ->
     let e = pre.embed_dim;
     let grid = pre.grid;
     let k = SAM2_PATCH_KERNEL;
-    let s = SAM2_PATCH_STRIDE;
-    let pad = SAM2_PATCH_PADDING;
     ensure!(
         image_nchw.len() == 3 * SAM2_IMG_SIZE * SAM2_IMG_SIZE,
         "image must be [3, {}, {}] NCHW, got len {}",
@@ -273,20 +271,84 @@ pub fn assemble_patch_tokens(pre: &Sam2PreprocessWeights, image_nchw: &[f32]) ->
         image_nchw.len()
     );
 
-    let h = SAM2_IMG_SIZE;
-    let w = SAM2_IMG_SIZE;
     let mut out = vec![0f32; grid * grid * e];
+
+    // The checkpoint stores [output, input, ky, kx], which makes adjacent
+    // output-channel reads stride across memory in the innermost loop.
+    // Transpose the small kernel once so each pixel update reads contiguous
+    // weights and can be vectorized by LLVM.
+    let input_stride = 3 * k * k;
+    let mut weights_input_major = vec![0f32; input_stride * e];
+    for (output_channel, weights) in pre.patch_proj_w.chunks_exact(input_stride).enumerate() {
+        for (input_index, weight) in weights.iter().enumerate() {
+            weights_input_major[input_index * e + output_channel] = *weight;
+        }
+    }
 
     // Direct Conv2d. Per-output-pixel cost is k·k·in_c·E = 7·7·3·E.
     // For E=112, grid=256 this is ~256² · 7² · 3 · 112 ≈ 1.1 G fmas —
     // about the same as a single transformer block, run once.
-    for py in 0..grid {
+    #[cfg(target_arch = "wasm32")]
+    assemble_patch_rows(pre, image_nchw, &weights_input_major, 0, grid, &mut out);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let rows_per_worker = grid.div_ceil(workers);
+        let weights_input_major = weights_input_major.as_slice();
+        std::thread::scope(|scope| {
+            for (chunk_index, rows) in out
+                .chunks_mut(rows_per_worker * grid * e)
+                .enumerate()
+            {
+                let first_row = chunk_index * rows_per_worker;
+                let row_count = rows.len() / (grid * e);
+                scope.spawn(move || {
+                    assemble_patch_rows(
+                        pre,
+                        image_nchw,
+                        weights_input_major,
+                        first_row,
+                        row_count,
+                        rows,
+                    );
+                });
+            }
+        });
+    }
+
+    // Add stage-0 position embedding (already in BHWC).
+    ensure!(
+        pre.pos_embed_full.len() == grid * grid * e,
+        "pos_embed_full size mismatch"
+    );
+    for i in 0..grid * grid * e {
+        out[i] += pre.pos_embed_full[i];
+    }
+    Ok(out)
+}
+
+fn assemble_patch_rows(
+    pre: &Sam2PreprocessWeights,
+    image_nchw: &[f32],
+    weights_input_major: &[f32],
+    first_row: usize,
+    row_count: usize,
+    out: &mut [f32],
+) {
+    let e = pre.embed_dim;
+    let grid = pre.grid;
+    let k = SAM2_PATCH_KERNEL;
+    let s = SAM2_PATCH_STRIDE;
+    let pad = SAM2_PATCH_PADDING;
+    let h = SAM2_IMG_SIZE;
+    let w = SAM2_IMG_SIZE;
+    debug_assert_eq!(out.len(), row_count * grid * e);
+
+    for (local_row, output_row) in out.chunks_exact_mut(grid * e).enumerate() {
+        let py = first_row + local_row;
         for px in 0..grid {
-            // dst row in BHWC
-            let dst = &mut out[(py * grid + px) * e..(py * grid + px + 1) * e];
-            // Start with bias.
+            let dst = &mut output_row[px * e..(px + 1) * e];
             dst.copy_from_slice(&pre.patch_proj_b);
-            // Convolve.
             for ky in 0..k {
                 let iy = (py * s) as isize + ky as isize - pad as isize;
                 if iy < 0 || iy >= h as isize {
@@ -300,28 +362,18 @@ pub fn assemble_patch_tokens(pre: &Sam2PreprocessWeights, image_nchw: &[f32]) ->
                     }
                     let ix = ix as usize;
                     for c in 0..3 {
-                        let v = image_nchw[c * h * w + iy * w + ix];
-                        // weight is [E, 3, k, k]: row-major
-                        let w_base = c * k * k + ky * k + kx;
-                        let stride = 3 * k * k;
-                        for ei in 0..e {
-                            dst[ei] += v * pre.patch_proj_w[ei * stride + w_base];
+                        let value = image_nchw[c * h * w + iy * w + ix];
+                        let input_index = c * k * k + ky * k + kx;
+                        let weights =
+                            &weights_input_major[input_index * e..(input_index + 1) * e];
+                        for (output, weight) in dst.iter_mut().zip(weights) {
+                            *output += value * weight;
                         }
                     }
                 }
             }
         }
     }
-
-    // Add stage-0 position embedding (already in BHWC).
-    ensure!(
-        pre.pos_embed_full.len() == grid * grid * e,
-        "pos_embed_full size mismatch"
-    );
-    for i in 0..grid * grid * e {
-        out[i] += pre.pos_embed_full[i];
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -343,6 +395,64 @@ mod tests {
                 "channel {c}: {mid} vs {expected}"
             );
         }
+    }
+
+    #[test]
+    fn parallel_patch_projection_matches_checkpoint_weight_layout() {
+        let embed_dim = 5;
+        let grid = 3;
+        let input_stride = 3 * SAM2_PATCH_KERNEL * SAM2_PATCH_KERNEL;
+        let pre = Sam2PreprocessWeights {
+            patch_proj_w: (0..embed_dim * input_stride)
+                .map(|index| index as f32 * 0.000_01 - 0.002)
+                .collect(),
+            patch_proj_b: (0..embed_dim).map(|index| index as f32 * 0.01).collect(),
+            pos_embed_full: vec![0.125; grid * grid * embed_dim],
+            embed_dim,
+            grid,
+        };
+        let image = vec![0.25; 3 * SAM2_IMG_SIZE * SAM2_IMG_SIZE];
+        let actual = assemble_patch_tokens(&pre, &image).unwrap();
+        let mut expected = vec![0f32; grid * grid * embed_dim];
+        for py in 0..grid {
+            for px in 0..grid {
+                let dst =
+                    &mut expected[(py * grid + px) * embed_dim..(py * grid + px + 1) * embed_dim];
+                dst.copy_from_slice(&pre.patch_proj_b);
+                for ky in 0..SAM2_PATCH_KERNEL {
+                    let iy = (py * SAM2_PATCH_STRIDE) as isize + ky as isize
+                        - SAM2_PATCH_PADDING as isize;
+                    if iy < 0 || iy >= SAM2_IMG_SIZE as isize {
+                        continue;
+                    }
+                    for kx in 0..SAM2_PATCH_KERNEL {
+                        let ix = (px * SAM2_PATCH_STRIDE) as isize + kx as isize
+                            - SAM2_PATCH_PADDING as isize;
+                        if ix < 0 || ix >= SAM2_IMG_SIZE as isize {
+                            continue;
+                        }
+                        for channel in 0..3 {
+                            let value = image[channel * SAM2_IMG_SIZE * SAM2_IMG_SIZE
+                                + iy as usize * SAM2_IMG_SIZE
+                                + ix as usize];
+                            let input_index = channel * SAM2_PATCH_KERNEL * SAM2_PATCH_KERNEL
+                                + ky * SAM2_PATCH_KERNEL
+                                + kx;
+                            for output_channel in 0..embed_dim {
+                                dst[output_channel] += value
+                                    * pre.patch_proj_w
+                                        [output_channel * input_stride + input_index];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (value, position) in expected.iter_mut().zip(&pre.pos_embed_full) {
+            *value += position;
+        }
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
