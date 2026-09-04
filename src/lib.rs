@@ -1,4 +1,3 @@
-mod ai;
 mod application;
 mod canvas;
 mod compare;

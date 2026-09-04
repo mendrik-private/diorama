@@ -62,5 +62,6 @@ pub enum Operation {
         preserve_accents: bool,
         protected: Vec<ProtectedColor>,
     },
-    Pencil(Stroke),
+    Annotate(AnnotationEdit),
 }
+use super::AnnotationEdit;

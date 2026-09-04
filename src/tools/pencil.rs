@@ -98,7 +98,8 @@ pub fn paint_stroke(
     stroke: &Stroke,
     cancellation: &CancellationToken,
 ) -> Result<RgbaImage> {
-    if !(1.0..=128.0).contains(&stroke.width)
+    if !stroke.width.is_finite()
+        || stroke.width < 1.0
         || !(0.01..=1.0).contains(&stroke.opacity)
         || !(0.0..=1.0).contains(&stroke.hardness)
     {
@@ -550,7 +551,7 @@ fn stamp(image: &mut RgbaImage, center_x: f32, center_y: f32, pressure: f32, str
     }
 }
 
-fn blend(destination: Rgba<u8>, source: Rgba<u8>, source_alpha: f32) -> Rgba<u8> {
+pub(crate) fn blend(destination: Rgba<u8>, source: Rgba<u8>, source_alpha: f32) -> Rgba<u8> {
     let destination_alpha = f32::from(destination.0[3]) / 255.0;
     let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
     if output_alpha <= f32::EPSILON {

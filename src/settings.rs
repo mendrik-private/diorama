@@ -174,6 +174,16 @@ impl Settings {
         self.set_integer("pencil-size", i32::from(size.clamp(1, 128)));
     }
 
+    pub fn annotation_text_size(&self) -> u16 {
+        self.integer("annotation-text-size")
+            .unwrap_or(24)
+            .clamp(6, 512) as u16
+    }
+
+    pub fn set_annotation_text_size(&self, size: u16) {
+        self.set_integer("annotation-text-size", i32::from(size.clamp(6, 512)));
+    }
+
     pub fn pencil_antialiasing(&self) -> bool {
         self.boolean("pencil-antialiasing").unwrap_or(false)
     }

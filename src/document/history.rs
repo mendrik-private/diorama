@@ -42,6 +42,14 @@ impl<T> History<T> {
         &self.entries[..self.cursor]
     }
 
+    pub(super) fn replace_last(&mut self, value: T) -> bool {
+        if self.cursor == 0 || self.cursor != self.entries.len() {
+            return false;
+        }
+        self.entries[self.cursor - 1] = value;
+        true
+    }
+
     pub(super) fn can_undo(&self) -> bool {
         self.cursor > 0
     }
@@ -69,5 +77,18 @@ mod tests {
         history.push(3);
         assert_eq!(history.active(), &[1, 3]);
         assert!(!history.redo());
+    }
+
+    #[test]
+    fn replacement_requires_the_tip_of_history() {
+        let mut history = History::default();
+        assert!(!history.replace_last(1));
+        history.push(1);
+        assert!(history.replace_last(2));
+        assert_eq!(history.active(), &[2]);
+        history.push(3);
+        assert!(history.undo());
+        assert!(!history.replace_last(4));
+        assert_eq!(history.active(), &[2]);
     }
 }

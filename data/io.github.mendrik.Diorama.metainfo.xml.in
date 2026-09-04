@@ -15,6 +15,11 @@
   <launchable type="desktop-id">io.github.mendrik.Diorama.desktop</launchable>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0" date="2026-09-04">
+      <description>
+        <p>Adds editable vector highlights, arrows, measurements, and curved text; improves pixel-perfect zoom under fractional scaling; and removes object-segmentation downloads.</p>
+      </description>
+    </release>
     <release version="0.2.8" date="2026-08-13" />
     <release version="0.2.6" date="2026-07-30" />
     <release version="0.2.5" date="2026-07-29" />

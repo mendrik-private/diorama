@@ -28,3 +28,18 @@ install_data(
   'icons/hicolor/scalable/actions/ruler-measure-symbolic.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'actions',
 )
+install_data(
+  'icons/hicolor/scalable/actions/pencil-symbolic.svg',
+  'icons/hicolor/scalable/actions/highlight-symbolic.svg',
+  'icons/hicolor/scalable/actions/arrow-symbolic.svg',
+  'icons/hicolor/scalable/actions/text-symbolic.svg',
+  install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'actions',
+)
+install_data(
+  'fonts/Excalifont-Regular.ttf',
+  install_dir: get_option('datadir') / 'fonts' / 'truetype' / 'diorama',
+)
+install_data(
+  'fonts/OFL-Excalifont.txt',
+  install_dir: get_option('datadir') / 'doc' / meson.project_name(),
+)

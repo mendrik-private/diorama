@@ -8,14 +8,17 @@ pub(super) enum ZoomAlignment {
     Cover,
 }
 
-pub(super) fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64> {
-    if !usable_panel_size(viewport) || selection.width == 0 || selection.height == 0 {
+pub(super) fn zoom_rect_target(viewport: (f64, f64), selection: CropOverlay) -> Option<f64> {
+    if !viewport.0.is_finite()
+        || !viewport.1.is_finite()
+        || viewport.0 <= 1.0
+        || viewport.1 <= 1.0
+        || selection.width == 0
+        || selection.height == 0
+    {
         return None;
     }
-    Some(
-        (f64::from(viewport.0) / f64::from(selection.width))
-            .min(f64::from(viewport.1) / f64::from(selection.height)),
-    )
+    Some((viewport.0 / f64::from(selection.width)).min(viewport.1 / f64::from(selection.height)))
 }
 
 pub(super) fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
@@ -34,42 +37,40 @@ pub(super) fn fit_on_load(force_fit: bool, zoom_mode: ZoomMode) -> Option<bool> 
     }
 }
 
-pub(super) fn normalized_render_scale(scale: f64) -> f64 {
+pub(super) fn sanitized_render_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
-        scale.round().max(1.0)
+        scale
     } else {
         1.0
     }
 }
 
 pub(super) fn aligned_hard_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
-    if zoom < 1.0 {
-        return zoom;
-    }
-    let render_scale = normalized_render_scale(render_scale);
+    let render_scale = sanitized_render_scale(render_scale);
     let render_zoom = zoom * render_scale;
     let render_zoom = match alignment {
         ZoomAlignment::Nearest => render_zoom.round(),
         ZoomAlignment::Contain => render_zoom.floor(),
         ZoomAlignment::Cover => render_zoom.ceil(),
     }
-    .max(render_scale);
+    .max(1.0);
     render_zoom / render_scale
 }
 
+pub(super) fn aligned_hard_fit_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
+    if zoom * sanitized_render_scale(render_scale) < 1.0 {
+        return zoom;
+    }
+    aligned_hard_zoom(zoom, render_scale, alignment)
+}
+
 pub(super) fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {
-    let render_scale = normalized_render_scale(render_scale);
+    let render_scale = sanitized_render_scale(render_scale);
     let render_zoom = zoom * render_scale;
-    let next = if zoom >= 1.0 {
-        if zoom_in {
-            render_zoom.floor() + 1.0
-        } else if zoom > 1.0 + 1e-6 {
-            (render_zoom.ceil() - 1.0).max(render_scale)
-        } else {
-            render_zoom * 0.8
-        }
+    let next = if zoom_in {
+        render_zoom.floor() + 1.0
     } else {
-        render_zoom * if zoom_in { 1.25 } else { 0.8 }
+        (render_zoom.ceil() - 1.0).max(1.0)
     };
     next / render_scale
 }

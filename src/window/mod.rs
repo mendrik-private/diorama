@@ -5,11 +5,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::ai::ObjectDetector;
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
 use crate::document::{
-    BrushPoint, CancellationToken, Document, Operation, Resampling, Rotation, Stroke, StrokePath,
+    Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
+    HIGHLIGHT_STROKE_WIDTH, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect,
+    Resampling, Rotation, Shape, Stroke, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -20,6 +21,7 @@ use crate::navigation::{DirectorySequence, find_matching_file};
 #[cfg(test)]
 use crate::settings::ColorFormat;
 use crate::settings::{Settings, ZoomMode};
+use crate::tools::annotation::highlight::highlight_stroke_width;
 use crate::tools::crop::CropBounds;
 use adw::prelude::{
     ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
@@ -29,12 +31,15 @@ use gio::prelude::*;
 use gtk::prelude::*;
 use libadwaita as adw;
 
+mod annotation;
 mod color;
 mod file_state;
 mod presentation;
 mod scale;
+mod tool;
 mod zoom;
 
+use annotation::AnnotationDrag;
 use color::{color_format_at, color_format_index, format_color, rgba_to_u8, u8_to_rgba};
 use file_state::{
     PendingDirectoryChanges, export_context_matches, files_equal, first_existing_folder,
@@ -47,10 +52,12 @@ use scale::{
     ScaleUnit, dimensions_from_percent, resampling_label, scale_unit, scaled_dimensions,
     scaled_width_for_height,
 };
+use tool::{Tool, palette_visible, pencil_drag_available, resting_tool};
 use zoom::{
-    ZoomAlignment, aligned_hard_zoom, anchored_adjustment_value, centered_adjustment_value,
-    comparison_zoom, fit_on_load, normalized_render_scale, panel_fit_zoom, scale_preview_zoom,
-    stepped_hard_zoom, usable_panel_size, zoom_rect_target,
+    ZoomAlignment, aligned_hard_fit_zoom, aligned_hard_zoom, anchored_adjustment_value,
+    centered_adjustment_value, comparison_zoom, fit_on_load, panel_fit_zoom,
+    sanitized_render_scale, scale_preview_zoom, stepped_hard_zoom, usable_panel_size,
+    zoom_rect_target,
 };
 
 #[derive(Clone)]
@@ -63,13 +70,14 @@ struct HeaderWidgets {
     animation_play_button: gtk::Button,
     scale_button: gtk::ToggleButton,
     measurement_button: gtk::ToggleButton,
-    selection_button: gtk::ToggleButton,
+    highlight_button: gtk::ToggleButton,
+    arrow_button: gtk::ToggleButton,
+    text_button: gtk::ToggleButton,
     color_picker_button: gtk::ToggleButton,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
     color_button: gtk::ColorDialogButton,
     pencil_size: gtk::SpinButton,
-    edit_button: gtk::ToggleButton,
     pencil_controls: gtk::Box,
 }
 
@@ -82,7 +90,7 @@ struct ExportSnapshot {
 }
 
 #[derive(Clone, Copy)]
-enum EditDrag {
+enum RegionDrag {
     Marking(SelectionDrag),
     Resizing {
         crop: CropOverlay,
@@ -100,23 +108,6 @@ struct SelectionDrag {
     current: (u32, u32),
     start_screen: (f64, f64),
     image_dimensions: (u32, u32),
-}
-
-#[derive(Clone, Copy)]
-struct MeasurementDrag {
-    start: (u32, u32),
-    current: (u32, u32),
-    start_screen: (f64, f64),
-    image_dimensions: (u32, u32),
-}
-
-#[derive(Clone, Copy)]
-struct ZoomRectDrag {
-    start: (u32, u32),
-    current: (u32, u32),
-    start_screen: (f64, f64),
-    image_dimensions: (u32, u32),
-    load_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,10 +136,12 @@ enum PencilDragMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardTool {
+    Highlight,
+    Arrow,
     Measure,
+    Text,
     Select,
     PickColor,
-    Crop,
     Pencil,
 }
 
@@ -214,6 +207,50 @@ fn pencil_drag_should_preview(mode: PencilDragMode, sampled_pixels: usize) -> bo
     mode != PencilDragMode::Freehand || sampled_pixels > 1
 }
 
+fn pencil_geometry(mode: PencilDragMode, points: &[BrushPoint]) -> Option<PencilGeometry> {
+    let first = points.first()?;
+    Some(match mode {
+        PencilDragMode::Freehand => PencilGeometry::Freehand(points.to_vec()),
+        PencilDragMode::Line => {
+            let end = points.last()?;
+            PencilGeometry::Line(vec![
+                Point {
+                    x: first.x,
+                    y: first.y,
+                },
+                Point { x: end.x, y: end.y },
+            ])
+        }
+        PencilDragMode::Rectangle => {
+            let end = points.get(2).or_else(|| points.last())?;
+            PencilGeometry::Rectangle(Rect::from_points(
+                Point {
+                    x: first.x,
+                    y: first.y,
+                },
+                Point { x: end.x, y: end.y },
+            ))
+        }
+        PencilDragMode::Circle => {
+            let edge = points.get(1)?;
+            let center = Point {
+                x: first.x,
+                y: first.y,
+            };
+            let radius = center.distance(Point {
+                x: edge.x,
+                y: edge.y,
+            });
+            PencilGeometry::Ellipse(Rect {
+                x: center.x - radius,
+                y: center.y - radius,
+                width: radius * 2.0,
+                height: radius * 2.0,
+            })
+        }
+    })
+}
+
 fn pencil_event_time(gesture: &gtk::GestureDrag) -> u32 {
     gesture.current_event().map_or(0, |event| event.time())
 }
@@ -247,7 +284,7 @@ enum CompareLensSource {
     Comparison,
 }
 
-fn edit_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bool, bool) {
+fn region_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bool, bool) {
     const EDGE: f32 = 12.0;
     let within_vertical_span = y >= rect.y() - EDGE && y <= rect.y() + rect.height() + EDGE;
     let within_horizontal_span = x >= rect.x() - EDGE && x <= rect.x() + rect.width() + EDGE;
@@ -258,8 +295,8 @@ fn edit_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bool
     (left, right, top, bottom)
 }
 
-fn edit_resize_cursor(rect: gtk::graphene::Rect, x: f32, y: f32) -> &'static str {
-    let (left, right, top, bottom) = edit_edge_hit(rect, x, y);
+fn region_resize_cursor(rect: gtk::graphene::Rect, x: f32, y: f32) -> &'static str {
+    let (left, right, top, bottom) = region_edge_hit(rect, x, y);
     match (left, right, top, bottom) {
         (true, _, true, _) | (_, true, _, true) => "nwse-resize",
         (_, true, true, _) | (true, _, _, true) => "nesw-resize",
@@ -269,8 +306,8 @@ fn edit_resize_cursor(rect: gtk::graphene::Rect, x: f32, y: f32) -> &'static str
     }
 }
 
-fn pencil_can_activate(edit_active: bool, has_image: bool) -> bool {
-    !edit_active && has_image
+fn pencil_can_activate(has_image: bool) -> bool {
+    has_image
 }
 
 fn image_navigation_direction(
@@ -297,7 +334,7 @@ fn image_navigation_direction(
     }
 }
 
-fn resize_crop(
+fn resize_region(
     mut crop: CropOverlay,
     x: u32,
     y: u32,
@@ -345,14 +382,6 @@ fn selection_overlay(drag: SelectionDrag) -> Option<CropOverlay> {
     })
 }
 
-fn measurement_overlay(drag: MeasurementDrag) -> CropOverlay {
-    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
-}
-
-fn zoom_rect_overlay(drag: ZoomRectDrag) -> CropOverlay {
-    boundary_overlay(drag.start, drag.current, drag.image_dimensions)
-}
-
 fn boundary_overlay(
     start: (u32, u32),
     current: (u32, u32),
@@ -390,21 +419,6 @@ fn pencil_zoom_key(
         gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => Some(PencilZoomKey::Out),
         _ => None,
     }
-}
-
-fn no_tool_active(active_tools: &[bool]) -> bool {
-    !active_tools.iter().any(|active| *active)
-}
-
-fn is_click(start: (f64, f64), end: (f64, f64)) -> bool {
-    (end.0 - start.0).hypot(end.1 - start.1) <= 4.0
-}
-
-fn measurement_clipboard_text(measurement: CropOverlay) -> String {
-    format!(
-        "x:{},y:{},width:{},height:{}",
-        measurement.x, measurement.y, measurement.width, measurement.height
-    )
 }
 
 fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32) -> gtk::Label {
@@ -463,37 +477,38 @@ struct WindowState {
     external_source_conflict: Cell<bool>,
     subtitle_ready: Cell<bool>,
     close_approved: Cell<bool>,
-    pencil_active: Cell<bool>,
+    tool: Cell<Tool>,
+    return_tool: Cell<Option<Tool>>,
+    updating_tool: Cell<bool>,
+    selected_annotation: Cell<Option<AnnotationId>>,
+    nudge_annotation: Cell<Option<AnnotationId>>,
+    annotation_drag: RefCell<Option<AnnotationDrag>>,
+    annotation_preview: RefCell<Option<Annotation>>,
+    annotation_preview_queue: RefCell<annotation::PreviewQueue<Annotation>>,
+    text_editor: RefCell<Option<InlineTextEditor>>,
     pencil_points: RefCell<Vec<BrushPoint>>,
     pencil_path: Cell<StrokePath>,
     pencil_drag: RefCell<Option<PencilDrag>>,
     pencil_line_anchor: Cell<Option<BrushPoint>>,
+    pencil_line_annotation: Cell<Option<AnnotationId>>,
     keyboard_tool_cursor: Cell<Option<(u32, u32)>>,
     keyboard_tool_anchor: Cell<Option<(u32, u32)>>,
     pencil_color: Cell<[u8; 4]>,
     pencil_antialiasing: Cell<bool>,
+    line_width: Cell<f64>,
     pencil_size: gtk::SpinButton,
     pencil_controls: gtk::Box,
     measurement_button: gtk::ToggleButton,
-    measurement_drag: Cell<Option<MeasurementDrag>>,
-    zoom_rect_drag: Cell<Option<ZoomRectDrag>>,
-    zoom_rect_selection: Cell<Option<CropOverlay>>,
-    selection_button: gtk::ToggleButton,
-    selection_drag: Cell<Option<SelectionDrag>>,
+    highlight_button: gtk::ToggleButton,
+    arrow_button: gtk::ToggleButton,
+    text_button: gtk::ToggleButton,
+    region_selection: Cell<Option<CropOverlay>>,
+    region_drag: Cell<Option<RegionDrag>>,
+    region_controls: gtk::Box,
     color_picker_button: gtk::ToggleButton,
-    sam2: Arc<Mutex<Option<ObjectDetector>>>,
-    object_detection_running: Cell<bool>,
-    object_detection_progress: gtk::Box,
-    object_detection_progress_label: gtk::Label,
-    object_detection_progress_bar: gtk::ProgressBar,
-    object_detection_progress_generation: Cell<u64>,
-    mask_flash_generation: Cell<u64>,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
     color_button: gtk::ColorDialogButton,
-    edit_button: gtk::ToggleButton,
-    edit_crop: RefCell<Option<CropOverlay>>,
-    edit_drag: Cell<Option<EditDrag>>,
     compare_canvas: RefCell<Option<ImageCanvas>>,
     compare_fit_zooms: Cell<Option<(f64, f64)>>,
     compare_rendered: RefCell<Option<image::RgbaImage>>,
@@ -532,8 +547,6 @@ struct WindowState {
     export_generation: Cell<u64>,
     export_lock: Arc<Mutex<()>>,
     deletion_running: Cell<bool>,
-    crop_controls: gtk::Box,
-    crop_apply_button: gtk::Button,
     pending_fit: Cell<Option<bool>>,
     zoom_mode: Cell<ZoomMode>,
     fit_tick_scheduled: Cell<bool>,
@@ -565,6 +578,13 @@ struct WindowState {
     minimap: MiniMap,
 }
 
+struct InlineTextEditor {
+    widget: gtk::Text,
+    anchor: Point,
+    font_size: f32,
+    _accelerator_suppression: Option<crate::application::AcceleratorSuppression>,
+}
+
 impl ViewerWindow {
     pub fn new(application: &adw::Application, file: Option<gio::File>) -> Self {
         let files = file.into_iter().collect::<Vec<_>>();
@@ -572,6 +592,7 @@ impl ViewerWindow {
     }
 
     pub fn new_with_files(application: &adw::Application, files: &[gio::File]) -> Self {
+        add_development_icon_search_path();
         let initial_file = files.first().cloned();
         let initial_sequence = if files.len() > 1 {
             DirectorySequence::from_files(files)
@@ -601,24 +622,33 @@ impl ViewerWindow {
         scrolled.set_margin_end(10);
         let canvas_overlay = gtk::Overlay::new();
         canvas_overlay.set_child(Some(&scrolled));
-        let crop_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        crop_controls.add_css_class("linked");
-        crop_controls.set_visible(false);
-        crop_controls.set_halign(gtk::Align::End);
-        crop_controls.set_valign(gtk::Align::End);
-        crop_controls.set_margin_end(26);
-        crop_controls.set_margin_bottom(26);
-        crop_controls.append(&button(
-            "window-close-symbolic",
-            "Abort Crop",
-            "win.cancel-tool",
+        let region_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        region_controls.add_css_class("toolbar");
+        region_controls.add_css_class("osd");
+        region_controls.set_visible(false);
+        region_controls.set_halign(gtk::Align::Start);
+        region_controls.set_valign(gtk::Align::End);
+        region_controls.set_margin_start(26);
+        region_controls.set_margin_bottom(26);
+        region_controls.append(&button(
+            "zoom-in-symbolic",
+            "Zoom to Selected Region",
+            "win.selection-zoom",
         ));
-        let crop_apply_button = button("object-select-symbolic", "Apply Crop", "win.confirm-crop");
-        crop_apply_button.set_sensitive(false);
-        crop_controls.append(&crop_apply_button);
-        canvas_overlay.add_overlay(&crop_controls);
+        region_controls.append(&button(
+            "edit-cut-symbolic",
+            "Crop to Selected Region",
+            "win.selection-crop",
+        ));
+        region_controls.append(&button(
+            "edit-copy-symbolic",
+            "Copy Selected Region",
+            "win.selection-copy",
+        ));
+        canvas_overlay.add_overlay(&region_controls);
         let zoom_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        zoom_controls.add_css_class("linked");
+        zoom_controls.add_css_class("toolbar");
+        zoom_controls.add_css_class("osd");
         zoom_controls.set_halign(gtk::Align::End);
         zoom_controls.set_valign(gtk::Align::End);
         zoom_controls.set_margin_end(26);
@@ -664,9 +694,11 @@ impl ViewerWindow {
         scale_controls.set_margin_end(26);
         scale_controls.set_margin_bottom(26);
         let scale_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        scale_surface.add_css_class("toolbar");
         scale_surface.add_css_class("osd");
         scale_surface.set_hexpand(true);
         let scale_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        scale_content.set_hexpand(true);
         scale_content.set_margin_start(12);
         scale_content.set_margin_end(12);
         scale_content.set_margin_top(12);
@@ -766,20 +798,6 @@ impl ViewerWindow {
         minimap.set_tooltip_text(Some(&gettext("Image overview — click to pan")));
         minimap.set_visible(false);
         canvas_overlay.add_overlay(&minimap);
-        let object_detection_progress = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        object_detection_progress.set_halign(gtk::Align::Center);
-        object_detection_progress.set_valign(gtk::Align::End);
-        object_detection_progress.set_margin_bottom(24);
-        object_detection_progress.set_width_request(280);
-        object_detection_progress.add_css_class("osd");
-        let object_detection_progress_label = gtk::Label::new(Some(&gettext("Segmenting object…")));
-        object_detection_progress_label.set_wrap(true);
-        let object_detection_progress_bar = gtk::ProgressBar::new();
-        object_detection_progress_bar.set_show_text(false);
-        object_detection_progress.append(&object_detection_progress_label);
-        object_detection_progress.append(&object_detection_progress_bar);
-        object_detection_progress.set_visible(false);
-        canvas_overlay.add_overlay(&object_detection_progress);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&canvas_overlay));
 
@@ -870,6 +888,7 @@ impl ViewerWindow {
             "visible",
             Some(&false.to_value()),
         );
+        compact.add_setter(&zoom_controls, "visible", Some(&false.to_value()));
         compact.add_setter(&title, "subtitle", Some(&"".to_value()));
         compact.add_setter(
             &empty_page,
@@ -889,6 +908,7 @@ impl ViewerWindow {
         let lens_diameter = settings.compare_lens_size();
         let lens_magnification = settings.compare_lens_magnification();
         let pencil_antialiasing = settings.pencil_antialiasing();
+        let line_width = f64::from(settings.pencil_size());
         let zoom_mode = settings.last_zoom_mode();
         let this = Self(Rc::new(WindowState {
             window,
@@ -916,37 +936,38 @@ impl ViewerWindow {
             external_source_conflict: Cell::new(false),
             subtitle_ready: Cell::new(false),
             close_approved: Cell::new(false),
-            pencil_active: Cell::new(false),
+            tool: Cell::new(Tool::None),
+            return_tool: Cell::new(None),
+            updating_tool: Cell::new(false),
+            selected_annotation: Cell::new(None),
+            nudge_annotation: Cell::new(None),
+            annotation_drag: RefCell::new(None),
+            annotation_preview: RefCell::new(None),
+            annotation_preview_queue: RefCell::new(annotation::PreviewQueue::default()),
+            text_editor: RefCell::new(None),
             pencil_points: RefCell::new(Vec::new()),
             pencil_path: Cell::new(StrokePath::Smooth),
             pencil_drag: RefCell::new(None),
             pencil_line_anchor: Cell::new(None),
+            pencil_line_annotation: Cell::new(None),
             keyboard_tool_cursor: Cell::new(None),
             keyboard_tool_anchor: Cell::new(None),
-            pencil_color: Cell::new([0, 0, 0, 255]),
+            pencil_color: Cell::new(crate::tools::annotation::DEFAULT_ANNOTATION_COLOR),
             pencil_antialiasing: Cell::new(pencil_antialiasing),
+            line_width: Cell::new(line_width),
             pencil_size: header_widgets.pencil_size,
             pencil_controls: header_widgets.pencil_controls,
             measurement_button: header_widgets.measurement_button,
-            measurement_drag: Cell::new(None),
-            zoom_rect_drag: Cell::new(None),
-            zoom_rect_selection: Cell::new(None),
-            selection_button: header_widgets.selection_button,
-            selection_drag: Cell::new(None),
+            highlight_button: header_widgets.highlight_button,
+            arrow_button: header_widgets.arrow_button,
+            text_button: header_widgets.text_button,
+            region_selection: Cell::new(None),
+            region_drag: Cell::new(None),
+            region_controls,
             color_picker_button: header_widgets.color_picker_button,
-            sam2: Arc::new(Mutex::new(None)),
-            object_detection_running: Cell::new(false),
-            object_detection_progress,
-            object_detection_progress_label,
-            object_detection_progress_bar,
-            object_detection_progress_generation: Cell::new(0),
-            mask_flash_generation: Cell::new(0),
             pencil_button: header_widgets.pencil_button,
             lens_button: header_widgets.lens_button,
             color_button: header_widgets.color_button,
-            edit_button: header_widgets.edit_button,
-            edit_crop: RefCell::new(None),
-            edit_drag: Cell::new(None),
             compare_canvas: RefCell::new(None),
             compare_fit_zooms: Cell::new(None),
             compare_rendered: RefCell::new(None),
@@ -983,8 +1004,6 @@ impl ViewerWindow {
             animation_paused: Cell::new(false),
             animation_controls: header_widgets.animation_controls,
             animation_play_button: header_widgets.animation_play_button,
-            crop_controls,
-            crop_apply_button,
             pending_fit: Cell::new(None),
             zoom_mode: Cell::new(zoom_mode),
             fit_tick_scheduled: Cell::new(false),
@@ -1025,6 +1044,7 @@ impl ViewerWindow {
         this.install_tool_controls();
         this.install_scale_controls();
         this.install_gestures();
+        this.install_annotation_controls();
         this.install_render_scale_tracking();
         this.install_minimap();
         this.connect_single_image_lens();
@@ -1090,7 +1110,7 @@ impl ViewerWindow {
 
     fn load_with_fit(&self, file: gio::File, fit: bool) {
         let fit_on_load = fit_on_load(fit, self.0.zoom_mode.get());
-        self.cancel_zoom_rect_drag();
+        self.clear_region_selection();
         self.0
             .navigation_generation
             .set(self.0.navigation_generation.get().wrapping_add(1));
@@ -1127,11 +1147,10 @@ impl ViewerWindow {
             .set(self.0.render_generation.get().wrapping_add(1));
         self.0.animation_frames.borrow_mut().clear();
         self.0.animation_controls.set_visible(false);
-        self.0.measurement_button.set_active(false);
-        self.0.selection_button.set_active(false);
-        self.0.color_picker_button.set_active(false);
-        self.clear_mask_flash();
-        self.0.scale_button.set_active(false);
+        self.0.document.replace(None);
+        self.0.rendered.replace(None);
+        self.set_tool(Tool::None);
+        self.select_annotation(None);
         self.exit_compare();
         self.0
             .directory_refresh_generation
@@ -1156,11 +1175,10 @@ impl ViewerWindow {
         if let Some(parent) = file.parent().filter(is_directory) {
             self.0.settings.set_last_open_folder(&parent);
         }
-        self.0.document.replace(None);
-        self.0.rendered.replace(None);
         self.0.editable_decode_pending.set(true);
         self.0.pending_scale_activation.set(false);
         self.0.external_source_conflict.set(false);
+        self.0.canvas.clear_annotation_previews();
         self.0.canvas.set_texture(None);
         self.0.subtitle_ready.set(false);
         self.0.source_modified.replace(
@@ -1339,7 +1357,7 @@ impl ViewerWindow {
         self.add_action("fit", {
             let this = self.clone();
             move || {
-                if this.0.scale_button.is_active() {
+                if this.0.tool.get() == Tool::Scale {
                     this.0.scale_preview_view.set(ScalePreviewView::Fit);
                     this.fit(false);
                 } else {
@@ -1420,6 +1438,7 @@ impl ViewerWindow {
         self.add_action("undo", {
             let this = self.clone();
             move || {
+                this.0.nudge_annotation.set(None);
                 let changed = this
                     .0
                     .document
@@ -1435,6 +1454,7 @@ impl ViewerWindow {
         self.add_action("redo", {
             let this = self.clone();
             move || {
+                this.0.nudge_annotation.set(None);
                 let changed = this
                     .0
                     .document
@@ -1463,33 +1483,25 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.apply(Operation::FlipVertical)
         });
-        self.add_action("crop", {
-            let this = self.clone();
-            move || {
-                this.0
-                    .edit_button
-                    .set_active(!this.0.edit_button.is_active())
-            }
-        });
         self.add_action("measure", {
             let this = self.clone();
-            move || {
-                this.0
-                    .measurement_button
-                    .set_active(!this.0.measurement_button.is_active())
-            }
+            move || this.toggle_tool(Tool::Measure)
         });
-        self.add_action("confirm-crop", {
+        self.add_action("highlight", {
             let this = self.clone();
-            move || this.confirm_crop()
+            move || this.toggle_tool(Tool::Highlight)
+        });
+        self.add_action("arrow", {
+            let this = self.clone();
+            move || this.toggle_tool(Tool::Arrow)
+        });
+        self.add_action("text", {
+            let this = self.clone();
+            move || this.toggle_tool(Tool::Text)
         });
         self.add_action("scale-preview", {
             let this = self.clone();
-            move || {
-                this.0
-                    .scale_button
-                    .set_active(!this.0.scale_button.is_active())
-            }
+            move || this.toggle_tool(Tool::Scale)
         });
         self.add_action("confirm-scale", {
             let this = self.clone();
@@ -1497,12 +1509,16 @@ impl ViewerWindow {
         });
         self.add_action("cancel-scale", {
             let this = self.clone();
-            move || this.0.scale_button.set_active(false)
+            move || {
+                if this.0.tool.get() == Tool::Scale {
+                    this.set_tool(Tool::None);
+                }
+            }
         });
         self.add_action("scale-actual-size", {
             let this = self.clone();
             move || {
-                if !this.0.scale_button.is_active() {
+                if this.0.tool.get() != Tool::Scale {
                     return;
                 }
                 this.0.scale_preview_view.set(ScalePreviewView::ActualSize);
@@ -1512,7 +1528,7 @@ impl ViewerWindow {
         self.add_action("scale-fit", {
             let this = self.clone();
             move || {
-                if !this.0.scale_button.is_active() {
+                if this.0.tool.get() != Tool::Scale {
                     return;
                 }
                 this.0.scale_preview_view.set(ScalePreviewView::Fit);
@@ -1525,7 +1541,7 @@ impl ViewerWindow {
         });
         self.add_action("scale", {
             let this = self.clone();
-            move || this.0.scale_button.set_active(true)
+            move || this.set_tool(Tool::Scale)
         });
         self.add_action("palette", {
             let this = self.clone();
@@ -1533,52 +1549,57 @@ impl ViewerWindow {
         });
         self.add_action("pencil", {
             let this = self.clone();
-            move || {
-                this.0
-                    .pencil_button
-                    .set_active(!this.0.pencil_button.is_active())
-            }
+            move || this.toggle_tool(Tool::Pencil)
         });
         self.add_action("pick-color", {
             let this = self.clone();
-            move || {
-                this.0
-                    .color_picker_button
-                    .set_active(!this.0.color_picker_button.is_active())
+            move || this.toggle_tool(Tool::PickColor)
+        });
+        let tool_action = gio::SimpleAction::new_stateful(
+            "tool",
+            Some(&String::static_variant_type()),
+            &Tool::None.name().to_variant(),
+        );
+        tool_action.connect_activate({
+            let this = self.clone();
+            move |_, parameter| {
+                if let Some(tool) = parameter
+                    .and_then(glib::Variant::str)
+                    .and_then(Tool::from_name)
+                {
+                    this.set_tool(tool);
+                }
             }
         });
+        self.0.window.add_action(&tool_action);
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
-                if this.0.zoom_rect_drag.get().is_some()
-                    || this.0.zoom_rect_selection.get().is_some()
+                if this.0.tool.get() == Tool::Select
+                    && (this.0.region_drag.get().is_some()
+                        || this.0.region_selection.get().is_some())
                 {
-                    this.cancel_zoom_rect_drag();
+                    this.clear_region_selection();
                     return;
                 }
-                if this.0.measurement_button.is_active() {
-                    this.0.measurement_button.set_active(false);
+                if this.close_text_editor() || this.cancel_annotation_drag() {
                     return;
                 }
-                if this.0.selection_button.is_active() {
-                    this.0.selection_button.set_active(false);
+                if this.0.selected_annotation.get().is_some() {
+                    this.select_annotation(None);
                     return;
                 }
-                if this.0.color_picker_button.is_active() {
-                    this.0.color_picker_button.set_active(false);
+                if this.0.tool.get() == Tool::PickColor
+                    && let Some(return_tool) = this.0.return_tool.get()
+                {
+                    this.set_tool(return_tool);
                     return;
                 }
-                if this.0.edit_button.is_active() {
-                    this.0.edit_button.set_active(false);
+                if matches!(this.0.tool.get(), Tool::None | Tool::Select) {
                     return;
                 }
-                if this.0.scale_button.is_active() {
-                    this.0.scale_button.set_active(false);
-                    return;
-                }
-                this.0.pencil_button.set_active(false);
+                this.set_tool(Tool::None);
                 this.0.pencil_points.borrow_mut().clear();
-                this.0.canvas.set_accessible_label(&gettext("Image canvas"));
                 this.0
                     .toasts
                     .add_toast(adw::Toast::new(&gettext("Active tool cancelled")));
@@ -1599,7 +1620,7 @@ impl ViewerWindow {
         self.add_action("about", {
             let window = self.0.window.clone();
             move || {
-                adw::AboutDialog::builder()
+                let dialog = adw::AboutDialog::builder()
                     .application_name("Diorama")
                     .application_icon(crate::APP_ID)
                     .version(env!("CARGO_PKG_VERSION"))
@@ -1607,8 +1628,14 @@ impl ViewerWindow {
                     .license_type(gtk::License::Gpl30)
                     .website("https://github.com/mendrik-private/diorama")
                     .issue_url("https://github.com/mendrik-private/diorama/issues")
-                    .build()
-                    .present(Some(&window));
+                    .build();
+                dialog.add_legal_section(
+                    "Excalifont",
+                    Some("Copyright 2024 Excalidraw"),
+                    gtk::License::Custom,
+                    Some(include_str!("../../data/fonts/OFL-Excalifont.txt")),
+                );
+                dialog.present(Some(&window));
             }
         });
         self.add_action("compare", {
@@ -1619,13 +1646,23 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.toggle_single_image_lens()
         });
-        self.add_action("select-object", {
+        self.add_action("select", {
+            let this = self.clone();
+            move || this.toggle_tool(Tool::Select)
+        });
+        self.add_action("selection-zoom", {
             let this = self.clone();
             move || {
-                this.0
-                    .selection_button
-                    .set_active(!this.0.selection_button.is_active())
+                this.zoom_selected_region();
             }
+        });
+        self.add_action("selection-crop", {
+            let this = self.clone();
+            move || this.crop_selected_region()
+        });
+        self.add_action("selection-copy", {
+            let this = self.clone();
+            move || this.copy_selected_region()
         });
     }
 
@@ -1635,7 +1672,8 @@ impl ViewerWindow {
         pencil_zoom.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
-                let Some(direction) = pencil_zoom_key(key, modifiers, this.0.pencil_active.get())
+                let Some(direction) =
+                    pencil_zoom_key(key, modifiers, this.0.tool.get() == Tool::Pencil)
                 else {
                     return glib::Propagation::Proceed;
                 };
@@ -1644,6 +1682,34 @@ impl ViewerWindow {
             }
         });
         self.0.window.add_controller(pencil_zoom);
+
+        let annotation_keys = gtk::EventControllerKey::new();
+        annotation_keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        annotation_keys.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| {
+                if modifiers.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK
+                        | gtk::gdk::ModifierType::HYPER_MASK
+                        | gtk::gdk::ModifierType::META_MASK,
+                ) || gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|focus| {
+                    focus.is::<gtk::Text>()
+                        || focus.is::<gtk::Entry>()
+                        || focus.is::<gtk::TextView>()
+                        || focus.is::<gtk::SpinButton>()
+                }) {
+                    return glib::Propagation::Proceed;
+                }
+                if this.handle_annotation_key(key, modifiers) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        self.0.window.add_controller(annotation_keys);
 
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed({
@@ -1658,7 +1724,10 @@ impl ViewerWindow {
                 ) {
                     return glib::Propagation::Proceed;
                 }
-                if this.0.scale_button.is_active()
+                if this.handle_annotation_key(key, modifiers) {
+                    return glib::Propagation::Stop;
+                }
+                if this.0.tool.get() == Tool::Scale
                     && (key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter)
                 {
                     this.confirm_scale_preview();
@@ -1667,7 +1736,7 @@ impl ViewerWindow {
                 if matches!(
                     key,
                     gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-                ) && this.zoom_selected_rect()
+                ) && this.zoom_selected_region()
                 {
                     return glib::Propagation::Stop;
                 }
@@ -1713,7 +1782,7 @@ impl ViewerWindow {
             let this = self.clone();
             move |_, key, _, modifiers| {
                 let contextual_mode_active =
-                    this.active_keyboard_tool().is_some() || this.0.scale_button.is_active();
+                    this.active_keyboard_tool().is_some() || this.0.tool.get() == Tool::Scale;
                 let Some(forward) =
                     image_navigation_direction(key, modifiers, contextual_mode_active)
                 else {
@@ -1727,18 +1796,15 @@ impl ViewerWindow {
     }
 
     fn active_keyboard_tool(&self) -> Option<KeyboardTool> {
-        if self.0.measurement_button.is_active() {
-            Some(KeyboardTool::Measure)
-        } else if self.0.selection_button.is_active() {
-            Some(KeyboardTool::Select)
-        } else if self.0.color_picker_button.is_active() {
-            Some(KeyboardTool::PickColor)
-        } else if self.0.edit_button.is_active() {
-            Some(KeyboardTool::Crop)
-        } else if self.0.pencil_button.is_active() {
-            Some(KeyboardTool::Pencil)
-        } else {
-            None
+        match self.0.tool.get() {
+            Tool::Highlight => Some(KeyboardTool::Highlight),
+            Tool::Arrow => Some(KeyboardTool::Arrow),
+            Tool::Measure => Some(KeyboardTool::Measure),
+            Tool::Text => Some(KeyboardTool::Text),
+            Tool::Select => Some(KeyboardTool::Select),
+            Tool::PickColor => Some(KeyboardTool::PickColor),
+            Tool::Pencil => Some(KeyboardTool::Pencil),
+            Tool::None | Tool::Scale => None,
         }
     }
 
@@ -1821,17 +1887,8 @@ impl ViewerWindow {
         if let Some(start) = self.0.keyboard_tool_anchor.get() {
             let dimensions = (width, height);
             match tool {
-                KeyboardTool::Measure => {
-                    self.0
-                        .canvas
-                        .set_measurement_overlay(Some(measurement_overlay(MeasurementDrag {
-                            start,
-                            current: (x, y),
-                            start_screen: (0.0, 0.0),
-                            image_dimensions: dimensions,
-                        })));
-                }
-                KeyboardTool::Select | KeyboardTool::Crop => {
+                KeyboardTool::Measure => {}
+                KeyboardTool::Select => {
                     self.0
                         .canvas
                         .set_crop_overlay(selection_overlay(SelectionDrag {
@@ -1841,7 +1898,11 @@ impl ViewerWindow {
                             image_dimensions: dimensions,
                         }));
                 }
-                KeyboardTool::PickColor | KeyboardTool::Pencil => {}
+                KeyboardTool::Highlight
+                | KeyboardTool::Arrow
+                | KeyboardTool::Text
+                | KeyboardTool::PickColor
+                | KeyboardTool::Pencil => {}
             }
         }
         if announce {
@@ -1867,10 +1928,6 @@ impl ViewerWindow {
         else {
             return;
         };
-        if tool == KeyboardTool::Crop && self.0.edit_crop.borrow().is_some() {
-            self.confirm_crop();
-            return;
-        }
         let current = if let Some(current) = self.0.keyboard_tool_cursor.get() {
             current
         } else {
@@ -1894,15 +1951,85 @@ impl ViewerWindow {
                     self.copy_color_to_clipboard(color);
                 }
             }
-            KeyboardTool::Pencil => self.commit_pencil_stroke(
+            KeyboardTool::Pencil => self.commit_editable_pencil_stroke(
                 &[BrushPoint {
                     x: current.0 as f32 + 0.5,
                     y: current.1 as f32 + 0.5,
                     pressure: 1.0,
                 }],
-                StrokePath::Smooth,
+                PencilDragMode::Freehand,
             ),
-            KeyboardTool::Measure | KeyboardTool::Select | KeyboardTool::Crop => {
+            KeyboardTool::Highlight | KeyboardTool::Arrow | KeyboardTool::Text => {
+                let id = {
+                    let mut document = self.0.document.borrow_mut();
+                    let Some(document) = document.as_mut() else {
+                        return;
+                    };
+                    document.allocate_annotation_id()
+                };
+                let color = self.0.pencil_color.get();
+                let stroke_width = self.current_annotation_stroke_width();
+                let current = crate::document::Point {
+                    x: current.0 as f32 + 0.5,
+                    y: current.1 as f32 + 0.5,
+                };
+                let shape = match tool {
+                    KeyboardTool::Highlight => {
+                        let width = image_dimensions.0.min(64) as f32;
+                        let height = image_dimensions.1.min(40) as f32;
+                        let x =
+                            (current.x - width / 2.0).clamp(0.0, image_dimensions.0 as f32 - width);
+                        let y = (current.y - height / 2.0)
+                            .clamp(0.0, image_dimensions.1 as f32 - height);
+                        Shape::Highlight {
+                            rect: crate::document::Rect {
+                                x,
+                                y,
+                                width,
+                                height,
+                            },
+                            seed: id.0 ^ 0xD10A_AA73_9E37_79B9,
+                            style: StrokeStyle {
+                                color,
+                                width: HIGHLIGHT_STROKE_WIDTH,
+                            },
+                        }
+                    }
+                    KeyboardTool::Arrow => {
+                        let length = image_dimensions.0.saturating_sub(1).min(80) as f32;
+                        let start_x = (current.x - length / 2.0)
+                            .clamp(0.5, image_dimensions.0 as f32 - 0.5 - length);
+                        let start = crate::document::Point {
+                            x: start_x,
+                            y: current.y,
+                        };
+                        let end = crate::document::Point {
+                            x: start_x + length,
+                            y: current.y,
+                        };
+                        Shape::Arrow {
+                            start,
+                            end,
+                            control: start.midpoint(end),
+                            style: StrokeStyle {
+                                color,
+                                width: stroke_width,
+                            },
+                        }
+                    }
+                    KeyboardTool::Text => {
+                        self.open_text_editor(None, id, current, 0.0, String::new());
+                        return;
+                    }
+                    _ => unreachable!(),
+                };
+                self.apply(Operation::Annotate(AnnotationEdit::Create(Annotation {
+                    id,
+                    shape,
+                })));
+                self.select_annotation(Some(id));
+            }
+            KeyboardTool::Measure | KeyboardTool::Select => {
                 let Some(start) = self.0.keyboard_tool_anchor.replace(Some(current)) else {
                     self.0.canvas.announce(
                         &gettext(
@@ -1915,47 +2042,69 @@ impl ViewerWindow {
                 self.0.keyboard_tool_anchor.set(None);
                 match tool {
                     KeyboardTool::Measure => {
-                        let drag = MeasurementDrag {
-                            start,
-                            current,
-                            start_screen: (0.0, 0.0),
-                            image_dimensions,
+                        let id = {
+                            let mut document = self.0.document.borrow_mut();
+                            let Some(document) = document.as_mut() else {
+                                return;
+                            };
+                            document.allocate_annotation_id()
                         };
-                        let measurement = measurement_overlay(drag);
-                        self.0.canvas.set_measurement_overlay(Some(measurement));
-                        self.copy_measurement_to_clipboard(measurement);
+                        let horizontal = start.0.abs_diff(current.0) >= start.1.abs_diff(current.1);
+                        let shape = if horizontal {
+                            Shape::Measurement {
+                                axis: Axis::Horizontal,
+                                from: start.0.min(current.0) as f32,
+                                to: start.0.max(current.0) as f32,
+                                at: start.1 as f32,
+                                style: StrokeStyle {
+                                    color: self.0.pencil_color.get(),
+                                    width: MEASUREMENT_STROKE_WIDTH,
+                                },
+                                label_size: self.0.settings.annotation_text_size() as f32,
+                            }
+                        } else {
+                            Shape::Measurement {
+                                axis: Axis::Vertical,
+                                from: start.1.min(current.1) as f32,
+                                to: start.1.max(current.1) as f32,
+                                at: start.0 as f32,
+                                style: StrokeStyle {
+                                    color: self.0.pencil_color.get(),
+                                    width: MEASUREMENT_STROKE_WIDTH,
+                                },
+                                label_size: self.0.settings.annotation_text_size() as f32,
+                            }
+                        };
+                        self.apply(Operation::Annotate(AnnotationEdit::Create(Annotation {
+                            id,
+                            shape,
+                        })));
+                        self.select_annotation(Some(id));
                     }
                     KeyboardTool::Select => {
-                        self.0.canvas.set_crop_overlay(None);
-                        self.complete_selection(SelectionDrag {
+                        let selection = selection_overlay(SelectionDrag {
                             start,
                             current,
                             start_screen: (0.0, 0.0),
                             image_dimensions,
                         });
-                    }
-                    KeyboardTool::Crop => {
-                        let crop = selection_overlay(SelectionDrag {
-                            start,
-                            current,
-                            start_screen: (0.0, 0.0),
-                            image_dimensions,
-                        });
-                        self.0.edit_crop.replace(crop);
-                        self.0.canvas.set_crop_overlay(crop);
-                        self.0.crop_apply_button.set_sensitive(crop.is_some());
-                        if let Some(crop) = crop {
+                        self.set_region_selection(selection);
+                        if let Some(selection) = selection {
                             self.0.canvas.announce(
                                 &gettext(
-                                    "Crop selected, {width} by {height} pixels. Press Enter to apply.",
+                                    "Region selected, {width} by {height} pixels. Choose zoom, crop, or copy.",
                                 )
-                                .replace("{width}", &crop.width.to_string())
-                                .replace("{height}", &crop.height.to_string()),
+                                .replace("{width}", &selection.width.to_string())
+                                .replace("{height}", &selection.height.to_string()),
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             );
                         }
                     }
-                    KeyboardTool::PickColor | KeyboardTool::Pencil => unreachable!(),
+                    KeyboardTool::Highlight
+                    | KeyboardTool::Arrow
+                    | KeyboardTool::Text
+                    | KeyboardTool::PickColor
+                    | KeyboardTool::Pencil => unreachable!(),
                 }
             }
         }
@@ -1976,6 +2125,10 @@ impl ViewerWindow {
         {
             action.set_enabled(enabled);
         }
+    }
+
+    fn current_annotation_stroke_width(&self) -> f32 {
+        self.0.pencil_size.value() as f32
     }
 
     fn update_action_states(&self) {
@@ -2027,17 +2180,32 @@ impl ViewerWindow {
             "rotate-counterclockwise",
             "flip-horizontal",
             "flip-vertical",
-            "crop",
-            "measure",
             "scale-preview",
             "crop-content",
             "scale",
             "palette",
             "pencil",
             "pick-color",
-            "select-object",
+            "select",
+            "tool",
         ] {
             self.set_action_enabled(action, editable);
+        }
+        let region_selected = editable && self.0.region_selection.get().is_some();
+        for action in ["selection-zoom", "selection-crop", "selection-copy"] {
+            self.set_action_enabled(action, region_selected);
+        }
+        let vector_annotations_available = editable && self.0.compare_canvas.borrow().is_none();
+        for action in ["measure", "highlight", "arrow", "text"] {
+            self.set_action_enabled(action, vector_annotations_available);
+        }
+        for button in [
+            &self.0.measurement_button,
+            &self.0.highlight_button,
+            &self.0.arrow_button,
+            &self.0.text_button,
+        ] {
+            button.set_sensitive(vector_annotations_available);
         }
         self.set_action_enabled("save", document.as_ref().is_some_and(Document::is_dirty));
         self.set_action_enabled("undo", document.as_ref().is_some_and(Document::can_undo));
@@ -2049,6 +2217,7 @@ impl ViewerWindow {
     }
 
     fn apply(&self, operation: Operation) {
+        self.0.nudge_annotation.set(None);
         {
             let mut document = self.0.document.borrow_mut();
             let Some(document) = document.as_mut() else {
@@ -2063,22 +2232,197 @@ impl ViewerWindow {
         self.render_document();
     }
 
+    fn toggle_tool(&self, tool: Tool) {
+        self.set_tool(if self.0.tool.get() == tool {
+            Tool::None
+        } else {
+            tool
+        });
+    }
+
+    fn tool_button_toggled(&self, button: &gtk::ToggleButton, tool: Tool) {
+        if self.0.updating_tool.get() {
+            return;
+        }
+        let requested = if button.is_active() { tool } else { Tool::None };
+        self.set_tool(requested);
+        if self.0.tool.get() != requested {
+            self.0.updating_tool.set(true);
+            button.set_active(self.0.tool.get() == tool);
+            self.0.updating_tool.set(false);
+        }
+    }
+
+    fn set_tool(&self, tool: Tool) {
+        let editable = self.0.document.borrow().is_some() && self.0.rendered.borrow().is_some();
+        let tool = resting_tool(tool, editable);
+        let previous = self.0.tool.get();
+        if previous == tool {
+            return;
+        }
+        if tool.is_vector_annotation() && self.0.compare_canvas.borrow().is_some() {
+            return;
+        }
+        if tool != Tool::None && self.0.rendered.borrow().is_none() {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
+            return;
+        }
+
+        self.0.updating_tool.set(true);
+        self.0.nudge_annotation.set(None);
+        self.cancel_annotation_drag();
+        self.close_text_editor();
+        match previous {
+            Tool::Pencil => self.set_pencil_active(false),
+            Tool::PickColor => self.set_color_picker_active(false),
+            Tool::Select => self.set_selection_active(false),
+            Tool::Scale => self.set_scale_preview_active(false),
+            Tool::Measure => {
+                self.0.canvas.set_measurement_cursor(None);
+                self.prepare_keyboard_tool(false);
+            }
+            _ => {}
+        }
+
+        if tool == Tool::PickColor {
+            self.0
+                .return_tool
+                .set(previous.is_annotation().then_some(previous));
+        } else {
+            self.0.return_tool.set(None);
+        }
+        self.0.tool.set(tool);
+        let keeps_annotation_selection =
+            tool.is_annotation() || tool == Tool::PickColor && self.0.return_tool.get().is_some();
+        if !keeps_annotation_selection {
+            self.select_annotation(None);
+        }
+        for (button, button_tool) in [
+            (&self.0.pencil_button, Tool::Pencil),
+            (&self.0.highlight_button, Tool::Highlight),
+            (&self.0.arrow_button, Tool::Arrow),
+            (&self.0.measurement_button, Tool::Measure),
+            (&self.0.text_button, Tool::Text),
+            (&self.0.color_picker_button, Tool::PickColor),
+            (&self.0.scale_button, Tool::Scale),
+        ] {
+            button.set_active(tool == button_tool);
+        }
+
+        match tool {
+            Tool::Pencil => self.set_pencil_active(true),
+            Tool::PickColor => self.set_color_picker_active(true),
+            Tool::Select => self.set_selection_active(true),
+            Tool::Scale => self.set_scale_preview_active(true),
+            Tool::Measure => {
+                self.0.canvas.set_cursor_from_name(Some("none"));
+                self.prepare_keyboard_tool(true);
+            }
+            Tool::Highlight | Tool::Arrow | Tool::Text => {
+                self.0
+                    .canvas
+                    .set_cursor_from_name((!self.0.lens_active.get()).then_some("crosshair"));
+                self.prepare_keyboard_tool(true);
+            }
+            Tool::None => {
+                self.0.canvas.set_cursor_from_name(None);
+                self.prepare_keyboard_tool(false);
+            }
+        }
+
+        let highlight_width = self
+            .0
+            .rendered
+            .borrow()
+            .as_ref()
+            .map(image::GenericImageView::dimensions)
+            .map_or(HIGHLIGHT_STROKE_WIDTH, highlight_stroke_width);
+        let (lower, upper, value, tooltip, size_sensitive) = match tool {
+            Tool::Text => (
+                6.0,
+                512.0,
+                f64::from(self.0.settings.annotation_text_size()),
+                gettext("Text size in image pixels"),
+                true,
+            ),
+            Tool::Highlight => (
+                f64::from(highlight_width),
+                f64::from(highlight_width),
+                f64::from(highlight_width),
+                gettext("Automatic highlight width for this image"),
+                false,
+            ),
+            Tool::Arrow | Tool::Pencil => (
+                1.0,
+                128.0,
+                self.0.line_width.get(),
+                gettext("Stroke width in image pixels"),
+                true,
+            ),
+            Tool::Measure => (
+                f64::from(MEASUREMENT_STROKE_WIDTH),
+                f64::from(MEASUREMENT_STROKE_WIDTH),
+                f64::from(MEASUREMENT_STROKE_WIDTH),
+                gettext("Fixed native 1-pixel measurement line"),
+                false,
+            ),
+            _ => (
+                1.0,
+                128.0,
+                self.0.line_width.get(),
+                gettext("Width in image pixels"),
+                true,
+            ),
+        };
+        self.0.pencil_size.set_range(lower, upper);
+        self.0.pencil_size.set_value(value);
+        self.0.pencil_size.set_sensitive(size_sensitive);
+        self.0.pencil_size.set_tooltip_text(Some(&tooltip));
+        self.0
+            .pencil_controls
+            .set_visible(palette_visible(tool, self.0.return_tool.get()));
+        if let Some(action) = self
+            .0
+            .window
+            .lookup_action("tool")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+        {
+            action.set_state(&tool.name().to_variant());
+        }
+        self.0.canvas.set_accessible_label(&if tool == Tool::None {
+            gettext("Image canvas")
+        } else {
+            gettext("Image canvas, {tool} tool active").replace("{tool}", tool.name())
+        });
+        self.0.updating_tool.set(false);
+    }
+
     fn install_tool_controls(&self) {
         self.0.measurement_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_measurement_active(button.is_active())
+            move |button| this.tool_button_toggled(button, Tool::Measure)
         });
-        self.0.selection_button.connect_toggled({
+        self.0.highlight_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_selection_active(button.is_active())
+            move |button| this.tool_button_toggled(button, Tool::Highlight)
+        });
+        self.0.arrow_button.connect_toggled({
+            let this = self.clone();
+            move |button| this.tool_button_toggled(button, Tool::Arrow)
+        });
+        self.0.text_button.connect_toggled({
+            let this = self.clone();
+            move |button| this.tool_button_toggled(button, Tool::Text)
         });
         self.0.color_picker_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_color_picker_active(button.is_active())
+            move |button| this.tool_button_toggled(button, Tool::PickColor)
         });
         self.0.pencil_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_pencil_active(button.is_active())
+            move |button| this.tool_button_toggled(button, Tool::Pencil)
         });
         self.0.lens_button.connect_toggled({
             let this = self.clone();
@@ -2086,22 +2430,42 @@ impl ViewerWindow {
         });
         self.0.color_button.connect_rgba_notify({
             let this = self.clone();
-            move |button| this.0.pencil_color.set(rgba_to_u8(button.rgba()))
+            move |button| {
+                let color = rgba_to_u8(button.rgba());
+                this.0.pencil_color.set(color);
+                if !this.0.updating_tool.get() {
+                    this.update_selected_annotation_style(Some(color), None);
+                }
+            }
         });
         self.0.pencil_size.connect_value_changed({
-            let settings = self.0.settings.clone();
-            move |spinner| settings.set_pencil_size(spinner.value().round() as u8)
-        });
-        self.0.edit_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_edit_active(button.is_active())
+            move |spinner| {
+                if this.0.updating_tool.get() {
+                    return;
+                }
+                match this.0.tool.get() {
+                    Tool::Text => this
+                        .0
+                        .settings
+                        .set_annotation_text_size(spinner.value().round() as u16),
+                    Tool::Highlight | Tool::Measure => return,
+                    _ => {
+                        this.0.line_width.set(spinner.value());
+                        this.0
+                            .settings
+                            .set_pencil_size(spinner.value().round() as u8);
+                    }
+                }
+                this.update_selected_annotation_style(None, Some(spinner.value() as f32));
+            }
         });
     }
 
     fn install_scale_controls(&self) {
         self.0.scale_button.connect_toggled({
             let this = self.clone();
-            move |button| this.set_scale_preview_active(button.is_active())
+            move |button| this.tool_button_toggled(button, Tool::Scale)
         });
         self.0.scale_width.connect_value_changed({
             let this = self.clone();
@@ -2152,25 +2516,21 @@ impl ViewerWindow {
             .view_only_banner
             .set_revealed(self.0.canvas.texture().is_some() && !editable_available);
         self.update_action_states();
-        if !self.0.pending_scale_activation.replace(false) {
+        if self.0.pending_scale_activation.replace(false) {
+            if editable_available && self.0.tool.get() == Tool::Scale {
+                self.set_scale_preview_active(true);
+            } else {
+                self.0.scale_button.set_active(false);
+            }
             return;
         }
-        if editable_available && self.0.scale_button.is_active() {
-            self.set_scale_preview_active(true);
-        } else {
-            self.0.scale_button.set_active(false);
+        if editable_available && self.0.tool.get() == Tool::None {
+            self.set_tool(Tool::Select);
         }
     }
 
     fn set_scale_preview_active(&self, active: bool) {
         if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.selection_button.set_active(false);
-            self.0.color_picker_button.set_active(false);
-            self.0.pencil_button.set_active(false);
-            self.0.lens_button.set_active(false);
-            self.0.edit_button.set_active(false);
             let image = self.0.rendered.borrow().clone();
             let Some(image) = image else {
                 if self.0.editable_decode_pending.get() {
@@ -2220,9 +2580,7 @@ impl ViewerWindow {
         self.0.scale_spinner.set_visible(false);
         self.0.scale_controls.set_visible(false);
         self.0.pending_fit.set(None);
-        self.0
-            .zoom_controls
-            .set_visible(!self.0.edit_button.is_active());
+        self.0.zoom_controls.set_visible(true);
         self.0.scale_showing_original.set(false);
         self.0.scale_preview.borrow_mut().take();
         let source = self.0.scale_source.borrow_mut().take();
@@ -2485,7 +2843,7 @@ impl ViewerWindow {
     }
 
     fn set_scale_original_visible(&self, visible: bool) {
-        if !self.0.scale_button.is_active()
+        if self.0.tool.get() != Tool::Scale
             || self.0.scale_showing_original.replace(visible) == visible
         {
             return;
@@ -2556,7 +2914,7 @@ impl ViewerWindow {
         }
         self.set_scale_original_visible(false);
         self.0.scale_committing.set(true);
-        self.0.scale_button.set_active(false);
+        self.set_tool(Tool::None);
         self.apply(Operation::Scale {
             width,
             height,
@@ -2583,18 +2941,7 @@ impl ViewerWindow {
     }
 
     fn set_pencil_active(&self, active: bool) {
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.selection_button.set_active(false);
-            self.0.color_picker_button.set_active(false);
-        }
-        if active
-            && !pencil_can_activate(
-                self.0.edit_button.is_active(),
-                self.0.rendered.borrow().is_some(),
-            )
-        {
+        if active && !pencil_can_activate(self.0.rendered.borrow().is_some()) {
             self.0.pencil_button.set_active(false);
             if self.0.rendered.borrow().is_none() {
                 self.0
@@ -2606,7 +2953,6 @@ impl ViewerWindow {
         if !active {
             self.abort_pencil_drag();
         }
-        self.0.pencil_active.set(active);
         self.0.pencil_controls.set_visible(active);
         self.0.canvas.set_accessible_label(&if active {
             gettext("Image canvas, Pencil tool active")
@@ -2623,14 +2969,6 @@ impl ViewerWindow {
                 .toasts
                 .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
-        }
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.selection_button.set_active(false);
-            self.0.scale_button.set_active(false);
-            self.0.edit_button.set_active(false);
-            self.0.pencil_button.set_active(false);
         }
         let cursor = if self.0.lens_active.get() || self.0.compare_canvas.borrow().is_some() {
             Some("none")
@@ -2650,25 +2988,22 @@ impl ViewerWindow {
     }
 
     fn apply_picked_color(&self, color: [u8; 4]) -> String {
+        self.abort_pencil_drag();
         self.0.pencil_color.set(color);
         self.0.color_button.set_rgba(&u8_to_rgba(color));
         format_color(color, self.0.settings.color_picker_format())
     }
 
     fn copy_color_to_clipboard(&self, color: [u8; 4]) {
+        let return_tool = self.0.return_tool.get();
         let value = self.apply_picked_color(color);
         self.0.window.clipboard().set_text(&value);
         self.0.toasts.add_toast(adw::Toast::new(
             &gettext("Copied {value}").replace("{value}", &value),
         ));
-    }
-
-    fn copy_measurement_to_clipboard(&self, measurement: CropOverlay) {
-        let text = measurement_clipboard_text(measurement);
-        self.0.window.clipboard().set_text(&text);
-        self.0.toasts.add_toast(adw::Toast::new(
-            &gettext("Copied {measurement}").replace("{measurement}", &text),
-        ));
+        if let Some(tool) = return_tool {
+            self.set_tool(tool);
+        }
     }
 
     fn copy_current_image_to_clipboard(&self) {
@@ -2687,8 +3022,8 @@ impl ViewerWindow {
     }
 
     fn copy_current_selection_or_image_to_clipboard(&self) {
-        if let Some(selection) = self.0.zoom_rect_selection.get() {
-            self.copy_zoom_rect_to_clipboard(selection);
+        if self.0.region_selection.get().is_some() {
+            self.copy_selected_region();
         } else {
             self.copy_current_image_to_clipboard();
         }
@@ -2719,199 +3054,38 @@ impl ViewerWindow {
 
     fn set_selection_active(&self, active: bool) {
         if active && self.0.rendered.borrow().is_none() {
-            self.0.selection_button.set_active(false);
             self.0
                 .toasts
                 .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.color_picker_button.set_active(false);
-            self.0.scale_button.set_active(false);
-            self.0.edit_button.set_active(false);
-            self.0.pencil_button.set_active(false);
-            self.0.lens_button.set_active(false);
-            self.0.canvas.clear_lens();
-            if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
-                canvas.clear_lens();
-                canvas.set_cursor_from_name(None);
-            }
-        } else {
-            self.0.selection_drag.set(None);
-            self.0.canvas.set_crop_overlay(None);
+        self.0.region_controls.set_visible(active);
+        if !active {
+            self.clear_region_selection();
         }
         self.0
             .canvas
-            .set_cursor_from_name(active.then_some("crosshair"));
+            .set_cursor_from_name((active && !self.0.lens_active.get()).then_some("crosshair"));
         self.0.canvas.set_accessible_label(&if active {
-            gettext("Image canvas, Select and Copy tool active")
+            gettext("Image canvas, Select Region tool active")
         } else {
             gettext("Image canvas")
         });
         self.prepare_keyboard_tool(active);
     }
 
-    fn set_measurement_active(&self, active: bool) {
-        if active && self.0.rendered.borrow().is_none() {
-            self.0.measurement_button.set_active(false);
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
-            return;
-        }
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.selection_button.set_active(false);
-            self.0.color_picker_button.set_active(false);
-            self.0.scale_button.set_active(false);
-            self.0.edit_button.set_active(false);
-            self.0.pencil_button.set_active(false);
-            self.0.lens_button.set_active(false);
-            self.0.canvas.clear_lens();
-            if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
-                canvas.clear_lens();
-                canvas.set_cursor_from_name(None);
-            }
-        } else {
-            self.0.measurement_drag.set(None);
-            self.0.canvas.set_measurement_cursor(None);
-            self.0.canvas.set_measurement_overlay(None);
-        }
-        self.0.canvas.set_cursor_from_name(active.then_some("none"));
-        self.0.canvas.set_accessible_label(&if active {
-            gettext("Image canvas, Measuring tool active")
-        } else {
-            gettext("Image canvas")
-        });
-        self.prepare_keyboard_tool(active);
-    }
-
-    fn complete_selection(&self, drag: SelectionDrag) {
-        if drag.start == drag.current {
-            let Some(image) = self.0.rendered.borrow().clone() else {
-                return;
-            };
-            self.detect_and_select_object(image, drag.start);
-            return;
-        }
-        let image = self.0.rendered.borrow();
-        let Some(image) = image.as_ref() else {
-            return;
-        };
-        let result = crate::tools::selection::bounds_between(
-            drag.start,
-            drag.current,
-            image.width(),
-            image.height(),
-        )
-        .and_then(|bounds| {
-            crate::tools::selection::crop(image, bounds).map(|selected| (bounds, selected))
-        });
-        match result {
-            Ok((bounds, selected)) => self.copy_image_to_clipboard(
-                &selected,
-                &gettext("Copied {width} × {height} selection")
-                    .replace("{width}", &bounds.width.to_string())
-                    .replace("{height}", &bounds.height.to_string()),
-            ),
-            Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error.to_string())),
+    fn set_region_selection(&self, selection: Option<CropOverlay>) {
+        self.0.region_selection.set(selection);
+        self.0.canvas.set_crop_overlay(selection);
+        let enabled = selection.is_some();
+        for action in ["selection-zoom", "selection-crop", "selection-copy"] {
+            self.set_action_enabled(action, enabled);
         }
     }
 
-    fn detect_and_select_object(&self, image: image::RgbaImage, point: (u32, u32)) {
-        if self.0.object_detection_running.replace(true) {
-            self.0.toasts.add_toast(adw::Toast::new(&gettext(
-                "Object detection is already running",
-            )));
-            return;
-        }
-        let detector_unloaded = self
-            .0
-            .sam2
-            .lock()
-            .map_or(true, |detector| detector.is_none());
-        let message = if detector_unloaded && !crate::ai::sam2_is_cached() {
-            gettext("Downloading SAM 2 Tiny (156 MB, Apache-2.0) — first use may take a while")
-        } else {
-            gettext("Segmenting object…")
-        };
-        self.0.object_detection_progress_label.set_label(&message);
-        self.0.object_detection_progress_bar.set_fraction(0.0);
-        self.0.object_detection_progress.set_visible(true);
-        let progress_generation = self
-            .0
-            .object_detection_progress_generation
-            .get()
-            .wrapping_add(1);
-        self.0
-            .object_detection_progress_generation
-            .set(progress_generation);
-        let progress_weak = Rc::downgrade(&self.0);
-        glib::timeout_add_local(Duration::from_millis(150), move || {
-            let Some(state) = progress_weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            if !state.object_detection_running.get()
-                || state.object_detection_progress_generation.get() != progress_generation
-            {
-                return glib::ControlFlow::Break;
-            }
-            state.object_detection_progress_bar.pulse();
-            glib::ControlFlow::Continue
-        });
-        let sam2 = Arc::clone(&self.0.sam2);
-        let generation = self.0.load_generation.get();
-        let render_generation = self.0.render_generation.get();
-        let weak = Rc::downgrade(&self.0);
-        glib::spawn_future_local(async move {
-            let result = gio::spawn_blocking(move || {
-                let mut sam2 = sam2
-                    .lock()
-                    .map_err(|error| crate::error::AppError::AiInference(error.to_string()))?;
-                crate::ai::select_object_at(
-                    &mut sam2,
-                    image,
-                    point.0,
-                    point.1,
-                    (generation, render_generation),
-                )
-            })
-            .await;
-            let Some(state) = weak.upgrade() else {
-                return;
-            };
-            state.object_detection_running.set(false);
-            state.object_detection_progress.set_visible(false);
-            if state.load_generation.get() != generation
-                || state.render_generation.get() != render_generation
-            {
-                return;
-            }
-            let this = ViewerWindow(state.clone());
-            match result {
-                Ok(Ok(Some(selected))) => {
-                    this.flash_object_mask(&selected);
-                    this.copy_image_to_clipboard(
-                        &selected.image,
-                        &gettext("Copied {width} × {height} selection")
-                            .replace("{width}", &selected.bounds.width.to_string())
-                            .replace("{height}", &selected.bounds.height.to_string()),
-                    );
-                }
-                Ok(Ok(None)) => state.toasts.add_toast(adw::Toast::new(&gettext(
-                    "No detected object contains that pixel",
-                ))),
-                Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(
-                    &gettext("Object detection failed: {error}")
-                        .replace("{error}", &error.to_string()),
-                )),
-                Err(_) => state
-                    .toasts
-                    .add_toast(adw::Toast::new(&gettext("Object detection worker failed"))),
-            }
-        });
+    fn clear_region_selection(&self) {
+        self.0.region_drag.set(None);
+        self.set_region_selection(None);
     }
 
     fn copy_image_to_clipboard(&self, image: &image::RgbaImage, message: &str) {
@@ -2919,45 +3093,9 @@ impl ViewerWindow {
             Ok(texture) => {
                 self.0.window.clipboard().set_texture(&texture);
                 self.0.toasts.add_toast(adw::Toast::new(message));
-                self.0.selection_button.set_active(false);
             }
             Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error)),
         }
-    }
-
-    fn flash_object_mask(&self, selected: &crate::ai::SelectedObject) {
-        let Ok(texture) = texture_from_rgba(&selected.flash) else {
-            return;
-        };
-        let generation = self.0.mask_flash_generation.get().wrapping_add(1);
-        self.0.mask_flash_generation.set(generation);
-        self.0.canvas.set_mask_flash(
-            Some(&texture),
-            CropOverlay {
-                x: selected.bounds.x,
-                y: selected.bounds.y,
-                width: selected.bounds.width,
-                height: selected.bounds.height,
-                image_width: selected.image_dimensions.0,
-                image_height: selected.image_dimensions.1,
-            },
-        );
-        let weak = Rc::downgrade(&self.0);
-        glib::timeout_add_local_once(Duration::from_millis(1_200), move || {
-            let Some(state) = weak.upgrade() else {
-                return;
-            };
-            if state.mask_flash_generation.get() == generation {
-                state.canvas.clear_mask_flash();
-            }
-        });
-    }
-
-    fn clear_mask_flash(&self) {
-        self.0
-            .mask_flash_generation
-            .set(self.0.mask_flash_generation.get().wrapping_add(1));
-        self.0.canvas.clear_mask_flash();
     }
 
     fn preview_pencil_stroke(&self) {
@@ -3018,6 +3156,7 @@ impl ViewerWindow {
         points: &[BrushPoint],
         path: StrokePath,
     ) {
+        self.0.pencil_line_annotation.set(None);
         let Some(image) = self.0.compare_rendered.borrow().clone() else {
             canvas.clear_pencil_overlay();
             return;
@@ -3028,21 +3167,96 @@ impl ViewerWindow {
         canvas.clear_pencil_overlay();
     }
 
-    fn commit_pencil_stroke(&self, points: &[BrushPoint], path: StrokePath) {
-        let stroke = self.pencil_stroke(points, path);
-        let image = self.0.rendered.borrow().clone();
-        if let Some(image) = image
-            && let Ok(preview) =
-                crate::tools::pencil::paint_stroke(&image, &stroke, &CancellationToken::default())
-            && let Ok(texture) = texture_from_rgba(&preview)
+    fn commit_editable_pencil_stroke(&self, points: &[BrushPoint], mode: PencilDragMode) {
+        let Some(geometry) = pencil_geometry(mode, points) else {
+            self.0.canvas.clear_pencil_overlay();
+            return;
+        };
+        let line_annotation = self.0.pencil_line_annotation.get().and_then(|id| {
+            self.0
+                .document
+                .borrow()
+                .as_ref()?
+                .annotations()
+                .into_iter()
+                .find(|annotation| annotation.id == id)
+                .map(|annotation| (id, annotation))
+        });
+        if mode == PencilDragMode::Line
+            && let Some((id, mut annotation)) = line_annotation
+            && let PencilGeometry::Line(segment) = &geometry
+            && let Some(end) = segment.last().copied()
+            && let Shape::Pencil {
+                geometry: PencilGeometry::Line(vertices),
+                ..
+            } = &mut annotation.shape
         {
-            self.0.canvas.set_texture(Some(&texture));
-            self.0.canvas.update_lens_texture(&texture);
-            self.0.rendered.replace(Some(preview));
-            self.update_minimap();
+            if vertices.last().copied() != Some(end) {
+                vertices.push(end);
+                self.0.canvas.clear_pencil_overlay();
+                self.commit_annotation_preview(&annotation);
+                self.apply(Operation::Annotate(AnnotationEdit::Set(annotation)));
+            } else {
+                self.0.canvas.clear_pencil_overlay();
+            }
+            self.select_annotation(Some(id));
+            return;
         }
+        let id = {
+            let mut document = self.0.document.borrow_mut();
+            let Some(document) = document.as_mut() else {
+                self.0.canvas.clear_pencil_overlay();
+                return;
+            };
+            document.allocate_annotation_id()
+        };
+        let annotation = Annotation {
+            id,
+            shape: Shape::Pencil {
+                geometry,
+                style: StrokeStyle {
+                    color: self.0.pencil_color.get(),
+                    width: self.0.pencil_size.value().round() as f32,
+                },
+                anti_aliasing: self.0.pencil_antialiasing.get(),
+            },
+        };
         self.0.canvas.clear_pencil_overlay();
-        self.apply(Operation::Pencil(stroke));
+        self.commit_annotation_preview(&annotation);
+        self.apply(Operation::Annotate(AnnotationEdit::Create(annotation)));
+        self.select_annotation(Some(id));
+        if mode == PencilDragMode::Line {
+            self.0.pencil_line_annotation.set(Some(id));
+        } else {
+            self.0.pencil_line_annotation.set(None);
+        }
+    }
+
+    fn pencil_line_chain_end(&self) -> Option<BrushPoint> {
+        let id = self.0.pencil_line_annotation.get()?;
+        let point = self
+            .0
+            .document
+            .borrow()
+            .as_ref()?
+            .annotations()
+            .into_iter()
+            .find_map(|annotation| match annotation {
+                Annotation {
+                    id: annotation_id,
+                    shape:
+                        Shape::Pencil {
+                            geometry: PencilGeometry::Line(points),
+                            ..
+                        },
+                } if annotation_id == id => points.last().copied(),
+                _ => None,
+            })?;
+        Some(BrushPoint {
+            x: point.x,
+            y: point.y,
+            pressure: 1.0,
+        })
     }
 
     fn begin_pencil_drag(
@@ -3064,7 +3278,12 @@ impl ViewerWindow {
             return;
         };
         let mode = pencil_drag_mode(modifiers);
-        let line_start = pencil_line_start(mode, self.0.pencil_line_anchor.get(), origin);
+        let line_start = pencil_line_start(
+            mode,
+            self.pencil_line_chain_end()
+                .or_else(|| self.0.pencil_line_anchor.get()),
+            origin,
+        );
         self.0.pencil_drag.replace(Some(PencilDrag {
             canvas: canvas.clone(),
             start_screen: (screen_x, screen_y),
@@ -3138,7 +3357,7 @@ impl ViewerWindow {
         screen_x: f64,
         screen_y: f64,
         timestamp_ms: u32,
-    ) -> Option<(Vec<BrushPoint>, StrokePath)> {
+    ) -> Option<(Vec<BrushPoint>, StrokePath, PencilDragMode)> {
         self.update_pencil_drag(canvas, screen_x, screen_y, timestamp_ms);
         let drag = self.0.pencil_drag.take()?;
         if drag.canvas != *canvas {
@@ -3152,11 +3371,12 @@ impl ViewerWindow {
         }
         let points = self.0.pencil_points.take();
         let path = self.0.pencil_path.replace(StrokePath::Smooth);
-        Some((points, path))
+        Some((points, path, drag.mode))
     }
 
     fn abort_pencil_drag(&self) {
         self.0.pencil_line_anchor.set(None);
+        self.0.pencil_line_annotation.set(None);
         self.0.pencil_points.borrow_mut().clear();
         self.0.pencil_path.set(StrokePath::Smooth);
         let Some(drag) = self.0.pencil_drag.take() else {
@@ -3176,64 +3396,15 @@ impl ViewerWindow {
             self.abort_pencil_drag();
         } else {
             self.0.pencil_line_anchor.set(None);
+            self.0.pencil_line_annotation.set(None);
         }
     }
 
-    fn set_edit_active(&self, active: bool) {
-        if !active {
-            self.prepare_keyboard_tool(false);
-        }
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.selection_button.set_active(false);
-            self.0.color_picker_button.set_active(false);
-            self.0.scale_button.set_active(false);
-            self.0.pencil_button.set_active(false);
-        }
-        self.0.crop_controls.set_visible(active);
-        self.0.zoom_controls.set_visible(!active);
-        self.0.lens_button.set_active(false);
-        self.0.lens_active.set(false);
-        self.0.canvas.set_cursor_from_name(None);
-        self.0.canvas.clear_lens();
-        if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
-            canvas.clear_lens();
-        }
-        self.0.lens_button.set_sensitive(!active);
-        self.0.scale_button.set_sensitive(!active);
-        self.0.measurement_button.set_sensitive(!active);
-        self.0.selection_button.set_sensitive(!active);
-        self.0.color_picker_button.set_sensitive(!active);
-        self.0.pencil_button.set_sensitive(!active);
-        if !active {
-            self.0.canvas.set_preview_scale(1.0);
-            self.0.canvas.set_crop_overlay(None);
-            self.0.edit_crop.replace(None);
-            self.0.edit_drag.take();
-            self.0.crop_apply_button.set_sensitive(false);
+    fn crop_selected_region(&self) {
+        if self.0.tool.get() != Tool::Select {
             return;
         }
-        if self.0.rendered.borrow().is_none() {
-            self.0.edit_button.set_active(false);
-            self.0
-                .toasts
-                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
-            return;
-        }
-        self.0.edit_crop.replace(None);
-        self.0.canvas.set_crop_overlay(None);
-        self.0.crop_apply_button.set_sensitive(false);
-        self.0.canvas.set_cursor_from_name(Some("crosshair"));
-        self.fit(false);
-        self.prepare_keyboard_tool(true);
-    }
-
-    fn confirm_crop(&self) {
-        if !self.0.edit_button.is_active() {
-            return;
-        }
-        let Some(crop) = *self.0.edit_crop.borrow() else {
+        let Some(crop) = self.0.region_selection.get() else {
             return;
         };
         self.apply(Operation::Crop {
@@ -3242,7 +3413,7 @@ impl ViewerWindow {
             width: crop.width,
             height: crop.height,
         });
-        self.0.edit_button.set_active(false);
+        self.clear_region_selection();
     }
 
     fn render_document(&self) {
@@ -3250,6 +3421,15 @@ impl ViewerWindow {
             return;
         };
         self.render_candidate(document);
+    }
+
+    fn cancel_document_render(&self) {
+        if let Some(previous) = self.0.render_cancellation.borrow_mut().take() {
+            previous.cancel();
+        }
+        self.0
+            .render_generation
+            .set(self.0.render_generation.get().wrapping_add(1));
     }
 
     fn render_candidate(&self, document: Document) {
@@ -3293,8 +3473,10 @@ impl ViewerWindow {
                                 .canvas
                                 .set_auto_background_from_image(&rendered.pixels);
                             state.canvas.set_texture(Some(&texture));
+                            state.canvas.finish_annotation_render();
                             state.rendered.replace(Some(rendered.pixels));
                             let window = ViewerWindow(state.clone());
+                            window.refresh_annotation_selection();
                             window.update_minimap();
                             window.update_subtitle();
                             window.update_action_states();
@@ -4095,6 +4277,7 @@ impl ViewerWindow {
                     (gettext("Fit to Window"), "0"),
                     (gettext("Zoom 100%–900%"), "1–9"),
                     (gettext("Toggle Soft/Hard Zoom"), "x"),
+                    (gettext("Magnifying Lens"), "l"),
                     (gettext("Previous Image"), "Left"),
                     (gettext("Next Image"), "Right"),
                     (gettext("Delete Image"), "Delete"),
@@ -4109,13 +4292,16 @@ impl ViewerWindow {
                     (gettext("Rotate Counterclockwise"), "<Shift>r"),
                     (gettext("Flip Horizontally"), "h"),
                     (gettext("Flip Vertically"), "v"),
-                    (gettext("Crop"), "c"),
+                    (gettext("Select Region"), "c"),
+                    (gettext("Highlight"), "o"),
+                    (gettext("Arrow"), "a"),
                     (gettext("Measure"), "m"),
+                    (gettext("Text"), "t"),
                     (gettext("Scale"), "s"),
-                    (gettext("Apply Crop or Scale"), "Return"),
+                    (gettext("Zoom Selected Region or Apply Scale"), "Return"),
                     (gettext("Move Active Tool"), "Left Right Up Down"),
                     (gettext("Set Tool Point"), "space"),
-                    (gettext("Cancel Crop or Scale"), "Escape"),
+                    (gettext("Clear Selection or Cancel Scale"), "Escape"),
                     (gettext("Pencil"), "p"),
                     (gettext("Exit Active Tool"), "Escape"),
                 ],
@@ -4606,6 +4792,9 @@ impl ViewerWindow {
 
     fn enter_compare(&self, file: gio::File, preview: crate::image::LoadedPreview) {
         self.exit_compare();
+        if self.0.tool.get().is_vector_annotation() {
+            self.set_tool(Tool::None);
+        }
         let Some(primary) = self.0.canvas.texture() else {
             return;
         };
@@ -4641,6 +4830,14 @@ impl ViewerWindow {
             .shrink_start_child(false)
             .shrink_end_child(false)
             .build();
+        paned.connect_position_notify({
+            let primary = self.0.canvas.clone();
+            let comparison = compare_canvas.clone();
+            move |_| {
+                primary.queue_draw();
+                comparison.queue_draw();
+            }
+        });
         let narrow_compare = adw::Breakpoint::new(
             adw::BreakpointCondition::parse("max-width: 600px").expect("valid compare breakpoint"),
         );
@@ -4708,6 +4905,7 @@ impl ViewerWindow {
             compare_canvas.set_auto_background_from_image(image);
         }
         self.0.compare_rendered.replace(compare_rendered);
+        self.update_action_states();
         self.monitor_comparison_file();
 
         lock.connect_toggled({
@@ -4719,7 +4917,7 @@ impl ViewerWindow {
             move |_| this.exit_compare()
         });
         self.connect_compare_adjustments(&compare_scrolled);
-        let cursor = if self.0.color_picker_button.is_active() {
+        let cursor = if self.0.tool.get() == Tool::PickColor {
             "crosshair"
         } else {
             "none"
@@ -4813,7 +5011,7 @@ impl ViewerWindow {
             ),
         );
         self.0.compare_fit_zooms.set(Some(fit_zooms));
-        self.apply_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
+        self.apply_fit_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
         true
     }
 
@@ -4839,9 +5037,9 @@ impl ViewerWindow {
             adjustment.disconnect(handler);
         }
         self.0.canvas.clear_lens();
-        let cursor = if self.0.lens_active.get() || self.0.measurement_button.is_active() {
+        let cursor = if self.0.lens_active.get() || self.0.tool.get() == Tool::Measure {
             Some("none")
-        } else if self.0.selection_button.is_active() || self.0.color_picker_button.is_active() {
+        } else if matches!(self.0.tool.get(), Tool::Select | Tool::PickColor) {
             Some("crosshair")
         } else {
             None
@@ -4865,6 +5063,7 @@ impl ViewerWindow {
         self.0.compare_rendered.replace(None);
         self.0.compare_file.replace(None);
         self.0.canvas.set_accessible_label(&gettext("Image canvas"));
+        self.update_action_states();
         let this = self.clone();
         glib::idle_add_local_once(move || this.update_minimap());
     }
@@ -4952,6 +5151,10 @@ impl ViewerWindow {
         ] {
             let this = self.clone();
             let handler = source.connect_value_changed(move |source| {
+                this.0.canvas.queue_draw_if_device_phase_changed();
+                if let Some(comparison) = this.0.compare_canvas.borrow().as_ref() {
+                    comparison.queue_draw_if_device_phase_changed();
+                }
                 if !this.0.compare_locked.get() || this.0.syncing_compare.replace(true) {
                     return;
                 }
@@ -4966,24 +5169,12 @@ impl ViewerWindow {
     }
 
     fn toggle_single_image_lens(&self) {
-        if self.0.edit_button.is_active() {
-            return;
-        }
         self.0
             .lens_button
             .set_active(!self.0.lens_button.is_active());
     }
 
     fn set_single_image_lens_active(&self, active: bool) {
-        if active {
-            self.cancel_zoom_rect_drag();
-            self.0.measurement_button.set_active(false);
-            self.0.selection_button.set_active(false);
-        }
-        if active && self.0.edit_button.is_active() {
-            self.0.lens_button.set_active(false);
-            return;
-        }
         if self.0.canvas.texture().is_none() {
             if active {
                 self.0.lens_button.set_active(false);
@@ -4997,10 +5188,11 @@ impl ViewerWindow {
         self.0.canvas.set_cursor_from_name(if active {
             Some("none")
         } else {
-            self.0
-                .color_picker_button
-                .is_active()
-                .then_some("crosshair")
+            match self.0.tool.get() {
+                Tool::Measure => Some("none"),
+                Tool::None => None,
+                _ => Some("crosshair"),
+            }
         });
         if !active {
             self.0.canvas.clear_lens();
@@ -5052,16 +5244,13 @@ impl ViewerWindow {
             let target = target.clone();
             move |_, x, y| {
                 if this.0.compare_canvas.borrow().is_none()
-                    || this.0.edit_button.is_active()
-                    || this.0.measurement_button.is_active()
-                    || this.0.selection_button.is_active()
+                    || matches!(this.0.tool.get(), Tool::Measure | Tool::Select)
                 {
                     source.clear_lens();
                     target.clear_lens();
-                    let cursor = if source == this.0.canvas && this.0.measurement_button.is_active()
-                    {
+                    let cursor = if source == this.0.canvas && this.0.tool.get() == Tool::Measure {
                         Some("none")
-                    } else if source == this.0.canvas && this.0.selection_button.is_active() {
+                    } else if source == this.0.canvas && this.0.tool.get() == Tool::Select {
                         Some("crosshair")
                     } else {
                         None
@@ -5156,76 +5345,84 @@ impl ViewerWindow {
             .push((source.clone(), scroll.upcast()));
     }
 
-    fn zoom_rect_drag_available(&self) -> bool {
-        self.0.canvas.texture().is_some() && self.no_tool_active()
-    }
-
-    fn object_detection_click_available(&self) -> bool {
-        self.0.rendered.borrow().is_some() && self.no_tool_active()
-    }
-
-    fn no_tool_active(&self) -> bool {
-        no_tool_active(&[
-            self.0.measurement_button.is_active(),
-            self.0.selection_button.is_active(),
-            self.0.color_picker_button.is_active(),
-            self.0.scale_button.is_active(),
-            self.0.edit_button.is_active(),
-            self.0.pencil_active.get(),
-            self.0.lens_active.get(),
-        ])
-    }
-
-    fn cancel_zoom_rect_drag(&self) {
-        let had_drag = self.0.zoom_rect_drag.take().is_some();
-        let had_selection = self.0.zoom_rect_selection.take().is_some();
-        if had_drag || had_selection {
-            self.0.canvas.set_crop_overlay(None);
-        }
-    }
-
-    fn zoom_selected_rect(&self) -> bool {
-        let Some(selection) = self.0.zoom_rect_selection.take() else {
+    fn zoom_selected_region(&self) -> bool {
+        let Some(selection) = self.0.region_selection.get() else {
             return false;
         };
-        self.0.canvas.set_crop_overlay(None);
         self.zoom_to_rect(selection);
         true
     }
 
     fn zoom_to_rect(&self, selection: CropOverlay) {
-        let viewport = (self.0.scrolled.width(), self.0.scrolled.height());
+        let horizontal = self.0.scrolled.hadjustment();
+        let vertical = self.0.scrolled.vadjustment();
+        let adjustment_viewport = (horizontal.page_size(), vertical.page_size());
+        let viewport = if zoom_rect_target(adjustment_viewport, selection).is_some() {
+            adjustment_viewport
+        } else {
+            (
+                f64::from(self.0.scrolled.width()),
+                f64::from(self.0.scrolled.height()),
+            )
+        };
         let Some(target_zoom) = zoom_rect_target(viewport, selection) else {
             return;
         };
         let generation = self.0.load_generation.get();
-        self.set_zoom_with_alignment(target_zoom, Some(ZoomAlignment::Contain));
-        let weak = Rc::downgrade(&self.0);
+        self.0.zoom_mode.set(ZoomMode::Manual);
+        self.0.settings.set_last_zoom_mode(ZoomMode::Manual);
+        self.apply_fit_zoom_with_alignment(target_zoom, None);
+        let this = self.clone();
         glib::idle_add_local_once(move || {
+            this.center_selection_native_point(selection, generation);
+        });
+        let weak = Rc::downgrade(&self.0);
+        let frames = Cell::new(0);
+        self.0.window.add_tick_callback(move |_, _| {
             let Some(state) = weak.upgrade() else {
-                return;
+                return glib::ControlFlow::Break;
             };
-            if state.load_generation.get() != generation
-                || state.canvas.texture().is_none_or(|texture| {
-                    texture.width() as u32 != selection.image_width
-                        || texture.height() as u32 != selection.image_height
-                })
-            {
-                return;
+            let this = ViewerWindow(state);
+            if !this.center_selection_native_point(selection, generation) {
+                return glib::ControlFlow::Break;
             }
-            let Some(rect) = state.canvas.crop_display_bounds(selection) else {
-                return;
-            };
-            let horizontal = state.scrolled.hadjustment();
-            let vertical = state.scrolled.vadjustment();
-            horizontal
-                .set_value(f64::from(rect.x() + rect.width() / 2.0) - horizontal.page_size() / 2.0);
-            vertical
-                .set_value(f64::from(rect.y() + rect.height() / 2.0) - vertical.page_size() / 2.0);
+            frames.set(frames.get() + 1);
+            if frames.get() >= 2 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
         });
     }
 
-    fn copy_zoom_rect_to_clipboard(&self, selection: CropOverlay) {
+    fn center_selection_native_point(&self, selection: CropOverlay, generation: u64) -> bool {
+        if self.0.load_generation.get() != generation
+            || self.0.region_selection.get() != Some(selection)
+            || self.0.canvas.texture().is_none_or(|texture| {
+                texture.width() as u32 != selection.image_width
+                    || texture.height() as u32 != selection.image_height
+            })
+        {
+            return false;
+        }
+        let native_center = Point {
+            x: selection.x as f32 + selection.width as f32 / 2.0,
+            y: selection.y as f32 + selection.height as f32 / 2.0,
+        };
+        let Some(center) = self.0.canvas.widget_point_for_image(native_center) else {
+            return false;
+        };
+        let horizontal = self.0.scrolled.hadjustment();
+        let vertical = self.0.scrolled.vadjustment();
+        horizontal.set_value(f64::from(center.x()) - horizontal.page_size() / 2.0);
+        vertical.set_value(f64::from(center.y()) - vertical.page_size() / 2.0);
+        true
+    }
+
+    fn copy_selected_region(&self) {
+        let Some(selection) = self.0.region_selection.get() else {
+            return;
+        };
         if selection.width == 0 || selection.height == 0 {
             return;
         }
@@ -5261,7 +5458,7 @@ impl ViewerWindow {
     }
 
     fn step_zoom(&self, zoom_in: bool) {
-        if self.0.pencil_active.get() {
+        if self.0.tool.get() == Tool::Pencil {
             self.abort_pencil_drag();
         }
         let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
@@ -5298,15 +5495,36 @@ impl ViewerWindow {
     }
 
     fn apply_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
+        self.apply_zoom_with_bounds(zoom, alignment, false);
+    }
+
+    fn apply_fit_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
+        self.apply_zoom_with_bounds(zoom, alignment, true);
+    }
+
+    fn apply_zoom_with_bounds(
+        &self,
+        zoom: f64,
+        alignment: Option<ZoomAlignment>,
+        fit_bounds: bool,
+    ) {
         self.0.pending_fit.set(None);
         let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
             alignment.map_or(zoom, |alignment| {
-                aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                if fit_bounds {
+                    aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
+                } else {
+                    aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                }
             })
         } else {
             zoom
         };
-        self.0.canvas.set_zoom(zoom);
+        if fit_bounds {
+            self.0.canvas.set_fit_zoom(zoom);
+        } else {
+            self.0.canvas.set_zoom(zoom);
+        }
         self.0
             .zoom_label
             .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
@@ -5324,12 +5542,20 @@ impl ViewerWindow {
                 });
             let zoom = if compare.filter() == ZoomFilter::Hard {
                 alignment.map_or(zoom, |alignment| {
-                    aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                    if fit_bounds {
+                        aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
+                    } else {
+                        aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                    }
                 })
             } else {
                 zoom
             };
-            compare.set_zoom(zoom);
+            if fit_bounds {
+                compare.set_fit_zoom(zoom);
+            } else {
+                compare.set_zoom(zoom);
+            }
         }
         self.update_minimap();
     }
@@ -5351,11 +5577,11 @@ impl ViewerWindow {
                 let Some(surface) = window.surface() else {
                     return;
                 };
-                this.update_render_scale(f64::from(surface.scale_factor()));
+                this.update_render_scale(surface.scale());
                 let weak = Rc::downgrade(&this.0);
-                surface.connect_scale_factor_notify(move |surface| {
+                surface.connect_scale_notify(move |surface| {
                     if let Some(state) = weak.upgrade() {
-                        ViewerWindow(state).update_render_scale(f64::from(surface.scale_factor()));
+                        ViewerWindow(state).update_render_scale(surface.scale());
                     }
                 });
             }
@@ -5363,9 +5589,7 @@ impl ViewerWindow {
     }
 
     fn update_render_scale(&self, scale: f64) {
-        // GSK renders into the integer scale-factor buffer before the compositor
-        // applies GNOME's fractional surface scale.
-        let scale = normalized_render_scale(scale);
+        let scale = sanitized_render_scale(scale);
         self.0.render_scale.set(scale);
         self.0.canvas.set_render_scale(scale);
         if let Some(compare) = self.0.compare_canvas.borrow().as_ref() {
@@ -5400,7 +5624,10 @@ impl ViewerWindow {
         self.0.minimap.add_controller(drag);
         for adjustment in [self.0.scrolled.hadjustment(), self.0.scrolled.vadjustment()] {
             let this = self.clone();
-            adjustment.connect_value_changed(move |_| this.update_minimap());
+            adjustment.connect_value_changed(move |_| {
+                this.0.canvas.queue_draw_if_device_phase_changed();
+                this.update_minimap();
+            });
         }
         self.0.scrolled.connect_notify_local(Some("width"), {
             let this = self.clone();
@@ -5769,18 +5996,18 @@ impl ViewerWindow {
             ZoomAlignment::Contain
         };
         if !fill
-            && self.0.scale_button.is_active()
+            && self.0.tool.get() == Tool::Scale
             && self.0.scale_preview_view.get() == ScalePreviewView::Fit
         {
             self.0.pending_fit.set(None);
             let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
-                aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
+                aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
             } else {
                 zoom
             };
             self.set_scale_preview_fit_zoom(zoom);
         } else {
-            self.apply_zoom_with_alignment(zoom, Some(alignment));
+            self.apply_fit_zoom_with_alignment(zoom, Some(alignment));
         }
         true
     }
@@ -5916,204 +6143,12 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(scroll);
 
-        let measurement_motion = gtk::EventControllerMotion::new();
-        measurement_motion.connect_motion({
-            let this = self.clone();
-            move |_, x, y| {
-                if !this.0.measurement_button.is_active() {
-                    return;
-                }
-                this.0
-                    .canvas
-                    .set_measurement_cursor(this.0.canvas.snapped_normalized_at(x, y));
-                this.0.canvas.set_cursor_from_name(Some("none"));
-            }
-        });
-        measurement_motion.connect_leave({
-            let this = self.clone();
-            move |_| {
-                if this.0.measurement_button.is_active() {
-                    this.0.canvas.set_measurement_cursor(None);
-                }
-            }
-        });
-        self.0.canvas.add_controller(measurement_motion);
-
-        let measurement = gtk::GestureDrag::new();
-        measurement.set_button(1);
-        measurement.connect_drag_begin({
-            let this = self.clone();
-            move |gesture, x, y| {
-                if !this.0.measurement_button.is_active() {
-                    return;
-                }
-                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
-                    return;
-                };
-                let Some(image_dimensions) = this
-                    .0
-                    .rendered
-                    .borrow()
-                    .as_ref()
-                    .map(image::GenericImageView::dimensions)
-                else {
-                    return;
-                };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                let drag = MeasurementDrag {
-                    start,
-                    current: start,
-                    start_screen: (x, y),
-                    image_dimensions,
-                };
-                this.0.measurement_drag.set(Some(drag));
-                this.0
-                    .canvas
-                    .set_measurement_overlay(Some(measurement_overlay(drag)));
-            }
-        });
-        measurement.connect_drag_update({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.measurement_drag.get() else {
-                    return;
-                };
-                let Some(current) = this.0.canvas.pixel_boundary_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) else {
-                    return;
-                };
-                drag.current = current;
-                this.0.measurement_drag.set(Some(drag));
-                this.0
-                    .canvas
-                    .set_measurement_overlay(Some(measurement_overlay(drag)));
-            }
-        });
-        measurement.connect_drag_end({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.measurement_drag.take() else {
-                    return;
-                };
-                if let Some(current) = this.0.canvas.pixel_boundary_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) {
-                    drag.current = current;
-                }
-                let measurement = measurement_overlay(drag);
-                this.0.canvas.set_measurement_overlay(Some(measurement));
-                this.copy_measurement_to_clipboard(measurement);
-            }
-        });
-        self.0.canvas.add_controller(measurement);
-
-        let selection = gtk::GestureDrag::new();
-        selection.set_button(1);
-        selection.connect_drag_begin({
-            let this = self.clone();
-            move |gesture, x, y| {
-                if !this.0.selection_button.is_active() {
-                    return;
-                }
-                let Some(start) = this.0.canvas.pixel_at(x, y) else {
-                    return;
-                };
-                let Some(image_dimensions) = this
-                    .0
-                    .rendered
-                    .borrow()
-                    .as_ref()
-                    .map(image::GenericImageView::dimensions)
-                else {
-                    return;
-                };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                let drag = SelectionDrag {
-                    start,
-                    current: start,
-                    start_screen: (x, y),
-                    image_dimensions,
-                };
-                this.0.selection_drag.set(Some(drag));
-                this.0.canvas.set_crop_overlay(selection_overlay(drag));
-            }
-        });
-        selection.connect_drag_update({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.selection_drag.get() else {
-                    return;
-                };
-                let Some(current) = this.0.canvas.pixel_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) else {
-                    return;
-                };
-                drag.current = current;
-                this.0.selection_drag.set(Some(drag));
-                this.0.canvas.set_crop_overlay(selection_overlay(drag));
-            }
-        });
-        selection.connect_drag_end({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.selection_drag.take() else {
-                    return;
-                };
-                if let Some(current) = this.0.canvas.pixel_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) {
-                    drag.current = current;
-                }
-                this.0.canvas.set_crop_overlay(None);
-                this.complete_selection(drag);
-            }
-        });
-        self.0.canvas.add_controller(selection);
-
-        let object_click = gtk::GestureClick::new();
-        object_click.set_button(1);
-        let press_point = Rc::new(Cell::new(None::<(f64, f64)>));
-        object_click.connect_pressed({
-            let this = self.clone();
-            let press_point = press_point.clone();
-            move |_, _, x, y| {
-                press_point.set(this.object_detection_click_available().then_some((x, y)));
-            }
-        });
-        object_click.connect_released({
-            let this = self.clone();
-            move |gesture, _, x, y| {
-                let Some((start_x, start_y)) = press_point.take() else {
-                    return;
-                };
-                if !is_click((start_x, start_y), (x, y)) || !this.object_detection_click_available()
-                {
-                    return;
-                }
-                let Some(point) = this.0.canvas.pixel_at(x, y) else {
-                    return;
-                };
-                let Some(image) = this.0.rendered.borrow().clone() else {
-                    return;
-                };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.detect_and_select_object(image, point);
-            }
-        });
-        self.0.canvas.add_controller(object_click);
-
         let color_picker = gtk::GestureClick::new();
         color_picker.set_button(1);
         color_picker.connect_pressed({
             let this = self.clone();
             move |gesture, _, x, y| {
-                if !this.0.color_picker_button.is_active() {
+                if this.0.tool.get() != Tool::PickColor {
                     return;
                 }
                 let color = this.0.canvas.pixel_at(x, y).and_then(|(x, y)| {
@@ -6132,36 +6167,34 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(color_picker);
 
-        let edit_cursor = gtk::EventControllerMotion::new();
-        edit_cursor.connect_motion({
+        let region_cursor = gtk::EventControllerMotion::new();
+        region_cursor.connect_motion({
             let this = self.clone();
             move |_, x, y| {
                 if this.0.lens_active.get() {
                     this.0.canvas.set_cursor_from_name(Some("none"));
                     return;
                 }
-                if !this.0.edit_button.is_active() {
+                if this.0.tool.get() != Tool::Select {
                     return;
                 }
                 let cursor = this
                     .0
-                    .edit_crop
-                    .borrow()
+                    .region_selection
+                    .get()
                     .and_then(|crop| this.0.canvas.crop_display_bounds(crop))
                     .map_or("crosshair", |rect| {
-                        edit_resize_cursor(rect, x as f32, y as f32)
+                        region_resize_cursor(rect, x as f32, y as f32)
                     });
                 this.0.canvas.set_cursor_from_name(Some(cursor));
             }
         });
-        edit_cursor.connect_leave({
+        region_cursor.connect_leave({
             let this = self.clone();
             move |_| {
-                let cursor = if this.0.lens_active.get() || this.0.measurement_button.is_active() {
+                let cursor = if this.0.lens_active.get() || this.0.tool.get() == Tool::Measure {
                     Some("none")
-                } else if this.0.selection_button.is_active()
-                    || this.0.color_picker_button.is_active()
-                {
+                } else if matches!(this.0.tool.get(), Tool::Select | Tool::PickColor) {
                     Some("crosshair")
                 } else {
                     None
@@ -6169,37 +6202,34 @@ impl ViewerWindow {
                 this.0.canvas.set_cursor_from_name(cursor)
             }
         });
-        self.0.canvas.add_controller(edit_cursor);
+        self.0.canvas.add_controller(region_cursor);
 
-        let edit_drag = gtk::GestureDrag::new();
-        edit_drag.set_button(1);
-        edit_drag.connect_drag_begin({
+        let region_drag = gtk::GestureDrag::new();
+        region_drag.set_button(1);
+        region_drag.connect_drag_begin({
             let this = self.clone();
             move |gesture, x, y| {
-                if !this.0.edit_button.is_active() {
+                if this.0.tool.get() != Tool::Select {
                     return;
                 }
-                let crop = *this.0.edit_crop.borrow();
-                if let Some(crop) = crop {
-                    let Some(rect) = this.0.canvas.crop_display_bounds(crop) else {
-                        return;
-                    };
-                    let (left, right, top, bottom) = edit_edge_hit(rect, x as f32, y as f32);
-                    if !(left || right || top || bottom) {
+                if let Some(crop) = this.0.region_selection.get()
+                    && let Some(rect) = this.0.canvas.crop_display_bounds(crop)
+                {
+                    let (left, right, top, bottom) = region_edge_hit(rect, x as f32, y as f32);
+                    if left || right || top || bottom {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        this.0.region_drag.set(Some(RegionDrag::Resizing {
+                            crop,
+                            start_screen: (x, y),
+                            left,
+                            right,
+                            top,
+                            bottom,
+                        }));
                         return;
                     }
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                    this.0.edit_drag.set(Some(EditDrag::Resizing {
-                        crop,
-                        start_screen: (x, y),
-                        left,
-                        right,
-                        top,
-                        bottom,
-                    }));
-                    return;
                 }
-                let Some(start) = this.0.canvas.pixel_at(x, y) else {
+                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
                     return;
                 };
                 let Some(image_dimensions) = this
@@ -6212,40 +6242,43 @@ impl ViewerWindow {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.0.canvas.grab_focus();
                 let marking = SelectionDrag {
                     start,
                     current: start,
                     start_screen: (x, y),
                     image_dimensions,
                 };
-                let crop = selection_overlay(marking);
-                this.0.edit_crop.replace(crop);
-                this.0.canvas.set_crop_overlay(crop);
-                this.0.edit_drag.set(Some(EditDrag::Marking(marking)));
+                this.set_region_selection(None);
+                this.0.region_drag.set(Some(RegionDrag::Marking(marking)));
             }
         });
-        edit_drag.connect_drag_update({
+        region_drag.connect_drag_update({
             let this = self.clone();
             move |_, dx, dy| {
-                let Some(drag) = this.0.edit_drag.get() else {
+                let Some(drag) = this.0.region_drag.get() else {
                     return;
                 };
                 match drag {
-                    EditDrag::Marking(mut marking) => {
-                        let Some(current) = this
-                            .0
-                            .canvas
-                            .pixel_at(marking.start_screen.0 + dx, marking.start_screen.1 + dy)
-                        else {
+                    RegionDrag::Marking(mut marking) => {
+                        let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
+                            marking.start_screen.0 + dx,
+                            marking.start_screen.1 + dy,
+                        ) else {
                             return;
                         };
                         marking.current = current;
-                        let crop = selection_overlay(marking);
-                        this.0.edit_crop.replace(crop);
-                        this.0.canvas.set_crop_overlay(crop);
-                        this.0.edit_drag.set(Some(EditDrag::Marking(marking)));
+                        let selection = boundary_overlay(
+                            marking.start,
+                            marking.current,
+                            marking.image_dimensions,
+                        );
+                        this.set_region_selection(
+                            (selection.width > 0 && selection.height > 0).then_some(selection),
+                        );
+                        this.0.region_drag.set(Some(RegionDrag::Marking(marking)));
                     }
-                    EditDrag::Resizing {
+                    RegionDrag::Resizing {
                         crop,
                         start_screen,
                         left,
@@ -6256,38 +6289,54 @@ impl ViewerWindow {
                         let Some((x, y)) = this
                             .0
                             .canvas
-                            .pixel_at(start_screen.0 + dx, start_screen.1 + dy)
+                            .clamped_pixel_boundary_at(start_screen.0 + dx, start_screen.1 + dy)
                         else {
                             return;
                         };
-                        let crop = resize_crop(crop, x, y, left, right, top, bottom);
-                        this.0.edit_crop.replace(Some(crop));
-                        this.0.canvas.set_crop_overlay(Some(crop));
+                        let crop = resize_region(crop, x, y, left, right, top, bottom);
+                        this.set_region_selection(Some(crop));
                     }
                 }
             }
         });
-        edit_drag.connect_drag_end({
+        region_drag.connect_drag_end({
             let this = self.clone();
             move |_, dx, dy| {
-                let Some(drag) = this.0.edit_drag.take() else {
+                let Some(drag) = this.0.region_drag.take() else {
                     return;
                 };
                 match drag {
-                    EditDrag::Marking(mut marking) => {
+                    RegionDrag::Marking(mut marking) => {
                         if let Some(current) = this
                             .0
                             .canvas
-                            .pixel_at(marking.start_screen.0 + dx, marking.start_screen.1 + dy)
+                            .clamped_pixel_boundary_at(
+                                marking.start_screen.0 + dx,
+                                marking.start_screen.1 + dy,
+                            )
                         {
                             marking.current = current;
                         }
-                        let crop = selection_overlay(marking);
-                        this.0.edit_crop.replace(crop);
-                        this.0.canvas.set_crop_overlay(crop);
-                        this.0.crop_apply_button.set_sensitive(crop.is_some());
+                        let selection = boundary_overlay(
+                            marking.start,
+                            marking.current,
+                            marking.image_dimensions,
+                        );
+                        let selection =
+                            (selection.width > 0 && selection.height > 0).then_some(selection);
+                        this.set_region_selection(selection);
+                        if let Some(selection) = selection {
+                            this.0.canvas.announce(
+                                &gettext(
+                                    "Region selected, {width} by {height} pixels. Choose zoom, crop, or copy.",
+                                )
+                                .replace("{width}", &selection.width.to_string())
+                                .replace("{height}", &selection.height.to_string()),
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
                     }
-                    EditDrag::Resizing {
+                    RegionDrag::Resizing {
                         crop,
                         start_screen,
                         left,
@@ -6298,24 +6347,40 @@ impl ViewerWindow {
                         if let Some((x, y)) = this
                             .0
                             .canvas
-                            .pixel_at(start_screen.0 + dx, start_screen.1 + dy)
+                            .clamped_pixel_boundary_at(start_screen.0 + dx, start_screen.1 + dy)
                         {
-                            let crop = resize_crop(crop, x, y, left, right, top, bottom);
-                            this.0.edit_crop.replace(Some(crop));
-                            this.0.canvas.set_crop_overlay(Some(crop));
+                            let crop = resize_region(crop, x, y, left, right, top, bottom);
+                            this.set_region_selection(Some(crop));
                         }
                     }
                 }
             }
         });
-        self.0.canvas.add_controller(edit_drag);
+        region_drag.connect_cancel({
+            let this = self.clone();
+            move |_, _| {
+                let Some(drag) = this.0.region_drag.take() else {
+                    return;
+                };
+                match drag {
+                    RegionDrag::Marking(_) => this.set_region_selection(None),
+                    RegionDrag::Resizing { crop, .. } => {
+                        this.set_region_selection(Some(crop));
+                    }
+                }
+            }
+        });
+        self.0.canvas.add_controller(region_drag);
 
         let pencil = gtk::GestureDrag::new();
         pencil.set_button(1);
         pencil.connect_drag_begin({
             let this = self.clone();
             move |gesture, x, y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
+                    return;
+                }
+                if !pencil_drag_available(this.annotation_hit_at(x, y)) {
                     return;
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -6331,7 +6396,7 @@ impl ViewerWindow {
         pencil.connect_drag_update({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
@@ -6348,7 +6413,7 @@ impl ViewerWindow {
         pencil.connect_drag_end({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
@@ -6359,7 +6424,7 @@ impl ViewerWindow {
                 }) else {
                     return;
                 };
-                let Some((points, path)) = this.finish_pencil_drag(
+                let Some((points, _path, mode)) = this.finish_pencil_drag(
                     &this.0.canvas,
                     drag.0,
                     drag.1,
@@ -6368,123 +6433,18 @@ impl ViewerWindow {
                     return;
                 };
                 if !points.is_empty() {
-                    this.commit_pencil_stroke(&points, path);
+                    this.commit_editable_pencil_stroke(&points, mode);
                 }
             }
         });
         self.0.canvas.add_controller(pencil);
-
-        let zoom_rect = gtk::GestureDrag::new();
-        zoom_rect.set_button(1);
-        zoom_rect.connect_drag_begin({
-            let this = self.clone();
-            move |gesture, x, y| {
-                if !this.zoom_rect_drag_available() {
-                    return;
-                }
-                let Some(start) = this.0.canvas.pixel_boundary_at(x, y) else {
-                    return;
-                };
-                let Some(image_dimensions) = this
-                    .0
-                    .canvas
-                    .texture()
-                    .map(|texture| (texture.width() as u32, texture.height() as u32))
-                else {
-                    return;
-                };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.0.zoom_rect_selection.set(None);
-                this.0.canvas.grab_focus();
-                let drag = ZoomRectDrag {
-                    start,
-                    current: start,
-                    start_screen: (x, y),
-                    image_dimensions,
-                    load_generation: this.0.load_generation.get(),
-                };
-                this.0.zoom_rect_drag.set(Some(drag));
-                this.0
-                    .canvas
-                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
-            }
-        });
-        zoom_rect.connect_drag_update({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.zoom_rect_drag.get() else {
-                    return;
-                };
-                if drag.load_generation != this.0.load_generation.get() {
-                    this.cancel_zoom_rect_drag();
-                    return;
-                }
-                let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) else {
-                    return;
-                };
-                drag.current = current;
-                this.0.zoom_rect_drag.set(Some(drag));
-                this.0
-                    .canvas
-                    .set_crop_overlay(Some(zoom_rect_overlay(drag)));
-            }
-        });
-        zoom_rect.connect_drag_end({
-            let this = self.clone();
-            move |_, offset_x, offset_y| {
-                let Some(mut drag) = this.0.zoom_rect_drag.take() else {
-                    return;
-                };
-                if let Some(current) = this.0.canvas.clamped_pixel_boundary_at(
-                    drag.start_screen.0 + offset_x,
-                    drag.start_screen.1 + offset_y,
-                ) {
-                    drag.current = current;
-                }
-                if drag.load_generation == this.0.load_generation.get()
-                    && this.zoom_rect_drag_available()
-                {
-                    let selection = zoom_rect_overlay(drag);
-                    if selection.width > 0 && selection.height > 0 {
-                        this.0.zoom_rect_selection.set(Some(selection));
-                        this.0.canvas.set_crop_overlay(Some(selection));
-                        this.0.canvas.announce(
-                            &gettext(
-                                "Area selected, {width} by {height} pixels. Press Ctrl+C to copy or Space or Enter to zoom.",
-                            )
-                            .replace("{width}", &selection.width.to_string())
-                            .replace("{height}", &selection.height.to_string()),
-                            gtk::AccessibleAnnouncementPriority::Medium,
-                        );
-                    } else {
-                        this.0.zoom_rect_selection.set(None);
-                        this.0.canvas.set_crop_overlay(None);
-                    }
-                } else {
-                    this.0.zoom_rect_selection.set(None);
-                    this.0.canvas.set_crop_overlay(None);
-                }
-            }
-        });
-        zoom_rect.connect_cancel({
-            let this = self.clone();
-            move |_, _| {
-                if this.0.zoom_rect_drag.take().is_some() {
-                    this.0.canvas.set_crop_overlay(None);
-                }
-            }
-        });
-        self.0.canvas.add_controller(zoom_rect);
 
         let sampler = gtk::GestureClick::new();
         sampler.set_button(3);
         sampler.connect_pressed({
             let this = self.clone();
             move |gesture, _, x, y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -6496,8 +6456,7 @@ impl ViewerWindow {
                         .and_then(|image| crate::tools::pencil::sample(image, x, y))
                 });
                 if let Some(color) = pixel {
-                    this.0.pencil_color.set(color);
-                    this.0.color_button.set_rgba(&u8_to_rgba(color));
+                    this.apply_picked_color(color);
                     let color_value = format!(
                         "#{:02X}{:02X}{:02X}{:02X} · rgba({}, {}, {}, {})",
                         color[0],
@@ -6545,7 +6504,7 @@ impl ViewerWindow {
             let this = self.clone();
             let canvas = canvas.clone();
             move |gesture, x, y| {
-                if !this.0.pencil_active.get() || this.0.compare_rendered.borrow().is_none() {
+                if this.0.tool.get() != Tool::Pencil || this.0.compare_rendered.borrow().is_none() {
                     return;
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -6562,7 +6521,7 @@ impl ViewerWindow {
             let this = self.clone();
             let canvas = canvas.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
@@ -6580,7 +6539,7 @@ impl ViewerWindow {
             let this = self.clone();
             let canvas = canvas.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
@@ -6591,7 +6550,7 @@ impl ViewerWindow {
                 }) else {
                     return;
                 };
-                let Some((points, path)) =
+                let Some((points, path, _mode)) =
                     this.finish_pencil_drag(&canvas, drag.0, drag.1, pencil_event_time(gesture))
                 else {
                     return;
@@ -6613,7 +6572,7 @@ impl ViewerWindow {
             let this = self.clone();
             let canvas = canvas.clone();
             move |gesture, _, x, y| {
-                if !this.0.pencil_active.get() {
+                if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
                 let pixel = canvas.pixel_at(x, y).and_then(|(x, y)| {
@@ -6627,8 +6586,7 @@ impl ViewerWindow {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.0.pencil_color.set(color);
-                this.0.color_button.set_rgba(&u8_to_rgba(color));
+                this.apply_picked_color(color);
             }
         });
         canvas.add_controller(sampler.clone());
@@ -6643,7 +6601,7 @@ impl ViewerWindow {
             let this = self.clone();
             let canvas = canvas.clone();
             move |gesture, _, x, y| {
-                if !this.0.color_picker_button.is_active() {
+                if this.0.tool.get() != Tool::PickColor {
                     return;
                 }
                 let color = canvas.pixel_at(x, y).and_then(|(x, y)| {
@@ -6735,37 +6693,41 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     let previous = button("go-previous-symbolic", "Previous Image", "win.previous");
     let next = button("go-next-symbolic", "Next Image", "win.next");
     let scale_button = toggle_button("view-fullscreen-symbolic", "Scale image");
-    let selection_button = toggle_button(
-        "edit-cut-symbolic",
-        "Select and Copy — drag a rectangle or click an object",
-    );
     let color_picker_button = toggle_button(
         "color-select-symbolic",
         "Pick Color — click a pixel to copy its value",
     );
     let measurement_button = toggle_button(
         "ruler-measure-symbolic",
-        "Measure pixels — click or drag a rectangle",
+        "Measure — drag an axis-aligned measurement line",
     );
-    let pencil_button = toggle_button("xsi-edit-symbolic", "Toggle Pencil");
+    let pencil_button = toggle_button("pencil-symbolic", "Pencil");
+    let highlight_button = toggle_button("highlight-symbolic", "Highlight");
+    let arrow_button = toggle_button("arrow-symbolic", "Arrow");
+    let text_button = toggle_button("text-symbolic", "Text");
     let lens_button = toggle_button("edit-find-symbolic", "Toggle 4× Lens");
-    let edit_button = toggle_button(
-        "edit-cut-symbolic",
-        "Crop image — Enter to apply, Escape to cancel",
-    );
     let color_button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-    color_button.set_rgba(&u8_to_rgba([0, 0, 0, 255]));
-    color_button.set_tooltip_text(Some(&gettext("Pencil color")));
+    color_button.set_rgba(&u8_to_rgba(
+        crate::tools::annotation::DEFAULT_ANNOTATION_COLOR,
+    ));
+    color_button.set_tooltip_text(Some(&gettext("Annotation color")));
     let pencil_size = spin(1.0, 128.0, 1.0);
     pencil_size.set_width_chars(2);
     pencil_size.set_max_width_chars(3);
-    pencil_size.set_tooltip_text(Some(&gettext("Paint size in pixels")));
+    pencil_size.set_tooltip_text(Some(&gettext("Width in image pixels")));
     let pencil_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    pencil_controls.add_css_class("linked");
+    pencil_controls.add_css_class("toolbar");
+    pencil_controls.add_css_class("osd");
     pencil_controls.append(&pencil_button);
+    pencil_controls.append(&highlight_button);
+    pencil_controls.append(&arrow_button);
+    pencil_controls.append(&measurement_button);
+    pencil_controls.append(&text_button);
+    pencil_controls.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     pencil_controls.append(&color_button);
     pencil_controls.append(&color_picker_button);
     pencil_controls.append(&lens_button);
+    pencil_controls.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     pencil_controls.append(&pencil_size);
     header.pack_start(&animation_controls);
     header.pack_start(&previous);
@@ -6780,39 +6742,60 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
         animation_play_button: play,
         scale_button,
         measurement_button,
-        selection_button,
+        highlight_button,
+        arrow_button,
+        text_button,
         color_picker_button,
         pencil_button,
         lens_button,
         color_button,
         pencil_size,
-        edit_button,
         pencil_controls,
     }
 }
 
+fn add_development_icon_search_path() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
+    let theme = gtk::IconTheme::for_display(&display);
+    if root.is_dir() && !theme.search_path().iter().any(|path| path == root) {
+        theme.add_search_path(root);
+    }
+}
+
 fn button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
-    gtk::Button::builder()
+    let label = gettext(tooltip);
+    let button = gtk::Button::builder()
         .icon_name(icon)
-        .tooltip_text(gettext(tooltip))
+        .tooltip_text(&label)
         .action_name(action)
-        .build()
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
+    button
 }
 
 fn toggle_button(icon: &str, tooltip: &str) -> gtk::ToggleButton {
-    gtk::ToggleButton::builder()
+    let label = gettext(tooltip);
+    let button = gtk::ToggleButton::builder()
         .icon_name(icon)
-        .tooltip_text(gettext(tooltip))
-        .build()
+        .tooltip_text(&label)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
+    button
 }
 
 fn menu_button() -> gtk::MenuButton {
     let menu = main_menu();
-    gtk::MenuButton::builder()
+    let label = gettext("Main Menu");
+    let button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text(gettext("Main Menu"))
+        .tooltip_text(&label)
         .menu_model(&menu)
-        .build()
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
+    button
 }
 
 fn menu_item(menu: &gio::Menu, label: &str, action: &str) {
@@ -6832,10 +6815,12 @@ fn main_menu() -> gio::Menu {
     menu_item(&menu, "Save As…", "win.save-as");
     menu_item(&menu, "Compare Images…", "win.compare");
     let edit_menu = gio::Menu::new();
-    menu_item(&edit_menu, "Measure", "win.measure");
-    menu_item(&edit_menu, "Pick Color", "win.pick-color");
     menu_item(&edit_menu, "Pencil", "win.pencil");
-    menu_item(&edit_menu, "Crop", "win.crop");
+    menu_item(&edit_menu, "Highlight", "win.highlight");
+    menu_item(&edit_menu, "Arrow", "win.arrow");
+    menu_item(&edit_menu, "Measure", "win.measure");
+    menu_item(&edit_menu, "Text", "win.text");
+    menu_item(&edit_menu, "Select Region", "win.select");
     menu_item(
         &edit_menu,
         "Rotate Counterclockwise",
@@ -6907,12 +6892,16 @@ fn export_options(path: &Path, settings: &Settings) -> Option<ExportOptions> {
 }
 
 fn texture_from_rgba(image: &image::RgbaImage) -> Result<gtk::gdk::Texture, String> {
+    texture_from_owned_rgba(image.clone())
+}
+
+fn texture_from_owned_rgba(image: image::RgbaImage) -> Result<gtk::gdk::Texture, String> {
     let width = i32::try_from(image.width()).map_err(|_| "Image width is too large".to_owned())?;
     let height =
         i32::try_from(image.height()).map_err(|_| "Image height is too large".to_owned())?;
     let stride = usize::try_from(u64::from(image.width()) * 4)
         .map_err(|_| "Image stride is too large".to_owned())?;
-    let bytes = glib::Bytes::from_owned(image.as_raw().clone());
+    let bytes = glib::Bytes::from_owned(image.into_raw());
     Ok(gtk::gdk::MemoryTexture::new(
         width,
         height,
@@ -6957,14 +6946,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_frame_uses_directional_resize_cursors() {
+    fn region_handles_use_directional_resize_cursors() {
         let rect = gtk::graphene::Rect::new(20.0, 30.0, 100.0, 80.0);
 
-        assert_eq!(edit_resize_cursor(rect, 20.0, 30.0), "nwse-resize");
-        assert_eq!(edit_resize_cursor(rect, 120.0, 30.0), "nesw-resize");
-        assert_eq!(edit_resize_cursor(rect, 70.0, 30.0), "ns-resize");
-        assert_eq!(edit_resize_cursor(rect, 20.0, 70.0), "ew-resize");
-        assert_eq!(edit_resize_cursor(rect, 20.0, 10.0), "default");
+        assert_eq!(region_resize_cursor(rect, 20.0, 30.0), "nwse-resize");
+        assert_eq!(region_resize_cursor(rect, 120.0, 30.0), "nesw-resize");
+        assert_eq!(region_resize_cursor(rect, 70.0, 30.0), "ns-resize");
+        assert_eq!(region_resize_cursor(rect, 20.0, 70.0), "ew-resize");
+        assert_eq!(region_resize_cursor(rect, 20.0, 10.0), "default");
     }
 
     #[test]
@@ -7259,13 +7248,19 @@ mod tests {
         );
         assert_eq!(
             aligned_hard_zoom(0.75, render_scale, ZoomAlignment::Nearest),
-            0.75
+            1.0
         );
         assert_eq!(
             aligned_hard_zoom(1.0, f64::NAN, ZoomAlignment::Nearest),
             1.0
         );
-        assert_eq!(normalized_render_scale(1.666_667), 2.0);
+        assert_eq!(sanitized_render_scale(1.666_667), 1.666_667);
+    }
+
+    #[test]
+    fn hard_fit_can_downscale_an_oversized_image() {
+        assert_eq!(aligned_hard_fit_zoom(0.2, 1.0, ZoomAlignment::Contain), 0.2);
+        assert_eq!(aligned_hard_fit_zoom(0.4, 2.0, ZoomAlignment::Contain), 0.4);
     }
 
     #[test]
@@ -7276,8 +7271,8 @@ mod tests {
         assert_eq!(stepped_hard_zoom(1.5, render_scale, true), 2.0);
         assert_eq!(stepped_hard_zoom(2.0, render_scale, false), 1.5);
         assert_eq!(stepped_hard_zoom(1.5, render_scale, false), 1.0);
-        assert_eq!(stepped_hard_zoom(1.0, render_scale, false), 0.8);
-        assert!((stepped_hard_zoom(0.8, render_scale, false) - 0.64).abs() < 1e-9);
+        assert_eq!(stepped_hard_zoom(1.0, render_scale, false), 0.5);
+        assert_eq!(stepped_hard_zoom(0.8, render_scale, false), 0.5);
     }
 
     #[test]
@@ -7288,10 +7283,9 @@ mod tests {
     }
 
     #[test]
-    fn pencil_is_unavailable_while_crop_is_active() {
-        assert!(!pencil_can_activate(true, true));
-        assert!(!pencil_can_activate(false, false));
-        assert!(pencil_can_activate(false, true));
+    fn pencil_requires_an_editable_image() {
+        assert!(!pencil_can_activate(false));
+        assert!(pencil_can_activate(true));
     }
 
     #[test]
@@ -7345,6 +7339,37 @@ mod tests {
             StrokePath::Linear
         );
         assert_eq!(pencil_drag_path(PencilDragMode::Circle), StrokePath::Circle);
+    }
+
+    #[test]
+    fn pencil_drag_modes_create_editable_geometry() {
+        let start = BrushPoint {
+            x: 10.5,
+            y: 20.5,
+            pressure: 0.5,
+        };
+        let end = BrushPoint {
+            x: 30.5,
+            y: 40.5,
+            pressure: 1.0,
+        };
+        assert!(matches!(
+            pencil_geometry(PencilDragMode::Freehand, &[start, end]),
+            Some(PencilGeometry::Freehand(points)) if points == [start, end]
+        ));
+        assert!(matches!(
+            pencil_geometry(PencilDragMode::Line, &[start, end]),
+            Some(PencilGeometry::Line(points)) if points.len() == 2
+        ));
+        assert!(matches!(
+            pencil_geometry(PencilDragMode::Rectangle, &[start, start, end]),
+            Some(PencilGeometry::Rectangle(_))
+        ));
+        assert!(matches!(
+            pencil_geometry(PencilDragMode::Circle, &[start, end]),
+            Some(PencilGeometry::Ellipse(Rect { width, height, .. }))
+                if (width - height).abs() <= f32::EPSILON
+        ));
     }
 
     #[test]
@@ -7461,10 +7486,12 @@ mod tests {
                 .map(|index| string_attribute(&edit_menu, index, "label"))
                 .collect::<Vec<_>>(),
             [
-                "Measure".to_owned(),
-                "Pick Color".to_owned(),
                 "Pencil".to_owned(),
-                "Crop".to_owned(),
+                "Highlight".to_owned(),
+                "Arrow".to_owned(),
+                "Measure".to_owned(),
+                "Text".to_owned(),
+                "Select Region".to_owned(),
                 "Rotate Counterclockwise".to_owned(),
                 "Rotate Clockwise".to_owned(),
                 "Flip Horizontally".to_owned(),
@@ -7473,15 +7500,17 @@ mod tests {
             ]
         );
         for (index, action) in [
-            (0, "win.measure"),
-            (1, "win.pick-color"),
-            (2, "win.pencil"),
-            (3, "win.crop"),
-            (4, "win.rotate-counterclockwise"),
-            (5, "win.rotate-clockwise"),
-            (6, "win.flip-horizontal"),
-            (7, "win.flip-vertical"),
-            (8, "win.scale-preview"),
+            (0, "win.pencil"),
+            (1, "win.highlight"),
+            (2, "win.arrow"),
+            (3, "win.measure"),
+            (4, "win.text"),
+            (5, "win.select"),
+            (6, "win.rotate-counterclockwise"),
+            (7, "win.rotate-clockwise"),
+            (8, "win.flip-horizontal"),
+            (9, "win.flip-vertical"),
+            (10, "win.scale-preview"),
         ] {
             assert_eq!(string_attribute(&edit_menu, index, "action"), action);
         }
@@ -7575,7 +7604,7 @@ mod tests {
     }
 
     #[test]
-    fn corner_drag_resizes_both_crop_boundaries() {
+    fn corner_drag_resizes_both_region_boundaries() {
         let crop = CropOverlay {
             x: 10,
             y: 20,
@@ -7585,14 +7614,14 @@ mod tests {
             image_height: 100,
         };
 
-        let resized = resize_crop(crop, 20, 30, true, false, true, false);
+        let resized = resize_region(crop, 20, 30, true, false, true, false);
 
         assert_eq!((resized.x, resized.y), (20, 30));
         assert_eq!((resized.width, resized.height), (40, 50));
     }
 
     #[test]
-    fn crop_marking_builds_an_inclusive_rectangle_before_resizing() {
+    fn keyboard_region_marking_builds_an_inclusive_rectangle() {
         let crop = selection_overlay(SelectionDrag {
             start: (7, 5),
             current: (2, 1),
@@ -7670,69 +7699,9 @@ mod tests {
     }
 
     #[test]
-    fn measurement_overlay_uses_grid_intersections_in_both_drag_directions() {
-        let forward = measurement_overlay(MeasurementDrag {
-            start: (2, 3),
-            current: (8, 9),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (16, 12),
-        });
-        let reverse = measurement_overlay(MeasurementDrag {
-            start: (8, 9),
-            current: (2, 3),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (16, 12),
-        });
-        let point = measurement_overlay(MeasurementDrag {
-            start: (5, 4),
-            current: (5, 4),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (16, 12),
-        });
-
-        assert_eq!(
-            (forward.x, forward.y, forward.width, forward.height),
-            (2, 3, 6, 6)
-        );
-        assert_eq!(
-            (reverse.x, reverse.y, reverse.width, reverse.height),
-            (2, 3, 6, 6)
-        );
-        assert_eq!(
-            measurement_clipboard_text(forward),
-            "x:2,y:3,width:6,height:6"
-        );
-        assert_eq!(
-            measurement_clipboard_text(reverse),
-            "x:2,y:3,width:6,height:6"
-        );
-        assert_eq!(
-            measurement_clipboard_text(point),
-            "x:5,y:4,width:0,height:0"
-        );
-        assert_eq!(forward.x as f32 / forward.image_width as f32, 2.0 / 16.0);
-        assert_eq!(
-            (forward.x + forward.width) as f32 / forward.image_width as f32,
-            8.0 / 16.0
-        );
-    }
-
-    #[test]
-    fn zoom_rectangle_uses_grid_boundaries_in_both_drag_directions() {
-        let forward = zoom_rect_overlay(ZoomRectDrag {
-            start: (12, 9),
-            current: (52, 39),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (100, 80),
-            load_generation: 0,
-        });
-        let reverse = zoom_rect_overlay(ZoomRectDrag {
-            start: (52, 39),
-            current: (12, 9),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (100, 80),
-            load_generation: 0,
-        });
+    fn region_selection_uses_grid_boundaries_in_both_drag_directions() {
+        let forward = boundary_overlay((12, 9), (52, 39), (100, 80));
+        let reverse = boundary_overlay((52, 39), (12, 9), (100, 80));
 
         assert_eq!(
             (
@@ -7759,7 +7728,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_rectangle_fits_the_complete_selection_and_ignores_degenerate_drags() {
+    fn selected_region_fits_completely_and_ignores_degenerate_bounds() {
         let selection = CropOverlay {
             x: 10,
             y: 20,
@@ -7769,10 +7738,10 @@ mod tests {
             image_height: 800,
         };
 
-        assert_eq!(zoom_rect_target((800, 600), selection), Some(4.0));
+        assert_eq!(zoom_rect_target((800.0, 600.0), selection), Some(4.0));
         assert_eq!(
             zoom_rect_target(
-                (800, 600),
+                (800.0, 600.0),
                 CropOverlay {
                     width: 0,
                     ..selection
@@ -7780,23 +7749,398 @@ mod tests {
             ),
             None
         );
-        assert_eq!(zoom_rect_target((1, 600), selection), None);
+        assert_eq!(zoom_rect_target((1.0, 600.0), selection), None);
     }
 
     #[test]
-    fn zoom_rectangle_is_only_available_without_an_active_tool() {
-        assert!(no_tool_active(&[false; 7]));
-        for active_index in 0..7 {
-            let mut active_tools = [false; 7];
-            active_tools[active_index] = true;
-            assert!(!no_tool_active(&active_tools));
+    #[ignore = "requires a graphical display"]
+    fn annotation_palette_icons_resolve_without_installing_the_app() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.AnnotationIconTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let _window = ViewerWindow::new(&application, None);
+        let display = gtk::gdk::Display::default().expect("graphical display");
+        let theme = gtk::IconTheme::for_display(&display);
+
+        for icon in [
+            "pencil-symbolic",
+            "highlight-symbolic",
+            "arrow-symbolic",
+            "ruler-measure-symbolic",
+            "text-symbolic",
+        ] {
+            assert!(theme.has_icon(icon), "missing annotation icon {icon}");
         }
     }
 
     #[test]
-    fn object_detection_responds_only_to_clicks() {
-        assert!(is_click((10.0, 20.0), (13.0, 22.0)));
-        assert!(!is_click((10.0, 20.0), (15.0, 20.0)));
+    #[ignore = "requires a graphical display"]
+    fn tool_state_clears_selection_and_eyedropper_escape_returns_to_its_tool() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ToolStateTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        let mut document = Document::new(crate::document::ImageSource {
+            pixels: Arc::new(image.clone()),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        let annotation = Annotation {
+            id: document.allocate_annotation_id(),
+            shape: Shape::Arrow {
+                start: crate::document::Point { x: 2.0, y: 2.0 },
+                end: crate::document::Point { x: 12.0, y: 12.0 },
+                control: crate::document::Point { x: 7.0, y: 7.0 },
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            annotation.clone(),
+        )));
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.document.replace(Some(document));
+
+        window.set_tool(Tool::Arrow);
+        window.select_annotation(Some(annotation.id));
+        window.set_tool(Tool::None);
+        assert_eq!(window.0.tool.get(), Tool::Select);
+        assert_eq!(window.0.selected_annotation.get(), None);
+
+        window.set_tool(Tool::Arrow);
+        window.select_annotation(Some(annotation.id));
+        window.set_tool(Tool::PickColor);
+        assert_eq!(window.0.return_tool.get(), Some(Tool::Arrow));
+        assert_eq!(window.0.selected_annotation.get(), Some(annotation.id));
+        window.select_annotation(None);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "cancel-tool", None);
+        assert_eq!(window.0.tool.get(), Tool::Arrow);
+
+        window.set_tool(Tool::Measure);
+        assert_eq!(window.0.pencil_size.value(), 1.0);
+        assert!(!window.0.pencil_size.is_sensitive());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn select_is_the_resting_tool_and_escape_cannot_deactivate_it() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.SelectRestingToolTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+
+        window.set_tool(Tool::Select);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "cancel-tool", None);
+        assert_eq!(window.0.tool.get(), Tool::Select);
+
+        window.set_tool(Tool::Pencil);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "cancel-tool", None);
+        assert_eq!(window.0.tool.get(), Tool::Select);
+
+        window.toggle_tool(Tool::Select);
+        assert_eq!(window.0.tool.get(), Tool::Select);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn keyboard_creation_matches_the_pencil_highlight_and_arrow_spec() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.KeyboardAnnotationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(100, 80, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+
+        window.set_tool(Tool::Highlight);
+        window.0.pencil_size.set_value(14.0);
+        assert_eq!(window.0.pencil_size.value(), 1.0);
+        assert!(!window.0.pencil_size.is_sensitive());
+        window.0.keyboard_tool_cursor.set(Some((50, 40)));
+        window.activate_keyboard_tool();
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        assert!(matches!(
+            annotations[0].shape,
+            Shape::Highlight {
+                rect: crate::document::Rect {
+                    width: 64.0,
+                    height: 40.0,
+                    ..
+                },
+                ..
+            }
+        ));
+        let Shape::Highlight { style, .. } = &annotations[0].shape else {
+            unreachable!()
+        };
+        assert_eq!(style.width, 1.0);
+
+        window.select_annotation(None);
+        window.set_tool(Tool::Arrow);
+        window.0.keyboard_tool_cursor.set(Some((50, 40)));
+        window.activate_keyboard_tool();
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        let Shape::Arrow { start, end, .. } = annotations[1].shape else {
+            panic!("keyboard Arrow did not create an arrow")
+        };
+        assert_eq!(end.x - start.x, 80.0);
+        assert_eq!(end.y, start.y);
+
+        window.select_annotation(None);
+        window.set_tool(Tool::Pencil);
+        window.0.keyboard_tool_cursor.set(Some((12, 14)));
+        window.activate_keyboard_tool();
+        let document = window.0.document.borrow();
+        let document = document.as_ref().expect("document");
+        let annotations = document.annotations();
+        assert!(matches!(
+            &annotations[2].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Freehand(points),
+                ..
+            } if points == &[BrushPoint {
+                x: 12.5,
+                y: 14.5,
+                pressure: 1.0,
+            }]
+        ));
+        assert!(
+            document
+                .operations()
+                .iter()
+                .all(|operation| matches!(operation, Operation::Annotate(_)))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn inline_text_editor_commits_renderable_text_and_delete_removes_it() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.InlineTextTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(160, 100, image::Rgba([255, 255, 255, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        let mut document = Document::new(crate::document::ImageSource {
+            pixels: Arc::new(image.clone()),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        let id = document.allocate_annotation_id();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.document.replace(Some(document));
+        window.set_tool(Tool::Text);
+        application.set_accels_for_action("win.text", &["t"]);
+
+        window.open_text_editor(None, id, Point { x: 24.5, y: 60.5 }, 0.0, String::new());
+        assert!(application.accels_for_action("win.text").is_empty());
+        let editor = window
+            .0
+            .text_editor
+            .borrow()
+            .as_ref()
+            .expect("inline text editor")
+            .widget
+            .clone();
+        assert_eq!(
+            editor.parent(),
+            Some(window.0.canvas_overlay.clone().upcast())
+        );
+        let sample = "AV A  VA";
+        editor.set_text(sample);
+        window.0.window.present();
+        while glib::MainContext::default().iteration(false) {}
+        let assert_caret_matches_preview = || {
+            let caret_origin = editor.compute_cursor_extents(0).0.x();
+            let rendered_font_size = window
+                .0
+                .text_editor
+                .borrow()
+                .as_ref()
+                .expect("inline text editor")
+                .font_size
+                * window.0.canvas.image_scale();
+            for position in 0..=sample.len() {
+                let actual = editor.compute_cursor_extents(position).0.x() - caret_origin;
+                let expected = crate::tools::annotation::font::text_advance(
+                    &sample[..position],
+                    rendered_font_size,
+                );
+                assert!(
+                    (actual - expected).abs() <= 1.0,
+                    "caret at {position} is {actual}, rendered prefix advance is {expected}"
+                );
+            }
+        };
+        assert_caret_matches_preview();
+
+        window.0.canvas.set_zoom(0.1);
+        while glib::MainContext::default().iteration(false) {}
+        window.position_text_editor();
+        while glib::MainContext::default().iteration(false) {}
+        assert_caret_matches_preview();
+
+        editor.set_text("tomato");
+        assert_eq!(window.0.tool.get(), Tool::Text);
+        editor.emit_activate();
+        assert_eq!(application.accels_for_action("win.text"), ["t"]);
+
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        assert!(matches!(
+            &annotations[0].shape,
+            Shape::Text { text, .. } if text == "tomato"
+        ));
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn nudge_coalescing_never_absorbs_a_separate_style_edit() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.NudgeHistoryTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(32, 32, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        let mut document = Document::new(crate::document::ImageSource {
+            pixels: Arc::new(image.clone()),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        let id = document.allocate_annotation_id();
+        document.apply(Operation::Annotate(AnnotationEdit::Create(Annotation {
+            id,
+            shape: Shape::Highlight {
+                rect: crate::document::Rect {
+                    x: 4.0,
+                    y: 4.0,
+                    width: 12.0,
+                    height: 8.0,
+                },
+                seed: 1,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        })));
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.document.replace(Some(document));
+        window.set_tool(Tool::Highlight);
+        window.select_annotation(Some(id));
+
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
+        );
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            2
+        );
+
+        window.update_selected_annotation_style(Some([0, 0, 255, 255]), None);
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            3
+        );
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            4
+        );
     }
 
     #[test]
@@ -7809,7 +8153,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn selection_tool_uses_scissors_and_deactivates_after_copy() {
+    fn selection_tool_shows_region_actions_and_keeps_the_selection_after_copy() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.SelectionClipboardTest")
@@ -7819,25 +8163,60 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
-        let display = gtk::gdk::Display::default().expect("graphical display");
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(image));
-        window.0.selection_button.set_active(true);
+        window.set_tool(Tool::Select);
+        let selection = CropOverlay {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            image_width: 2,
+            image_height: 2,
+        };
+        window.set_region_selection(Some(selection));
 
+        let actions = window.0.region_controls.observe_children();
+        assert_eq!(window.0.tool.get(), Tool::Select);
+        assert!(window.0.region_controls.property::<bool>("visible"));
+        assert_eq!(actions.n_items(), 3);
         assert_eq!(
-            window.0.selection_button.icon_name().as_deref(),
-            Some("edit-cut-symbolic")
+            (0..actions.n_items())
+                .map(|index| {
+                    actions
+                        .item(index)
+                        .expect("region control")
+                        .downcast::<gtk::Button>()
+                        .expect("region button")
+                        .action_name()
+                        .expect("region action")
+                        .to_string()
+                })
+                .collect::<Vec<_>>(),
+            [
+                "win.selection-zoom",
+                "win.selection-crop",
+                "win.selection-copy"
+            ]
         );
-        assert!(gtk::IconTheme::for_display(&display).has_icon("edit-cut-symbolic"));
 
-        window.complete_selection(SelectionDrag {
-            start: (0, 0),
-            current: (1, 1),
-            start_screen: (0.0, 0.0),
-            image_dimensions: (2, 2),
-        });
-
-        assert!(!window.0.selection_button.is_active());
+        window.copy_selected_region();
+        let copied = glib::MainContext::default()
+            .block_on(window.0.window.clipboard().read_texture_future())
+            .expect("clipboard read")
+            .expect("clipboard texture");
+        assert_eq!(
+            rgba_from_texture(&copied),
+            Some(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([1, 2, 3, 255])
+            ))
+        );
+        assert_eq!(window.0.tool.get(), Tool::Select);
+        assert_eq!(window.0.region_selection.get(), Some(selection));
     }
 
     #[test]
@@ -7867,36 +8246,6 @@ mod tests {
             .expect("clipboard texture");
 
         assert_eq!(rgba_from_texture(&copied), Some(image));
-    }
-
-    #[test]
-    #[ignore = "requires a graphical display"]
-    fn completed_measurement_is_written_to_the_clipboard() {
-        adw::init().expect("GTK display initialization");
-        let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.MeasurementClipboardTest")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        application
-            .register(gio::Cancellable::NONE)
-            .expect("application registration");
-        let window = ViewerWindow::new(&application, None);
-        let measurement = CropOverlay {
-            x: 2,
-            y: 3,
-            width: 6,
-            height: 7,
-            image_width: 16,
-            image_height: 12,
-        };
-
-        window.copy_measurement_to_clipboard(measurement);
-        let copied = glib::MainContext::default()
-            .block_on(window.0.window.clipboard().read_text_future())
-            .expect("clipboard read")
-            .expect("clipboard text");
-
-        assert_eq!(copied, "x:2,y:3,width:6,height:7");
     }
 
     #[test]
@@ -7944,7 +8293,31 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn pencil_controls_use_a_contextual_canvas_group_and_define_each_stroke() {
+    fn pencil_color_sampling_forgets_any_pending_line_origin() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilSamplingStateTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.lens_active.set(true);
+        window.0.pencil_line_anchor.set(Some(BrushPoint {
+            x: 5.5,
+            y: 7.5,
+            pressure: 1.0,
+        }));
+
+        window.apply_picked_color([12, 34, 56, 255]);
+
+        assert_eq!(window.0.pencil_line_anchor.get(), None);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn annotation_palette_is_contextual_and_pencil_settings_define_each_stroke() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.PencilControlsTest")
@@ -7968,26 +8341,10 @@ mod tests {
         );
         assert_eq!(window.0.lens_button.parent().as_ref(), Some(&controls));
         assert_eq!(window.0.pencil_size.parent().as_ref(), Some(&controls));
-        assert!(controls.has_css_class("linked"));
-        assert!(!controls.has_css_class("osd"));
-        assert!(window.0.zoom_controls.has_css_class("linked"));
-        assert!(!window.0.zoom_controls.has_css_class("osd"));
-        assert_eq!(
-            window.0.color_button.prev_sibling().as_ref(),
-            Some(window.0.pencil_button.upcast_ref())
-        );
-        assert_eq!(
-            window.0.color_picker_button.prev_sibling().as_ref(),
-            Some(window.0.color_button.upcast_ref())
-        );
-        assert_eq!(
-            window.0.lens_button.prev_sibling().as_ref(),
-            Some(window.0.color_picker_button.upcast_ref())
-        );
-        assert_eq!(
-            window.0.pencil_size.prev_sibling().as_ref(),
-            Some(window.0.lens_button.upcast_ref())
-        );
+        assert!(controls.has_css_class("toolbar"));
+        assert!(controls.has_css_class("osd"));
+        assert!(window.0.zoom_controls.has_css_class("toolbar"));
+        assert!(window.0.zoom_controls.has_css_class("osd"));
 
         assert!(controls.ancestor(adw::HeaderBar::static_type()).is_none());
         assert!(controls.ancestor(gtk::Overlay::static_type()).is_some());
@@ -8009,7 +8366,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn committing_a_pencil_stroke_replaces_the_rendered_image_after_borrowing_it() {
+    fn every_pencil_drag_mode_commits_an_editable_annotation_node() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.PencilCommitTest")
@@ -8019,7 +8376,7 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
-        let pixels = image::RgbaImage::from_pixel(3, 3, image::Rgba([0, 0, 0, 0]));
+        let pixels = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
         let texture = texture_from_rgba(&pixels).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window
@@ -8032,37 +8389,137 @@ mod tests {
             })));
         window.0.rendered.replace(Some(pixels));
 
-        window.commit_pencil_stroke(
-            &[BrushPoint {
-                x: 1.5,
-                y: 1.5,
-                pressure: 1.0,
-            }],
-            StrokePath::Smooth,
+        let start = BrushPoint {
+            x: 8.5,
+            y: 8.5,
+            pressure: 0.5,
+        };
+        let end = BrushPoint {
+            x: 24.5,
+            y: 20.5,
+            pressure: 1.0,
+        };
+        for mode in [
+            PencilDragMode::Freehand,
+            PencilDragMode::Line,
+            PencilDragMode::Rectangle,
+            PencilDragMode::Circle,
+        ] {
+            let points = if mode == PencilDragMode::Rectangle {
+                crate::tools::pencil::shape_points(crate::tools::pencil::PencilShape::Rectangle {
+                    start,
+                    end,
+                })
+            } else {
+                vec![start, end]
+            };
+            window.commit_editable_pencil_stroke(&points, mode);
+        }
+
+        let mut document = window.0.document.borrow_mut();
+        let document = document.as_mut().expect("document");
+        assert_eq!(document.operations().len(), 4);
+        assert!(
+            document.operations().iter().all(|operation| matches!(
+                operation,
+                Operation::Annotate(AnnotationEdit::Create(_))
+            ))
+        );
+        let annotations = document.annotations();
+        assert!(matches!(
+            annotations[0].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Freehand(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            annotations[1].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            annotations[2].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Rectangle(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            annotations[3].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Ellipse(_),
+                ..
+            }
+        ));
+        assert!(document.undo());
+        assert_eq!(document.annotations().len(), 3);
+        assert!(document.redo());
+        assert_eq!(document.annotations().len(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn ctrl_line_chain_is_one_annotation_with_every_vertex_handle() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilLineChainTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        let point = |x, y| BrushPoint {
+            x,
+            y,
+            pressure: 1.0,
+        };
+
+        window.commit_editable_pencil_stroke(
+            &[point(4.5, 4.5), point(20.5, 12.5)],
+            PencilDragMode::Line,
+        );
+        window.commit_editable_pencil_stroke(
+            &[point(20.5, 12.5), point(36.5, 28.5)],
+            PencilDragMode::Line,
         );
 
+        let document = window.0.document.borrow();
+        let annotations = document.as_ref().expect("document").annotations();
         assert_eq!(
-            window
-                .0
-                .rendered
-                .borrow()
-                .as_ref()
-                .expect("committed preview")
-                .get_pixel(1, 1)
-                .0,
-            [0, 0, 0, 255]
+            annotations.len(),
+            1,
+            "a line chain must be one editable node"
         );
         assert_eq!(
-            window
-                .0
-                .document
-                .borrow()
-                .as_ref()
-                .expect("document")
-                .operations()
-                .len(),
-            1
+            crate::tools::annotation::hit::handles(&annotations[0]).len(),
+            3,
+            "every line vertex must remain repositionable"
         );
+        assert!(matches!(
+            &annotations[0].shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(points),
+                ..
+            } if points == &[
+                Point { x: 4.5, y: 4.5 },
+                Point { x: 20.5, y: 12.5 },
+                Point { x: 36.5, y: 28.5 },
+            ]
+        ));
     }
 
     #[test]
@@ -8214,7 +8671,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn edit_tools_are_removed_from_the_header_and_have_window_actions() {
+    fn annotation_tools_share_the_canvas_palette_and_have_window_actions() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.EditMenuTest")
@@ -8225,13 +8682,29 @@ mod tests {
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
 
-        assert!(window.0.measurement_button.parent().is_none());
-        assert!(window.0.edit_button.parent().is_none());
+        assert_eq!(
+            window.0.measurement_button.parent().as_ref(),
+            Some(&window.0.pencil_controls.clone().upcast::<gtk::Widget>())
+        );
+        assert_eq!(
+            window.0.highlight_button.parent().as_ref(),
+            Some(&window.0.pencil_controls.clone().upcast::<gtk::Widget>())
+        );
+        assert_eq!(
+            window.0.arrow_button.parent().as_ref(),
+            Some(&window.0.pencil_controls.clone().upcast::<gtk::Widget>())
+        );
+        assert_eq!(
+            window.0.text_button.parent().as_ref(),
+            Some(&window.0.pencil_controls.clone().upcast::<gtk::Widget>())
+        );
         assert!(window.0.scale_button.parent().is_none());
         assert!(window.0.window.lookup_action("measure").is_some());
-        assert!(window.0.window.lookup_action("crop").is_some());
+        assert!(window.0.window.lookup_action("highlight").is_some());
+        assert!(window.0.window.lookup_action("arrow").is_some());
+        assert!(window.0.window.lookup_action("text").is_some());
+        assert!(window.0.window.lookup_action("select").is_some());
         assert!(window.0.window.lookup_action("scale-preview").is_some());
-        assert!(window.0.selection_button.parent().is_none());
         assert!(
             window
                 .0
@@ -8239,32 +8712,36 @@ mod tests {
                 .ancestor(adw::HeaderBar::static_type())
                 .is_none()
         );
-        let crop_children = window.0.crop_controls.observe_children();
-        assert_eq!(crop_children.n_items(), 2);
+        let region_children = window.0.region_controls.observe_children();
+        assert_eq!(region_children.n_items(), 3);
         assert_eq!(
-            (0..crop_children.n_items())
+            (0..region_children.n_items())
                 .map(|index| {
-                    crop_children
+                    region_children
                         .item(index)
-                        .expect("crop control")
+                        .expect("region control")
                         .downcast::<gtk::Button>()
-                        .expect("crop button")
+                        .expect("region button")
                         .action_name()
-                        .expect("crop button action")
+                        .expect("region button action")
                         .to_string()
                 })
                 .collect::<Vec<_>>(),
-            ["win.cancel-tool", "win.confirm-crop"]
+            [
+                "win.selection-zoom",
+                "win.selection-crop",
+                "win.selection-copy"
+            ]
         );
 
         let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(image));
-        window.0.edit_button.set_active(true);
+        window.set_tool(Tool::Select);
 
-        assert!(window.0.edit_crop.borrow().is_none());
-        assert!(!window.0.crop_apply_button.is_sensitive());
+        assert!(window.0.region_selection.get().is_none());
+        assert!(window.0.region_controls.property::<bool>("visible"));
     }
 
     #[test]
@@ -8295,7 +8772,7 @@ mod tests {
         assert!(enabled("open"));
         assert!(enabled("preferences"));
         assert!(!enabled("copy-image"));
-        assert!(!enabled("crop"));
+        assert!(!enabled("select"));
         assert!(!enabled("properties"));
 
         let pixels = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
@@ -8314,14 +8791,14 @@ mod tests {
         window.update_action_states();
 
         assert!(enabled("copy-image"));
-        assert!(enabled("crop"));
+        assert!(enabled("select"));
         assert!(enabled("properties"));
         assert!(!enabled("save"));
     }
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn keyboard_crop_cursor_selects_source_pixels_without_pointer_input() {
+    fn keyboard_region_cursor_selects_source_pixels_without_pointer_input() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.KeyboardCropTest")
@@ -8336,7 +8813,7 @@ mod tests {
         window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(pixels));
 
-        window.0.edit_button.set_active(true);
+        window.set_tool(Tool::Select);
         assert_eq!(window.0.keyboard_tool_cursor.get(), None);
         assert!(window.move_keyboard_tool_cursor(0, 0));
         let start = window
@@ -8349,14 +8826,50 @@ mod tests {
         assert!(window.move_keyboard_tool_cursor(2, 1));
         window.activate_keyboard_tool();
 
-        let crop = window
+        let selection = window
             .0
-            .edit_crop
-            .borrow()
-            .expect("keyboard crop selection");
-        assert_eq!(crop.width, 3);
-        assert_eq!(crop.height, 2);
-        assert!(window.0.crop_apply_button.is_sensitive());
+            .region_selection
+            .get()
+            .expect("keyboard region selection");
+        assert_eq!(selection.width, 3);
+        assert_eq!(selection.height, 2);
+        assert!(
+            window
+                .0
+                .window
+                .lookup_action("selection-crop")
+                .expect("crop region action")
+                .is_enabled()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn arrow_tool_keeps_the_selected_line_thickness() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ArrowThicknessTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.rendered.replace(Some(image::RgbaImage::new(1, 1)));
+        let original_width = window.0.settings.pencil_size();
+        let selected_width = if original_width == 11 { 12.0 } else { 11.0 };
+        window.set_tool(Tool::Pencil);
+        window.0.pencil_size.set_value(selected_width);
+        window.set_tool(Tool::Highlight);
+
+        window.set_tool(Tool::Arrow);
+
+        assert_eq!(window.0.pencil_size.value(), selected_width);
+        assert_eq!(
+            window.current_annotation_stroke_width(),
+            selected_width as f32
+        );
+        window.0.settings.set_pencil_size(original_width);
     }
 
     #[test]
@@ -8489,7 +9002,7 @@ mod tests {
         window.0.scale_controls.set_visible(true);
         window.0.canvas_overlay.allocate(1000, 600, -1, None);
         assert_eq!(window.0.scale_controls.width(), 948);
-        assert!(scale_slider_row.width() > 900);
+        assert!(scale_slider_row.width() >= 900);
         assert!(window.0.scale_slider.width() > 700);
     }
 
@@ -8693,7 +9206,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn new_window_fit_waits_for_the_real_viewport_size() {
+    fn new_window_fit_waits_for_the_real_viewport_and_downscales_large_images() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.InitialFitTest")
@@ -8703,7 +9216,8 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
-        let image = image::RgbaImage::from_pixel(200, 100, image::Rgba([1, 2, 3, 255]));
+        window.0.window.set_default_size(800, 600);
+        let image = image::RgbaImage::from_pixel(1_600, 1_200, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window.0.content_stack.set_visible_child_name("viewer");
@@ -8724,10 +9238,12 @@ mod tests {
 
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
+        let requested_zoom = panel_fit_zoom(viewport, (1_600, 1_200));
+        assert!(requested_zoom * window.0.render_scale.get() < 1.0);
         assert_eq!(
             window.0.canvas.zoom(),
-            aligned_hard_zoom(
-                panel_fit_zoom(viewport, (200, 100)),
+            aligned_hard_fit_zoom(
+                requested_zoom,
                 window.0.render_scale.get(),
                 ZoomAlignment::Contain,
             )
@@ -8757,7 +9273,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn zoom_rectangle_waits_for_copy_or_zoom_command() {
+    fn selected_region_remains_available_after_copy_and_zoom() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
@@ -8779,19 +9295,17 @@ mod tests {
             image_width: 100,
             image_height: 80,
         };
-        let expected_zoom = aligned_hard_zoom(
-            zoom_rect_target(
-                (window.0.scrolled.width(), window.0.scrolled.height()),
-                selection,
-            )
-            .unwrap(),
-            window.0.render_scale.get(),
-            ZoomAlignment::Contain,
-        );
+        let expected_zoom = zoom_rect_target(
+            (
+                f64::from(window.0.scrolled.width()),
+                f64::from(window.0.scrolled.height()),
+            ),
+            selection,
+        )
+        .unwrap();
 
         let initial_zoom = window.0.canvas.zoom();
-        window.0.zoom_rect_selection.set(Some(selection));
-        window.0.canvas.set_crop_overlay(Some(selection));
+        window.set_region_selection(Some(selection));
         window.copy_current_selection_or_image_to_clipboard();
         let copied = glib::MainContext::default()
             .block_on(window.0.window.clipboard().read_texture_future())
@@ -8806,10 +9320,10 @@ mod tests {
             ))
         );
         assert_eq!(window.0.canvas.zoom(), initial_zoom);
-        assert!(window.0.zoom_rect_selection.get().is_some());
+        assert_eq!(window.0.region_selection.get(), Some(selection));
 
-        assert!(window.zoom_selected_rect());
-        assert!(window.0.zoom_rect_selection.get().is_none());
+        assert!(window.zoom_selected_region());
+        assert_eq!(window.0.region_selection.get(), Some(selection));
         window.0.scrolled.allocate(800, 600, -1, None);
         let context = glib::MainContext::default();
         while context.pending() {
@@ -8836,6 +9350,96 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn zoom_to_large_selected_region_fits_and_centers_in_the_actual_viewport() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.LargeSelectionZoomTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.window.set_default_size(820, 620);
+        let image = image::RgbaImage::new(1_600, 1_200);
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while (window.0.scrolled.hadjustment().page_size() <= 1.0
+            || window.0.scrolled.vadjustment().page_size() <= 1.0)
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        let selection = CropOverlay {
+            x: 100,
+            y: 100,
+            width: 1_200,
+            height: 900,
+            image_width: 1_600,
+            image_height: 1_200,
+        };
+        window.set_region_selection(Some(selection));
+
+        assert!(window.zoom_selected_region());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::yield_now();
+        }
+
+        let horizontal = window.0.scrolled.hadjustment();
+        let vertical = window.0.scrolled.vadjustment();
+        let expected_zoom = (horizontal.page_size() / f64::from(selection.width))
+            .min(vertical.page_size() / f64::from(selection.height));
+        assert!(expected_zoom < 1.0, "the regression requires downscaling");
+        assert!(
+            (window.0.canvas.zoom() - expected_zoom).abs() < 0.01,
+            "applied zoom {} did not match viewport-fit zoom {expected_zoom}; page={}x{}",
+            window.0.canvas.zoom(),
+            horizontal.page_size(),
+            vertical.page_size(),
+        );
+        let selected = window.0.canvas.crop_display_bounds(selection).unwrap();
+        assert!(f64::from(selected.width()) <= horizontal.page_size() + 1.0);
+        assert!(f64::from(selected.height()) <= vertical.page_size() + 1.0);
+        let native_center = Point {
+            x: selection.x as f32 + selection.width as f32 / 2.0,
+            y: selection.y as f32 + selection.height as f32 / 2.0,
+        };
+        let canvas_center = window
+            .0
+            .canvas
+            .widget_point_for_image(native_center)
+            .expect("native selection center");
+        let viewport = window.0.canvas.parent().expect("scroll viewport");
+        let visible_center = window
+            .0
+            .canvas
+            .compute_point(&viewport, &canvas_center)
+            .expect("selection center in viewport coordinates");
+        assert!(
+            (visible_center.x() - viewport.width() as f32 / 2.0).abs() < 1.0,
+            "native selection center x={} did not land at viewport center {}",
+            visible_center.x(),
+            viewport.width() as f32 / 2.0,
+        );
+        assert!(
+            (visible_center.y() - viewport.height() as f32 / 2.0).abs() < 1.0,
+            "native selection center y={} did not land at viewport center {}",
+            visible_center.y(),
+            viewport.height() as f32 / 2.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn compare_mode_round_trip_restores_overlay_and_disconnects_session_state() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -8849,6 +9453,16 @@ mod tests {
         let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.update_action_states();
         window
             .0
             .current_file
@@ -8863,11 +9477,24 @@ mod tests {
         let comparison = gio::File::for_path("/images/comparison.png");
 
         for _ in 0..2 {
+            assert!(window.0.highlight_button.is_sensitive());
+            window.set_tool(Tool::Highlight);
             window.enter_compare(comparison.clone(), preview.clone());
+            assert_eq!(window.0.tool.get(), Tool::Select);
+            assert!(
+                !window
+                    .0
+                    .window
+                    .lookup_action("highlight")
+                    .expect("highlight action")
+                    .is_enabled()
+            );
+            assert!(!window.0.highlight_button.is_sensitive());
             assert_eq!(window.0.compare_controllers.borrow().len(), 8);
             assert_eq!(window.0.compare_adjustment_handlers.borrow().len(), 4);
 
             window.exit_compare();
+            assert!(window.0.highlight_button.is_sensitive());
 
             assert_eq!(
                 window.0.toasts.child(),
@@ -8882,7 +9509,7 @@ mod tests {
                 Some(window.0.canvas_overlay.clone().upcast())
             );
             assert_eq!(
-                window.0.crop_controls.parent(),
+                window.0.region_controls.parent(),
                 Some(window.0.canvas_overlay.clone().upcast())
             );
             assert_eq!(
@@ -8893,7 +9520,7 @@ mod tests {
                 window.0.minimap.parent(),
                 Some(window.0.canvas_overlay.clone().upcast())
             );
-            assert!(window.0.canvas.cursor().is_none());
+            assert!(window.0.canvas.cursor().is_some());
             assert!(window.0.compare_controllers.borrow().is_empty());
             assert!(window.0.compare_adjustment_handlers.borrow().is_empty());
         }

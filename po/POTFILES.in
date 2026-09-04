@@ -3,3 +3,15 @@ data/io.github.mendrik.Diorama.metainfo.xml.in
 src/application.rs
 src/canvas/mod.rs
 src/window/mod.rs
+src/window/annotation.rs
+src/window/tool.rs
+src/tools/annotation/arrow.rs
+src/tools/annotation/edit.rs
+src/tools/annotation/font.rs
+src/tools/annotation/geometry.rs
+src/tools/annotation/highlight.rs
+src/tools/annotation/hit.rs
+src/tools/annotation/measure.rs
+src/tools/annotation/render.rs
+src/tools/annotation/text.rs
+src/settings.rs

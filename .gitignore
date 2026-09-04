@@ -1,4 +1,4 @@
 /target/
 /build/
 /.flatpak-builder/
-
+/.rust-repo-intelligence/index.sqlite3

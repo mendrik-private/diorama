@@ -24,10 +24,6 @@ pub enum AppError {
     ExternallyChanged(PathBuf),
     #[error("The file was deleted or moved: {0}")]
     FileMissing(PathBuf),
-    #[error("The optional local object-selection model is unavailable")]
-    AiModelUnavailable,
-    #[error("Local object selection failed: {0}")]
-    AiInference(String),
     #[error("Could not read or write the file: {0}")]
     Io(#[from] std::io::Error),
     #[error("Could not process the image: {0}")]

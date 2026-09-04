@@ -1,6 +1,6 @@
 [package]
 name = "diorama"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, native GNOME image viewer"
@@ -23,11 +23,8 @@ tempfile = "3.23.0"
 thiserror = "2.0.17"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-rlx-sam2 = "0.2.11"
-hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
-
-[patch.crates-io]
-rlx-sam2 = { path = "vendor/rlx-sam2" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25"
 
 [dev-dependencies]
 base64 = "0.22.1"

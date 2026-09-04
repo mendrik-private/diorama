@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::{DynamicImage, RgbaImage};
 
-use super::{History, Operation};
+use super::{Annotation, AnnotationEdit, AnnotationId, History, Operation, fold_annotations};
 use crate::error::{AppError, Result};
 use crate::tools;
 
@@ -55,6 +55,7 @@ pub struct Document {
     history: History<Operation>,
     saved_operations: Arc<[Operation]>,
     cache: RenderCache,
+    next_annotation_id: u64,
 }
 
 impl Clone for Document {
@@ -71,6 +72,7 @@ impl Clone for Document {
             // Render candidates can diverge from the live operation stack. Sharing a cache
             // keyed only by operation prefix would allow a cancelled candidate to poison it.
             cache: Arc::new(Mutex::new(cache)),
+            next_annotation_id: self.next_annotation_id,
         }
     }
 }
@@ -82,6 +84,7 @@ impl Document {
             history: History::default(),
             saved_operations: Vec::new().into(),
             cache: Arc::new(Mutex::new(Vec::new())),
+            next_annotation_id: 1,
         }
     }
 
@@ -98,8 +101,31 @@ impl Document {
     }
 
     pub fn apply(&mut self, operation: Operation) {
+        let previous_len = self.operations().len();
         self.history.push(operation);
-        self.truncate_cache(self.operations().len().saturating_sub(1));
+        self.truncate_cache(previous_len);
+    }
+
+    pub fn allocate_annotation_id(&mut self) -> AnnotationId {
+        let id = AnnotationId(self.next_annotation_id);
+        self.next_annotation_id = self.next_annotation_id.saturating_add(1);
+        id
+    }
+
+    #[must_use]
+    pub fn annotations(&self) -> Vec<Annotation> {
+        fold_annotations(self.source.pixels.dimensions(), self.operations())
+    }
+
+    pub fn amend_annotation(&mut self, annotation: Annotation) -> bool {
+        let same_annotation = matches!(
+            self.operations().last(),
+            Some(Operation::Annotate(AnnotationEdit::Set(previous))) if previous.id == annotation.id
+        );
+        same_annotation
+            && self
+                .history
+                .replace_last(Operation::Annotate(AnnotationEdit::Set(annotation)))
     }
 
     pub fn undo(&mut self) -> bool {
@@ -140,6 +166,39 @@ impl Document {
     }
 
     pub fn render(&self, cancellation: &CancellationToken) -> Result<RenderedImage> {
+        self.render_with_exclusion(cancellation, None)
+    }
+
+    pub fn render_excluding(
+        &self,
+        id: AnnotationId,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderedImage> {
+        self.render_with_exclusion(cancellation, Some(id))
+    }
+
+    pub fn render_measurement_drag_base(
+        &self,
+        excluded: Option<AnnotationId>,
+        cancellation: &CancellationToken,
+    ) -> Result<RenderedImage> {
+        self.render_with_options(cancellation, excluded, false)
+    }
+
+    fn render_with_exclusion(
+        &self,
+        cancellation: &CancellationToken,
+        excluded: Option<AnnotationId>,
+    ) -> Result<RenderedImage> {
+        self.render_with_options(cancellation, excluded, true)
+    }
+
+    fn render_with_options(
+        &self,
+        cancellation: &CancellationToken,
+        excluded: Option<AnnotationId>,
+        include_measurement_markers: bool,
+    ) -> Result<RenderedImage> {
         let (mut pixels, start) = self
             .cache
             .lock()
@@ -154,6 +213,9 @@ impl Document {
 
         for (index, operation) in self.operations().iter().enumerate().skip(start) {
             cancellation.check()?;
+            if matches!(operation, Operation::Annotate(_)) {
+                continue;
+            }
             pixels = apply_operation(pixels, operation, cancellation)?;
             let mut cache = self
                 .cache
@@ -165,6 +227,20 @@ impl Document {
             while cache.len() > 3 {
                 cache.remove(0);
             }
+        }
+
+        let mut annotations = self.annotations();
+        if let Some(excluded) = excluded {
+            annotations.retain(|annotation| annotation.id != excluded);
+        }
+        if include_measurement_markers {
+            tools::annotation::composite_annotations(&mut pixels, &annotations, cancellation)?;
+        } else {
+            tools::annotation::composite_annotation_shapes(
+                &mut pixels,
+                &annotations,
+                cancellation,
+            )?;
         }
 
         Ok(RenderedImage {
@@ -235,9 +311,7 @@ fn apply_operation(
                 cancellation,
             );
         }
-        Operation::Pencil(stroke) => {
-            return tools::pencil::paint_stroke(&dynamic.into_rgba8(), stroke, cancellation);
-        }
+        Operation::Annotate(_) => return Ok(dynamic.into_rgba8()),
     };
 
     cancellation.check()?;
@@ -251,7 +325,9 @@ mod tests {
     use image::{Rgba, RgbaImage};
 
     use super::{CancellationToken, Document, ImageSource, Metadata};
-    use crate::document::{Operation, Rotation};
+    use crate::document::{
+        Annotation, AnnotationEdit, AnnotationId, Operation, Rect, Rotation, Shape, StrokeStyle,
+    };
 
     fn document() -> Document {
         let pixels = RgbaImage::from_fn(2, 1, |x, _| {
@@ -266,6 +342,33 @@ mod tests {
             path: None,
             metadata: Metadata::default(),
         })
+    }
+
+    fn annotation_document() -> Document {
+        Document::new(ImageSource {
+            pixels: Arc::new(RgbaImage::from_pixel(64, 64, Rgba([255, 255, 255, 255]))),
+            path: None,
+            metadata: Metadata::default(),
+        })
+    }
+
+    fn highlight(id: u64, x: f32) -> Annotation {
+        Annotation {
+            id: AnnotationId(id),
+            shape: Shape::Highlight {
+                rect: Rect {
+                    x,
+                    y: 16.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                seed: id,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 2.0,
+                },
+            },
+        }
     }
 
     #[test]
@@ -364,5 +467,76 @@ mod tests {
 
         document.apply(Operation::Rotate(Rotation::Clockwise90));
         assert!(!document.adopt_render_cache(&rendered_candidate));
+    }
+
+    #[test]
+    fn annotation_entries_do_not_create_raster_cache_prefixes() {
+        let mut document = annotation_document();
+        document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
+            1, 8.0,
+        ))));
+        document.render(&CancellationToken::default()).unwrap();
+        assert!(document.cache.lock().unwrap().is_empty());
+
+        document.apply(Operation::Rotate(Rotation::Clockwise90));
+        document.render(&CancellationToken::default()).unwrap();
+        let cache = document.cache.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].0, 2);
+    }
+
+    #[test]
+    fn undoing_set_restores_annotation_geometry_and_dirty_state() {
+        let mut document = annotation_document();
+        let original = highlight(1, 8.0);
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            original.clone(),
+        )));
+        document.mark_saved_at(document.operations().into());
+        let changed = highlight(1, 24.0);
+        document.apply(Operation::Annotate(AnnotationEdit::Set(changed.clone())));
+        assert_eq!(document.annotations(), vec![changed]);
+        assert!(document.is_dirty());
+        assert!(document.undo());
+        assert_eq!(document.annotations(), vec![original]);
+        assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn amendment_coalesces_only_the_same_annotation_at_the_history_tip() {
+        let mut document = annotation_document();
+        document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
+            1, 8.0,
+        ))));
+        document.apply(Operation::Annotate(AnnotationEdit::Set(highlight(1, 12.0))));
+        assert!(document.amend_annotation(highlight(1, 16.0)));
+        assert_eq!(document.operations().len(), 2);
+        assert!(!document.amend_annotation(highlight(2, 16.0)));
+        assert!(document.undo());
+        assert!(!document.amend_annotation(highlight(1, 20.0)));
+        assert!(document.can_redo());
+    }
+
+    #[test]
+    fn render_excluding_omits_only_the_requested_annotation() {
+        let mut document = annotation_document();
+        document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
+            1, 6.0,
+        ))));
+        document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
+            2, 34.0,
+        ))));
+        let all = document
+            .render(&CancellationToken::default())
+            .unwrap()
+            .pixels;
+        let without_first = document
+            .render_excluding(AnnotationId(1), &CancellationToken::default())
+            .unwrap()
+            .pixels;
+        let source = document.source().pixels.as_ref();
+        assert_ne!(all, without_first);
+        assert_ne!(without_first, *source);
+        assert_eq!(without_first.get_pixel(10, 26), source.get_pixel(10, 26));
     }
 }

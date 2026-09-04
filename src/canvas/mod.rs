@@ -7,11 +7,13 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use crate::document::{BrushPoint, StrokePath};
+use crate::document::{Annotation, BrushPoint, Point, Shape, StrokePath};
 use crate::i18n::gettext;
+use crate::tools::annotation::hit::{HandleKind, handles};
 
 const MAX_FIT_ZOOM: f64 = 16_384.0;
 const COORDINATE_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
+const MEASUREMENT_CURSOR_BLEND_MODE: gtk::gsk::BlendMode = gtk::gsk::BlendMode::Difference;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ZoomFilter {
@@ -20,16 +22,25 @@ pub enum ZoomFilter {
     Hard,
 }
 
-fn normalized_render_scale(scale: f64) -> f64 {
+fn sanitized_render_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
-        scale.round().max(1.0)
+        scale
     } else {
         1.0
     }
 }
 
+fn bounded_fit_zoom(zoom: f64) -> f64 {
+    zoom.clamp(f64::EPSILON, MAX_FIT_ZOOM)
+}
+
+fn snap_to_device(value: f32, render_scale: f64) -> f32 {
+    let render_scale = sanitized_render_scale(render_scale) as f32;
+    (value * render_scale).round() / render_scale
+}
+
 fn aligned_render_pixel_scale(zoom: f64, render_scale: f64) -> Option<f64> {
-    let effective_scale = zoom * normalized_render_scale(render_scale);
+    let effective_scale = zoom * sanitized_render_scale(render_scale);
     let aligned = effective_scale.round();
     (aligned >= 1.0 && (effective_scale - aligned).abs() <= 1e-6 * effective_scale.abs().max(1.0))
         .then_some(aligned)
@@ -55,35 +66,54 @@ fn measured_image_dimension(
     }
 }
 
-fn canvas_image_bounds(
+#[derive(Debug, Clone, Copy)]
+struct CanvasLayout {
+    logical_bounds: gtk::graphene::Rect,
+    device_bounds: Option<gtk::graphene::Rect>,
+}
+
+fn canvas_layout(
     bounds: gtk::graphene::Rect,
     image_dimensions: (i32, i32),
     zoom: f64,
     filter: ZoomFilter,
     render_scale: f64,
     preview_scale: f32,
-) -> gtk::graphene::Rect {
+    surface_origin_device: (f64, f64),
+) -> CanvasLayout {
     let image_width = image_dimensions.0.max(1);
     let image_height = image_dimensions.1.max(1);
-    let mut image_bounds = if filter == ZoomFilter::Hard {
-        aligned_render_pixel_scale(zoom, render_scale).map(|pixel_scale| {
-            let render_scale = normalized_render_scale(render_scale);
-            let width = f64::from(image_width) * pixel_scale / render_scale;
-            let height = f64::from(image_height) * pixel_scale / render_scale;
-            let x = ((f64::from(bounds.x()) + (f64::from(bounds.width()) - width) / 2.0)
-                * render_scale)
-                .round()
-                / render_scale;
-            let y = ((f64::from(bounds.y()) + (f64::from(bounds.height()) - height) / 2.0)
-                * render_scale)
-                .round()
-                / render_scale;
-            gtk::graphene::Rect::new(x as f32, y as f32, width as f32, height as f32)
-        })
-    } else {
-        None
+    let render_scale = sanitized_render_scale(render_scale);
+    if filter == ZoomFilter::Hard {
+        let pixel_scale = zoom * render_scale * f64::from(preview_scale.clamp(0.01, 64.0));
+        let width_device = f64::from(image_width) * pixel_scale;
+        let height_device = f64::from(image_height) * pixel_scale;
+        let desired_x =
+            f64::from(bounds.x()) + (f64::from(bounds.width()) - width_device / render_scale) / 2.0;
+        let desired_y = f64::from(bounds.y())
+            + (f64::from(bounds.height()) - height_device / render_scale) / 2.0;
+        let x_device =
+            (surface_origin_device.0 + desired_x * render_scale).round() - surface_origin_device.0;
+        let y_device =
+            (surface_origin_device.1 + desired_y * render_scale).round() - surface_origin_device.1;
+        let device_bounds = gtk::graphene::Rect::new(
+            x_device as f32,
+            y_device as f32,
+            width_device as f32,
+            height_device as f32,
+        );
+        return CanvasLayout {
+            logical_bounds: gtk::graphene::Rect::new(
+                (x_device / render_scale) as f32,
+                (y_device / render_scale) as f32,
+                (width_device / render_scale) as f32,
+                (height_device / render_scale) as f32,
+            ),
+            device_bounds: Some(device_bounds),
+        };
     }
-    .unwrap_or_else(|| {
+
+    let mut image_bounds = {
         let image_ratio = image_width as f32 / image_height as f32;
         let bounds_ratio = bounds.width() / bounds.height().max(1.0);
         if image_ratio > bounds_ratio {
@@ -103,7 +133,7 @@ fn canvas_image_bounds(
                 bounds.height(),
             )
         }
-    });
+    };
 
     let preview_scale = preview_scale.clamp(0.01, 64.0);
     if preview_scale != 1.0 {
@@ -116,7 +146,31 @@ fn canvas_image_bounds(
             height,
         );
     }
-    image_bounds
+    CanvasLayout {
+        logical_bounds: image_bounds,
+        device_bounds: None,
+    }
+}
+
+#[cfg(test)]
+fn canvas_image_bounds(
+    bounds: gtk::graphene::Rect,
+    image_dimensions: (i32, i32),
+    zoom: f64,
+    filter: ZoomFilter,
+    render_scale: f64,
+    preview_scale: f32,
+) -> gtk::graphene::Rect {
+    canvas_layout(
+        bounds,
+        image_dimensions,
+        zoom,
+        filter,
+        render_scale,
+        preview_scale,
+        (0.0, 0.0),
+    )
+    .logical_bounds
 }
 
 fn overlay_rect(image_bounds: gtk::graphene::Rect, overlay: &CropOverlay) -> gtk::graphene::Rect {
@@ -190,7 +244,7 @@ fn opposite_grayscale_luminance(image: &image::RgbaImage) -> f32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CropOverlay {
     pub x: u32,
     pub y: u32,
@@ -198,12 +252,6 @@ pub struct CropOverlay {
     pub height: u32,
     pub image_width: u32,
     pub image_height: u32,
-}
-
-#[derive(Debug, Clone)]
-struct MaskFlash {
-    texture: gdk::Texture,
-    bounds: CropOverlay,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +272,62 @@ struct PencilOverlay {
     width: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct AnnotationOverlay {
+    pub texture: gdk::Texture,
+    pub bounds: crate::document::Rect,
+}
+
+#[derive(Debug)]
+struct PreviewLayers<T> {
+    committed: Vec<T>,
+    active: Option<T>,
+}
+
+impl<T> Default for PreviewLayers<T> {
+    fn default() -> Self {
+        Self {
+            committed: Vec::new(),
+            active: None,
+        }
+    }
+}
+
+impl<T> PreviewLayers<T> {
+    fn set_active(&mut self, preview: Option<T>) {
+        self.active = preview;
+    }
+
+    fn commit_active(&mut self) {
+        if let Some(preview) = self.active.take() {
+            self.committed.push(preview);
+        }
+    }
+
+    fn finish_document_render(&mut self) -> bool {
+        let changed = !self.committed.is_empty();
+        self.committed.clear();
+        changed
+    }
+
+    fn clear(&mut self) -> bool {
+        let changed = self.active.is_some() || !self.committed.is_empty();
+        self.active = None;
+        self.committed.clear();
+        changed
+    }
+
+    fn visible(&self) -> impl Iterator<Item = &T> {
+        self.committed.iter().chain(self.active.iter())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionHandles {
+    pub annotation: Annotation,
+    pub hot: Option<HandleKind>,
+}
+
 mod imp {
     use super::*;
 
@@ -236,13 +340,16 @@ mod imp {
         pub background: Cell<Background>,
         pub auto_background_luminance: Cell<f32>,
         pub preview_scale: Cell<f32>,
+        pub device_origin_phase: Cell<(u64, u64)>,
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
         pub crop_overlay: RefCell<Option<CropOverlay>>,
-        pub measurement_overlay: Cell<Option<CropOverlay>>,
+        pub crop_dash_phase: Cell<f32>,
+        pub crop_animation_running: Cell<bool>,
         pub measurement_cursor: Cell<Option<(f32, f32)>>,
-        pub(super) mask_flash: RefCell<Option<MaskFlash>>,
         pub(super) pencil_overlay: RefCell<Option<PencilOverlay>>,
+        pub(super) annotation_previews: RefCell<PreviewLayers<AnnotationOverlay>>,
+        pub(super) selection: RefCell<Option<SelectionHandles>>,
     }
 
     #[glib::object_subclass]
@@ -304,38 +411,91 @@ mod imp {
                 self.auto_background_luminance.get(),
             );
             let image_bounds = self.texture.borrow().as_ref().map(|texture| {
-                let image_bounds = canvas_image_bounds(
+                let layout = canvas_layout(
                     bounds,
                     (texture.width(), texture.height()),
                     self.zoom.get(),
                     self.filter.get(),
                     self.render_scale.get(),
                     self.preview_scale.get(),
+                    object.surface_origin_device(),
                 );
+                let image_bounds = layout.logical_bounds;
                 let filter = match self.filter.get() {
                     ZoomFilter::Soft => gtk::gsk::ScalingFilter::Linear,
                     ZoomFilter::Hard => gtk::gsk::ScalingFilter::Nearest,
                 };
-                let measurement = self.measurement_overlay.get();
                 let measurement_cursor = self.measurement_cursor.get();
-                if measurement.is_some() || measurement_cursor.is_some() {
-                    snapshot.push_blend(gtk::gsk::BlendMode::Difference);
-                    snapshot.append_scaled_texture(texture, filter, &image_bounds);
-                    snapshot.pop();
-                    draw_measurement_layer(
+                if measurement_cursor.is_some() {
+                    append_measurement_cursor_xor(
                         snapshot,
-                        &object,
+                        texture,
+                        filter,
+                        layout,
                         image_bounds,
-                        measurement,
                         measurement_cursor,
+                        self.render_scale.get(),
                     );
-                    snapshot.pop();
                 } else {
-                    snapshot.append_scaled_texture(texture, filter, &image_bounds);
+                    append_texture(snapshot, texture, filter, layout, self.render_scale.get());
                 }
                 image_bounds
             });
             let pencil_overlay = self.pencil_overlay.borrow();
+            let annotation_previews = self.annotation_previews.borrow();
+            if let Some(image_bounds) = image_bounds {
+                let render_scale = sanitized_render_scale(self.render_scale.get());
+                let image_dimensions = self
+                    .texture
+                    .borrow()
+                    .as_ref()
+                    .map_or((1, 1), |texture| (texture.width(), texture.height()));
+                for overlay in annotation_previews.visible() {
+                    let scale_x = image_bounds.width() / image_dimensions.0.max(1) as f32;
+                    let scale_y = image_bounds.height() / image_dimensions.1.max(1) as f32;
+                    let preview_bounds = gtk::graphene::Rect::new(
+                        image_bounds.x() + overlay.bounds.x * scale_x,
+                        image_bounds.y() + overlay.bounds.y * scale_y,
+                        overlay.bounds.width * scale_x,
+                        overlay.bounds.height * scale_y,
+                    );
+                    let layout = CanvasLayout {
+                        logical_bounds: preview_bounds,
+                        device_bounds: (self.filter.get() == ZoomFilter::Hard).then(|| {
+                            gtk::graphene::Rect::new(
+                                preview_bounds.x() * render_scale as f32,
+                                preview_bounds.y() * render_scale as f32,
+                                preview_bounds.width() * render_scale as f32,
+                                preview_bounds.height() * render_scale as f32,
+                            )
+                        }),
+                    };
+                    append_texture(
+                        snapshot,
+                        &overlay.texture,
+                        match self.filter.get() {
+                            ZoomFilter::Soft => gtk::gsk::ScalingFilter::Linear,
+                            ZoomFilter::Hard => gtk::gsk::ScalingFilter::Nearest,
+                        },
+                        layout,
+                        render_scale,
+                    );
+                }
+            }
+            if let Some(image_bounds) = image_bounds
+                && let Some(selection) = self.selection.borrow().as_ref()
+            {
+                draw_annotation_selection(
+                    snapshot,
+                    image_bounds,
+                    self.texture
+                        .borrow()
+                        .as_ref()
+                        .map_or((1, 1), |texture| (texture.width(), texture.height())),
+                    selection,
+                    self.render_scale.get(),
+                );
+            }
             if let Some(image_bounds) = image_bounds
                 && let Some(overlay) = pencil_overlay.as_ref()
             {
@@ -350,20 +510,66 @@ mod imp {
                 );
             }
             if let Some(lens) = self.lens.borrow().as_ref() {
-                draw_lens(snapshot, bounds, lens, pencil_overlay.as_ref());
+                draw_lens(
+                    snapshot,
+                    bounds,
+                    lens,
+                    pencil_overlay.as_ref(),
+                    self.background.get(),
+                    self.auto_background_luminance.get(),
+                );
             }
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
             }
-            if let Some(image_bounds) = image_bounds {
-                if let Some(flash) = self.mask_flash.borrow().as_ref() {
-                    draw_mask_flash(snapshot, image_bounds, flash);
-                }
-                if let Some(overlay) = self.crop_overlay.borrow().as_ref() {
-                    draw_crop_overlay(snapshot, image_bounds, overlay);
-                }
+            if let Some(image_bounds) = image_bounds
+                && let Some(overlay) = self.crop_overlay.borrow().as_ref()
+            {
+                draw_crop_overlay(
+                    snapshot,
+                    image_bounds,
+                    overlay,
+                    self.render_scale.get(),
+                    self.crop_dash_phase.get(),
+                );
             }
         }
+    }
+
+    fn append_texture(
+        snapshot: &gtk::Snapshot,
+        texture: &gdk::Texture,
+        filter: gtk::gsk::ScalingFilter,
+        layout: CanvasLayout,
+        render_scale: f64,
+    ) {
+        if let Some(device_bounds) = layout.device_bounds {
+            let inverse = (1.0 / sanitized_render_scale(render_scale)) as f32;
+            snapshot.save();
+            snapshot.scale(inverse, inverse);
+            snapshot.append_scaled_texture(texture, filter, &device_bounds);
+            snapshot.restore();
+        } else {
+            snapshot.append_scaled_texture(texture, filter, &layout.logical_bounds);
+        }
+    }
+
+    pub(super) fn append_measurement_cursor_xor(
+        snapshot: &gtk::Snapshot,
+        texture: &gdk::Texture,
+        filter: gtk::gsk::ScalingFilter,
+        layout: CanvasLayout,
+        image_bounds: gtk::graphene::Rect,
+        cursor: Option<(f32, f32)>,
+        render_scale: f64,
+    ) {
+        snapshot.push_blend(MEASUREMENT_CURSOR_BLEND_MODE);
+        append_texture(snapshot, texture, filter, layout, render_scale);
+        // A blend snapshot has two child slots. The first pop closes the image
+        // (bottom) child; the second closes the white crosshair (top) child.
+        snapshot.pop();
+        draw_measurement_cursor(snapshot, image_bounds, cursor, render_scale);
+        snapshot.pop();
     }
 
     pub(super) fn draw_pencil_overlay(
@@ -454,6 +660,101 @@ mod imp {
         snapshot.pop();
     }
 
+    pub(super) fn draw_annotation_selection(
+        snapshot: &gtk::Snapshot,
+        image_bounds: gtk::graphene::Rect,
+        image_dimensions: (i32, i32),
+        selection: &SelectionHandles,
+        render_scale: f64,
+    ) {
+        let scale_x = image_bounds.width() / image_dimensions.0.max(1) as f32;
+        let scale_y = image_bounds.height() / image_dimensions.1.max(1) as f32;
+        let map = |point: Point| {
+            gtk::graphene::Point::new(
+                snap_to_device(image_bounds.x() + point.x * scale_x, render_scale),
+                snap_to_device(image_bounds.y() + point.y * scale_y, render_scale),
+            )
+        };
+        let mut outline = Vec::new();
+        match &selection.annotation.shape {
+            Shape::Pencil { geometry, .. } => {
+                outline = crate::tools::annotation::pencil::outline_points(geometry);
+            }
+            Shape::Highlight { rect, .. } => {
+                outline.extend([
+                    Point {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                    Point {
+                        x: rect.x + rect.width,
+                        y: rect.y,
+                    },
+                    Point {
+                        x: rect.x + rect.width,
+                        y: rect.y + rect.height,
+                    },
+                    Point {
+                        x: rect.x,
+                        y: rect.y + rect.height,
+                    },
+                    Point {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                ]);
+            }
+            Shape::Arrow { start, end, .. } => outline.extend([*start, *end]),
+            Shape::Measurement { .. } => {
+                // The rendered one-pixel measurement remains the outline. Drawing a GSK
+                // selection stroke over it would reintroduce antialiasing and extra width.
+            }
+            Shape::Text {
+                anchor,
+                angle,
+                font_size,
+                bend,
+                text,
+                ..
+            } => {
+                outline = crate::tools::annotation::text::baseline(
+                    *anchor, *angle, *bend, text, *font_size,
+                );
+            }
+        }
+        if outline.len() >= 2 {
+            let builder = gtk::gsk::PathBuilder::new();
+            let first = map(outline[0]);
+            builder.move_to(first.x(), first.y());
+            for point in outline.into_iter().skip(1) {
+                let point = map(point);
+                builder.line_to(point.x(), point.y());
+            }
+            let path = builder.to_path();
+            let hairline = 1.0 / sanitized_render_scale(render_scale) as f32;
+            for (width, color) in [
+                (hairline * 3.0, gdk::RGBA::BLACK),
+                (hairline, gdk::RGBA::WHITE),
+            ] {
+                snapshot.append_stroke(&path, &gtk::gsk::Stroke::new(width), &color);
+            }
+        }
+        for (kind, point) in handles(&selection.annotation) {
+            let point = map(point);
+            let outer = gtk::graphene::Rect::new(point.x() - 4.0, point.y() - 4.0, 8.0, 8.0);
+            let outer_color = if selection.hot == Some(kind) {
+                gdk::RGBA::new(1.0, 0.5, 0.0, 1.0)
+            } else {
+                gdk::RGBA::BLACK
+            };
+            snapshot.append_color(&outer_color, &outer);
+            snapshot.append_color(
+                &gdk::RGBA::WHITE,
+                &gtk::graphene::Rect::new(point.x() - 2.5, point.y() - 2.5, 5.0, 5.0),
+            );
+        }
+    }
+
     fn draw_pencil_dot(
         snapshot: &gtk::Snapshot,
         image_bounds: gtk::graphene::Rect,
@@ -473,6 +774,8 @@ mod imp {
         bounds: gtk::graphene::Rect,
         lens: &Lens,
         pencil_overlay: Option<&PencilOverlay>,
+        background: Background,
+        auto_background_luminance: f32,
     ) {
         let center_x = lens.normalized_x.clamp(0.0, 1.0) * bounds.width();
         let center_y = lens.normalized_y.clamp(0.0, 1.0) * bounds.height();
@@ -485,6 +788,7 @@ mod imp {
         );
         let rounded = gtk::gsk::RoundedRect::from_rect(clip, diameter / 2.0);
         snapshot.push_rounded_clip(&rounded);
+        draw_background(snapshot, bounds, background, auto_background_luminance);
         let magnification = lens.magnification.max(1.0);
         let source_bounds = contain_bounds(bounds, &lens.texture);
         let source_x =
@@ -556,211 +860,136 @@ mod imp {
         snapshot.append_border(&rounded, &[1.5; 4], &[color; 4]);
     }
 
-    fn draw_crop_overlay(
+    pub(super) fn draw_crop_overlay(
         snapshot: &gtk::Snapshot,
         image_bounds: gtk::graphene::Rect,
         overlay: &CropOverlay,
+        render_scale: f64,
+        dash_phase: f32,
     ) {
-        draw_dashed_crop_border(snapshot, overlay_rect(image_bounds, overlay));
+        let rect = overlay_rect(image_bounds, overlay);
+        draw_dashed_crop_border(snapshot, rect, render_scale, dash_phase);
+        draw_crop_handles(snapshot, rect);
     }
 
-    fn draw_mask_flash(
+    fn draw_measurement_cursor(
         snapshot: &gtk::Snapshot,
         image_bounds: gtk::graphene::Rect,
-        flash: &MaskFlash,
-    ) {
-        let bounds = overlay_rect(image_bounds, &flash.bounds);
-        snapshot.append_scaled_texture(&flash.texture, gtk::gsk::ScalingFilter::Nearest, &bounds);
-        let blue = gdk::RGBA::new(0.21, 0.52, 0.89, 0.95);
-        let rounded = gtk::gsk::RoundedRect::from_rect(bounds, 0.0);
-        snapshot.append_border(&rounded, &[2.0; 4], &[blue; 4]);
-    }
-
-    fn draw_measurement_layer(
-        snapshot: &gtk::Snapshot,
-        canvas: &super::ImageCanvas,
-        image_bounds: gtk::graphene::Rect,
-        measurement: Option<CropOverlay>,
         cursor: Option<(f32, f32)>,
+        render_scale: f64,
     ) {
         let white = gdk::RGBA::WHITE;
         if let Some((normalized_x, normalized_y)) = cursor {
-            let x = image_bounds.x() + normalized_x.clamp(0.0, 1.0) * image_bounds.width();
-            let y = image_bounds.y() + normalized_y.clamp(0.0, 1.0) * image_bounds.height();
-            snapshot.append_color(
-                &white,
-                &gtk::graphene::Rect::new(x - 0.5, image_bounds.y(), 1.0, image_bounds.height()),
+            let thickness = 1.0 / sanitized_render_scale(render_scale) as f32;
+            let x = snap_to_device(
+                image_bounds.x() + normalized_x.clamp(0.0, 1.0) * image_bounds.width(),
+                render_scale,
+            );
+            let y = snap_to_device(
+                image_bounds.y() + normalized_y.clamp(0.0, 1.0) * image_bounds.height(),
+                render_scale,
             );
             snapshot.append_color(
                 &white,
-                &gtk::graphene::Rect::new(image_bounds.x(), y - 0.5, image_bounds.width(), 1.0),
+                &gtk::graphene::Rect::new(
+                    x - thickness / 2.0,
+                    image_bounds.y(),
+                    thickness,
+                    image_bounds.height(),
+                ),
+            );
+            snapshot.append_color(
+                &white,
+                &gtk::graphene::Rect::new(
+                    image_bounds.x(),
+                    y - thickness / 2.0,
+                    image_bounds.width(),
+                    thickness,
+                ),
             );
         }
-        let Some(measurement) = measurement else {
-            return;
-        };
-        let rect = overlay_rect(image_bounds, &measurement);
-        let rounded = gtk::gsk::RoundedRect::from_rect(rect, 0.0);
-        snapshot.append_border(&rounded, &[1.0; 4], &[white; 4]);
-        let (origin_label, width_label, height_label) = measurement_labels(measurement);
-        let [origin_anchor, width_anchor, height_anchor] = measurement_label_anchors(rect);
-        append_measurement_label(
-            snapshot,
-            canvas,
-            &origin_label,
-            origin_anchor.0,
-            origin_anchor.1,
-            MeasurementLabelPlacement::InsideTopLeft,
-            image_bounds,
-        );
-        append_measurement_label(
-            snapshot,
-            canvas,
-            &width_label,
-            width_anchor.0,
-            width_anchor.1,
-            MeasurementLabelPlacement::AboveCenter,
-            image_bounds,
-        );
-        append_measurement_label(
-            snapshot,
-            canvas,
-            &height_label,
-            height_anchor.0,
-            height_anchor.1,
-            MeasurementLabelPlacement::RightCenter,
-            image_bounds,
-        );
     }
 
-    pub(super) fn measurement_label_anchors(rect: gtk::graphene::Rect) -> [(f32, f32); 3] {
-        [
-            (rect.x(), rect.y()),
-            (rect.x() + rect.width() / 2.0, rect.y() - 3.0),
-            (
-                rect.x() + rect.width() + 4.0,
-                rect.y() + rect.height() / 2.0,
-            ),
-        ]
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum MeasurementLabelPlacement {
-        InsideTopLeft,
-        AboveCenter,
-        RightCenter,
-    }
-
-    fn append_measurement_label(
+    pub(super) fn draw_dashed_crop_border(
         snapshot: &gtk::Snapshot,
-        canvas: &super::ImageCanvas,
-        text: &str,
-        anchor_x: f32,
-        anchor_y: f32,
-        placement: MeasurementLabelPlacement,
-        image_bounds: gtk::graphene::Rect,
+        rect: gtk::graphene::Rect,
+        render_scale: f64,
+        phase: f32,
     ) {
-        let layout = canvas.create_pango_layout(Some(text));
-        layout.set_font_description(Some(&gtk::pango::FontDescription::from_string("Sans 9")));
-        let (width, height) = layout.pixel_size();
-        let width = width as f32;
-        let height = height as f32;
-        let (x, y) = measurement_label_position(
-            (anchor_x, anchor_y),
-            (width, height),
-            placement,
-            image_bounds,
-        );
-        snapshot.save();
-        snapshot.translate(&gtk::graphene::Point::new(x, y));
-        snapshot.append_layout(&layout, &gdk::RGBA::WHITE);
-        snapshot.restore();
-    }
-
-    fn measurement_label_position(
-        anchor: (f32, f32),
-        label_size: (f32, f32),
-        placement: MeasurementLabelPlacement,
-        image_bounds: gtk::graphene::Rect,
-    ) -> (f32, f32) {
-        let (width, height) = label_size;
-        let (x, y) = match placement {
-            MeasurementLabelPlacement::InsideTopLeft => (anchor.0 + 4.0, anchor.1 + 4.0),
-            MeasurementLabelPlacement::AboveCenter => (
-                anchor.0 - width / 2.0,
-                if anchor.1 - height >= image_bounds.y() {
-                    anchor.1 - height
-                } else {
-                    anchor.1 + 6.0
-                },
-            ),
-            MeasurementLabelPlacement::RightCenter => {
-                let x = if anchor.0 + width <= image_bounds.x() + image_bounds.width() {
-                    anchor.0
-                } else {
-                    anchor.0 - width - 8.0
-                };
-                (x, anchor.1 - height / 2.0)
-            }
-        };
-        (
-            x.clamp(
-                image_bounds.x(),
-                (image_bounds.x() + image_bounds.width() - width).max(image_bounds.x()),
-            ),
-            y.clamp(
-                image_bounds.y(),
-                (image_bounds.y() + image_bounds.height() - height).max(image_bounds.y()),
-            ),
-        )
-    }
-
-    pub(super) fn measurement_labels(measurement: CropOverlay) -> (String, String, String) {
-        (
-            gettext("X {x} · Y {y}")
-                .replace("{x}", &measurement.x.to_string())
-                .replace("{y}", &measurement.y.to_string()),
-            gettext("W {width} px").replace("{width}", &measurement.width.to_string()),
-            gettext("H {height} px").replace("{height}", &measurement.height.to_string()),
-        )
-    }
-
-    pub(super) fn draw_dashed_crop_border(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
         let black = gdk::RGBA::BLACK;
         let white = gdk::RGBA::WHITE;
-        const DASH: f32 = 8.0;
-        const GAP: f32 = 4.0;
-        const THICKNESS: f32 = 1.0;
+        const DASH: f32 = 4.0;
+        const CYCLE: f32 = DASH * 2.0;
+        let thickness = 1.0 / sanitized_render_scale(render_scale) as f32;
+        let rect = gtk::graphene::Rect::new(
+            snap_to_device(rect.x(), render_scale),
+            snap_to_device(rect.y(), render_scale),
+            snap_to_device(rect.width(), render_scale),
+            snap_to_device(rect.height(), render_scale),
+        );
 
         for (horizontal, x, y, length) in [
             (true, rect.x(), rect.y(), rect.width()),
             (
                 true,
                 rect.x(),
-                rect.y() + rect.height() - THICKNESS,
+                rect.y() + rect.height() - thickness,
                 rect.width(),
             ),
             (false, rect.x(), rect.y(), rect.height()),
             (
                 false,
-                rect.x() + rect.width() - THICKNESS,
+                rect.x() + rect.width() - thickness,
                 rect.y(),
                 rect.height(),
             ),
         ] {
-            let mut offset = 0.0;
-            let mut is_black = true;
+            let phase = phase.rem_euclid(CYCLE);
+            let mut segment_index = (phase / DASH).floor() as i32;
+            let mut offset = segment_index as f32 * DASH - phase;
             while offset < length {
-                let dash = (length - offset).min(DASH);
-                let color = if is_black { &black } else { &white };
-                let segment = if horizontal {
-                    gtk::graphene::Rect::new(x + offset, y, dash, THICKNESS)
-                } else {
-                    gtk::graphene::Rect::new(x, y + offset, THICKNESS, dash)
-                };
-                snapshot.append_color(color, &segment);
-                offset += DASH + GAP;
-                is_black = !is_black;
+                let start = offset.max(0.0);
+                let end = (offset + DASH).min(length);
+                if end > start {
+                    let color = if segment_index.rem_euclid(2) == 0 {
+                        &black
+                    } else {
+                        &white
+                    };
+                    let segment = if horizontal {
+                        gtk::graphene::Rect::new(x + start, y, end - start, thickness)
+                    } else {
+                        gtk::graphene::Rect::new(x, y + start, thickness, end - start)
+                    };
+                    snapshot.append_color(color, &segment);
+                }
+                offset += DASH;
+                segment_index += 1;
+            }
+        }
+    }
+
+    fn draw_crop_handles(snapshot: &gtk::Snapshot, rect: gtk::graphene::Rect) {
+        let left = rect.x();
+        let center_x = rect.x() + rect.width() / 2.0;
+        let right = rect.x() + rect.width();
+        let top = rect.y();
+        let center_y = rect.y() + rect.height() / 2.0;
+        let bottom = rect.y() + rect.height();
+        for point in [
+            (left, top),
+            (center_x, top),
+            (right, top),
+            (right, center_y),
+            (right, bottom),
+            (center_x, bottom),
+            (left, bottom),
+            (left, center_y),
+        ] {
+            for (diameter, color) in [(9.0, gdk::RGBA::BLACK), (5.0, gdk::RGBA::WHITE)] {
+                let builder = gtk::gsk::PathBuilder::new();
+                builder.add_circle(&gtk::graphene::Point::new(point.0, point.1), diameter / 2.0);
+                snapshot.append_fill(&builder.to_path(), gtk::gsk::FillRule::Winding, &color);
             }
         }
     }
@@ -870,7 +1099,7 @@ impl ImageCanvas {
     }
 
     fn image_bounds_for_texture(&self, texture: &gdk::Texture) -> gtk::graphene::Rect {
-        canvas_image_bounds(
+        canvas_layout(
             gtk::graphene::Rect::new(
                 0.0,
                 0.0,
@@ -882,6 +1111,26 @@ impl ImageCanvas {
             self.imp().filter.get(),
             self.imp().render_scale.get(),
             self.imp().preview_scale.get(),
+            self.surface_origin_device(),
+        )
+        .logical_bounds
+    }
+
+    fn surface_origin_device(&self) -> (f64, f64) {
+        let render_scale = sanitized_render_scale(self.imp().render_scale.get());
+        let Some(native) = self.native() else {
+            return (0.0, 0.0);
+        };
+        let Some(native_widget) = self.root().and_downcast::<gtk::Window>() else {
+            return (0.0, 0.0);
+        };
+        let point = self
+            .compute_point(&native_widget, &gtk::graphene::Point::new(0.0, 0.0))
+            .unwrap_or_else(|| gtk::graphene::Point::new(0.0, 0.0));
+        let (surface_x, surface_y) = native.surface_transform();
+        (
+            (f64::from(point.x()) + surface_x) * render_scale,
+            (f64::from(point.y()) + surface_y) * render_scale,
         )
     }
 
@@ -906,15 +1155,27 @@ impl ImageCanvas {
     }
 
     pub fn set_fit_zoom(&self, zoom: f64) {
-        self.imp().zoom.set(zoom.clamp(0.01, MAX_FIT_ZOOM));
+        self.imp().zoom.set(bounded_fit_zoom(zoom));
         self.queue_resize();
         self.queue_draw();
     }
 
     pub fn set_render_scale(&self, scale: f64) {
-        self.imp().render_scale.set(normalized_render_scale(scale));
+        self.imp().render_scale.set(sanitized_render_scale(scale));
         self.queue_resize();
         self.queue_draw();
+    }
+
+    pub fn queue_draw_if_device_phase_changed(&self) {
+        let render_scale = sanitized_render_scale(self.imp().render_scale.get());
+        if render_scale.fract().abs() <= f64::EPSILON {
+            return;
+        }
+        let (x, y) = self.surface_origin_device();
+        let phase = (x.rem_euclid(1.0).to_bits(), y.rem_euclid(1.0).to_bits());
+        if self.imp().device_origin_phase.replace(phase) != phase {
+            self.queue_draw();
+        }
     }
 
     pub fn filter(&self) -> ZoomFilter {
@@ -983,18 +1244,40 @@ impl ImageCanvas {
     }
 
     pub fn set_crop_overlay(&self, overlay: Option<CropOverlay>) {
-        self.imp().crop_overlay.replace(overlay);
-        self.queue_draw();
-    }
-
-    pub fn set_measurement_overlay(&self, overlay: Option<CropOverlay>) {
-        self.imp().measurement_overlay.set(overlay);
+        if self.imp().crop_overlay.replace(overlay) == overlay {
+            return;
+        }
+        if overlay.is_some() && !self.imp().crop_animation_running.replace(true) {
+            let canvas = self.downgrade();
+            self.add_tick_callback(move |_, frame_clock| {
+                let Some(canvas) = canvas.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if canvas.imp().crop_overlay.borrow().is_none() {
+                    canvas.imp().crop_dash_phase.set(0.0);
+                    canvas.imp().crop_animation_running.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                if canvas.settings().is_gtk_enable_animations() {
+                    let seconds = frame_clock.frame_time() as f64 / 1_000_000.0;
+                    canvas
+                        .imp()
+                        .crop_dash_phase
+                        .set((seconds * 16.0).rem_euclid(8.0) as f32);
+                    canvas.queue_draw();
+                } else if canvas.imp().crop_dash_phase.replace(0.0) != 0.0 {
+                    canvas.queue_draw();
+                }
+                glib::ControlFlow::Continue
+            });
+        }
         self.queue_draw();
     }
 
     pub fn set_measurement_cursor(&self, cursor: Option<(f32, f32)>) {
-        self.imp().measurement_cursor.set(cursor);
-        self.queue_draw();
+        if self.imp().measurement_cursor.replace(cursor) != cursor {
+            self.queue_draw();
+        }
     }
 
     pub fn set_pencil_overlay(
@@ -1019,19 +1302,76 @@ impl ImageCanvas {
         }
     }
 
-    pub fn set_mask_flash(&self, texture: Option<&gdk::Texture>, bounds: CropOverlay) {
+    pub fn set_annotation_preview(&self, overlay: Option<AnnotationOverlay>) {
         self.imp()
-            .mask_flash
-            .replace(texture.map(|texture| MaskFlash {
-                texture: texture.clone(),
-                bounds,
-            }));
+            .annotation_previews
+            .borrow_mut()
+            .set_active(overlay);
         self.queue_draw();
     }
 
-    pub fn clear_mask_flash(&self) {
-        self.imp().mask_flash.replace(None);
+    pub fn commit_annotation_preview(&self) {
+        self.imp().annotation_previews.borrow_mut().commit_active();
+    }
+
+    pub fn finish_annotation_render(&self) {
+        if self
+            .imp()
+            .annotation_previews
+            .borrow_mut()
+            .finish_document_render()
+        {
+            self.queue_draw();
+        }
+    }
+
+    pub fn clear_annotation_previews(&self) {
+        if self.imp().annotation_previews.borrow_mut().clear() {
+            self.queue_draw();
+        }
+    }
+
+    pub fn set_annotation_selection(&self, selection: Option<SelectionHandles>) {
+        if self.imp().selection.borrow().as_ref() == selection.as_ref() {
+            return;
+        }
+        self.imp().selection.replace(selection);
         self.queue_draw();
+    }
+
+    pub fn image_point_at(&self, x: f64, y: f64) -> Option<Point> {
+        let texture = self.imp().texture.borrow();
+        let texture = texture.as_ref()?;
+        let bounds = self.image_bounds_for_texture(texture);
+        if x < f64::from(bounds.x())
+            || y < f64::from(bounds.y())
+            || x > f64::from(bounds.x() + bounds.width())
+            || y > f64::from(bounds.y() + bounds.height())
+        {
+            return None;
+        }
+        Some(Point {
+            x: ((x as f32 - bounds.x()) / bounds.width() * texture.width() as f32)
+                .clamp(0.0, texture.width() as f32),
+            y: ((y as f32 - bounds.y()) / bounds.height() * texture.height() as f32)
+                .clamp(0.0, texture.height() as f32),
+        })
+    }
+
+    pub fn widget_point_for_image(&self, point: Point) -> Option<gtk::graphene::Point> {
+        let texture = self.texture()?;
+        let bounds = self.image_bounds_for_texture(&texture);
+        Some(gtk::graphene::Point::new(
+            bounds.x() + point.x * bounds.width() / texture.width().max(1) as f32,
+            bounds.y() + point.y * bounds.height() / texture.height().max(1) as f32,
+        ))
+    }
+
+    pub fn image_scale(&self) -> f32 {
+        let texture = self.imp().texture.borrow();
+        texture.as_ref().map_or(1.0, |texture| {
+            self.image_bounds_for_texture(texture).width() / texture.width().max(1) as f32
+        })
     }
 
     pub fn set_preview_scale(&self, scale: f32) {
@@ -1249,11 +1589,89 @@ impl MiniMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{BrushPoint, StrokePath};
+    use crate::document::{
+        AnnotationId, BrushPoint, PencilGeometry, Rect, Shape, StrokePath, StrokeStyle,
+    };
+
+    #[test]
+    fn committed_annotation_preview_stays_visible_until_document_render_finishes() {
+        let mut previews = PreviewLayers::default();
+        previews.set_active(Some("last drag frame"));
+
+        previews.commit_active();
+
+        assert_eq!(
+            previews.visible().copied().collect::<Vec<_>>(),
+            ["last drag frame"]
+        );
+        previews.finish_document_render();
+        assert!(previews.visible().next().is_none());
+    }
+
+    #[test]
+    fn finishing_an_older_document_render_does_not_clear_the_active_preview() {
+        let mut previews = PreviewLayers::default();
+        previews.set_active(Some("committed"));
+        previews.commit_active();
+        previews.set_active(Some("new drag"));
+
+        previews.finish_document_render();
+
+        assert_eq!(
+            previews.visible().copied().collect::<Vec<_>>(),
+            ["new drag"]
+        );
+    }
 
     #[test]
     fn hard_zoom_is_the_default_filter() {
         assert_eq!(ZoomFilter::default(), ZoomFilter::Hard);
+    }
+
+    #[test]
+    fn measurement_crosshair_uses_difference_blending() {
+        assert_eq!(
+            MEASUREMENT_CURSOR_BLEND_MODE,
+            gtk::gsk::BlendMode::Difference
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn measurement_crosshair_is_the_top_child_of_a_difference_blend() {
+        gtk::init().expect("GTK display initialization");
+        let pixels = glib::Bytes::from_owned(vec![0_u8; 4 * 4 * 4]);
+        let texture: gdk::Texture =
+            gdk::MemoryTexture::new(4, 4, gdk::MemoryFormat::R8g8b8a8, &pixels, 4 * 4).upcast();
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 4.0, 4.0);
+        let snapshot = gtk::Snapshot::new();
+
+        imp::append_measurement_cursor_xor(
+            &snapshot,
+            &texture,
+            gtk::gsk::ScalingFilter::Nearest,
+            CanvasLayout {
+                logical_bounds: bounds,
+                device_bounds: None,
+            },
+            bounds,
+            Some((0.5, 0.5)),
+            1.0,
+        );
+
+        let blend = snapshot
+            .to_node()
+            .expect("measurement render node")
+            .downcast::<gtk::gsk::BlendNode>()
+            .expect("measurement cursor must wrap the image in a blend node");
+        assert_eq!(blend.blend_mode(), gtk::gsk::BlendMode::Difference);
+        assert!(
+            blend
+                .top_child()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .is_ok(),
+            "the two crosshair lines must occupy the blend's top child"
+        );
     }
 
     #[test]
@@ -1362,6 +1780,8 @@ mod tests {
             gtk::graphene::Rect::new(0.0, 0.0, 100.0, 100.0),
             &lens,
             Some(&overlay),
+            Background::Checkerboard,
+            0.5,
         );
 
         let node = snapshot.to_node().expect("lens render node");
@@ -1371,10 +1791,67 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn lens_draws_the_configured_transparency_background() {
+        fn contains_color(node: &gtk::gsk::RenderNode, expected: &gdk::RGBA) -> bool {
+            if let Ok(color) = node.clone().downcast::<gtk::gsk::ColorNode>() {
+                return color.color() == *expected;
+            }
+            if let Ok(container) = node.clone().downcast::<gtk::gsk::ContainerNode>() {
+                return (0..container.n_children())
+                    .map(|index| container.child(index))
+                    .any(|child| contains_color(&child, expected));
+            }
+            if let Ok(clip) = node.clone().downcast::<gtk::gsk::RoundedClipNode>() {
+                return contains_color(&clip.child(), expected);
+            }
+            if let Ok(blend) = node.clone().downcast::<gtk::gsk::BlendNode>() {
+                return contains_color(&blend.bottom_child(), expected)
+                    || contains_color(&blend.top_child(), expected);
+            }
+            false
+        }
+
+        gtk::init().expect("GTK display initialization");
+        let pixels = glib::Bytes::from_owned(vec![0_u8; 4]);
+        let texture: gdk::Texture =
+            gdk::MemoryTexture::new(1, 1, gdk::MemoryFormat::R8g8b8a8, &pixels, 4).upcast();
+        let lens = Lens {
+            texture,
+            normalized_x: 0.5,
+            normalized_y: 0.5,
+            diameter: 80.0,
+            magnification: 4.0,
+            show_cross: false,
+        };
+        let snapshot = gtk::Snapshot::new();
+
+        imp::draw_lens(
+            &snapshot,
+            gtk::graphene::Rect::new(0.0, 0.0, 100.0, 100.0),
+            &lens,
+            None,
+            Background::Gray,
+            0.5,
+        );
+
+        let node = snapshot.to_node().expect("lens render node");
+        assert!(contains_color(
+            &node,
+            &gdk::RGBA::new(0.32, 0.32, 0.32, 1.0)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn drag_rectangle_border_is_one_pixel_black_and_white() {
         gtk::init().expect("GTK display initialization");
         let snapshot = gtk::Snapshot::new();
-        imp::draw_dashed_crop_border(&snapshot, gtk::graphene::Rect::new(2.0, 3.0, 32.0, 24.0));
+        imp::draw_dashed_crop_border(
+            &snapshot,
+            gtk::graphene::Rect::new(2.0, 3.0, 32.0, 24.0),
+            1.0,
+            0.0,
+        );
         let border = snapshot
             .to_node()
             .expect("border render node")
@@ -1393,6 +1870,15 @@ mod tests {
                 bounds.width() == 1.0 || bounds.height() == 1.0,
                 "each border segment must be exactly one pixel thick: {bounds:?}"
             );
+            let dash_length = if bounds.width() == 1.0 {
+                bounds.height()
+            } else {
+                bounds.width()
+            };
+            assert!(
+                dash_length <= 4.0,
+                "selection dashes must be at most four pixels long: {bounds:?}"
+            );
             match segment.color() {
                 color if color == gdk::RGBA::BLACK => black_segments += 1,
                 color if color == gdk::RGBA::WHITE => white_segments += 1,
@@ -1402,6 +1888,115 @@ mod tests {
 
         assert!(black_segments > 0);
         assert!(white_segments > 0);
+
+        let shifted = gtk::Snapshot::new();
+        imp::draw_dashed_crop_border(
+            &shifted,
+            gtk::graphene::Rect::new(2.0, 3.0, 32.0, 24.0),
+            1.0,
+            2.0,
+        );
+        let shifted = shifted
+            .to_node()
+            .expect("shifted border render node")
+            .downcast::<gtk::gsk::ContainerNode>()
+            .expect("shifted border segment container");
+        let first = shifted
+            .child(0)
+            .downcast::<gtk::gsk::ColorNode>()
+            .expect("first shifted segment");
+        assert_eq!(first.bounds().width(), 2.0);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn region_selection_draws_eight_resize_handles() {
+        fn count_fills(node: &gtk::gsk::RenderNode) -> u32 {
+            if node.clone().downcast::<gtk::gsk::FillNode>().is_ok() {
+                return 1;
+            }
+            node.clone()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .map_or(0, |container| {
+                    (0..container.n_children())
+                        .map(|index| count_fills(&container.child(index)))
+                        .sum()
+                })
+        }
+
+        gtk::init().expect("GTK display initialization");
+        let snapshot = gtk::Snapshot::new();
+        imp::draw_crop_overlay(
+            &snapshot,
+            gtk::graphene::Rect::new(0.0, 0.0, 100.0, 80.0),
+            &CropOverlay {
+                x: 10,
+                y: 10,
+                width: 50,
+                height: 40,
+                image_width: 100,
+                image_height: 80,
+            },
+            1.0,
+            0.0,
+        );
+
+        assert_eq!(
+            count_fills(&snapshot.to_node().expect("selection render node")),
+            16,
+            "eight handles must each have an outer and inner dot"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn selected_pencil_rectangle_draws_eight_resize_handles() {
+        fn count_colors(node: &gtk::gsk::RenderNode) -> u32 {
+            if node.clone().downcast::<gtk::gsk::ColorNode>().is_ok() {
+                return 1;
+            }
+            node.clone()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .map_or(0, |container| {
+                    (0..container.n_children())
+                        .map(|index| count_colors(&container.child(index)))
+                        .sum()
+                })
+        }
+
+        gtk::init().expect("GTK display initialization");
+        let snapshot = gtk::Snapshot::new();
+        imp::draw_annotation_selection(
+            &snapshot,
+            gtk::graphene::Rect::new(0.0, 0.0, 100.0, 80.0),
+            (100, 80),
+            &SelectionHandles {
+                annotation: Annotation {
+                    id: AnnotationId(1),
+                    shape: Shape::Pencil {
+                        geometry: PencilGeometry::Rectangle(Rect {
+                            x: 10.0,
+                            y: 10.0,
+                            width: 50.0,
+                            height: 40.0,
+                        }),
+                        style: StrokeStyle {
+                            color: [255, 0, 0, 255],
+                            width: 3.0,
+                        },
+                        anti_aliasing: true,
+                    },
+                },
+                hot: None,
+            },
+            1.0,
+        );
+
+        assert_eq!(
+            count_colors(&snapshot.to_node().expect("pencil selection render node")),
+            16,
+            "eight handles must each have an outer and inner node"
+        );
     }
 
     #[test]
@@ -1437,9 +2032,11 @@ mod tests {
         assert_eq!(aligned_render_pixel_scale(1.25, 1.0), None);
         assert_eq!(aligned_render_pixel_scale(1.0, 2.0), Some(2.0));
         assert_eq!(aligned_render_pixel_scale(0.8, 2.0), None);
-        assert_eq!(normalized_render_scale(1.666_667), 2.0);
-        assert_eq!(normalized_render_scale(f64::NAN), 1.0);
-        assert_eq!(normalized_render_scale(0.0), 1.0);
+        assert_eq!(aligned_render_pixel_scale(0.8, 1.25), Some(1.0));
+        assert_eq!(aligned_render_pixel_scale(1.5, 2.0), Some(3.0));
+        assert_eq!(sanitized_render_scale(1.666_667), 1.666_667);
+        assert_eq!(sanitized_render_scale(f64::NAN), 1.0);
+        assert_eq!(sanitized_render_scale(0.0), 1.0);
 
         let bounds = gtk::graphene::Rect::new(0.0, 0.0, 4.0, 4.0);
         let soft = canvas_image_bounds(bounds, (4, 2), 1.0, ZoomFilter::Soft, 2.0, 1.0);
@@ -1447,6 +2044,36 @@ mod tests {
             (soft.x(), soft.y(), soft.width(), soft.height()),
             (0.0, 1.0, 4.0, 2.0)
         );
+    }
+
+    #[test]
+    fn fit_zoom_can_go_below_the_manual_one_percent_floor() {
+        assert_eq!(bounded_fit_zoom(0.005), 0.005);
+    }
+
+    #[test]
+    fn device_rect_origin_is_integral_in_surface_space() {
+        let bounds = gtk::graphene::Rect::new(0.0, 0.0, 101.0, 79.0);
+        for render_scale in [1.0, 1.25, 1.5, 2.0] {
+            for origin in [(0.0, 0.0), (0.2, 0.7), (12.375, 5.125)] {
+                for pixel_scale in [1.0, 2.0, 3.0, 8.0] {
+                    let layout = canvas_layout(
+                        bounds,
+                        (17, 11),
+                        pixel_scale / render_scale,
+                        ZoomFilter::Hard,
+                        render_scale,
+                        1.0,
+                        origin,
+                    );
+                    let logical = layout.logical_bounds;
+                    let x = origin.0 + f64::from(logical.x()) * render_scale;
+                    let y = origin.1 + f64::from(logical.y()) * render_scale;
+                    assert!((x - x.round()).abs() < 1e-4);
+                    assert!((y - y.round()).abs() < 1e-4);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1483,42 +2110,9 @@ mod tests {
     }
 
     #[test]
-    fn measurement_labels_report_source_pixel_position_and_dimensions() {
-        let measurement = CropOverlay {
-            x: 10,
-            y: 20,
-            width: 31,
-            height: 17,
-            image_width: 100,
-            image_height: 80,
-        };
-
-        assert_eq!(
-            imp::measurement_labels(measurement),
-            (
-                "X 10 · Y 20".to_owned(),
-                "W 31 px".to_owned(),
-                "H 17 px".to_owned()
-            )
-        );
-    }
-
-    #[test]
     fn coordinate_tooltip_reports_zero_based_source_pixel_position() {
         assert_eq!(coordinate_tooltip_text((0, 0)), "X 0 · Y 0");
         assert_eq!(coordinate_tooltip_text((123, 45)), "X 123 · Y 45");
-    }
-
-    #[test]
-    fn measurement_origin_label_stays_at_the_rectangle_top_left() {
-        let narrow = gtk::graphene::Rect::new(30.0, 40.0, 50.0, 60.0);
-        let wide = gtk::graphene::Rect::new(30.0, 40.0, 200.0, 60.0);
-        let [narrow_origin, narrow_width, _] = imp::measurement_label_anchors(narrow);
-        let [wide_origin, wide_width, _] = imp::measurement_label_anchors(wide);
-
-        assert_eq!(narrow_origin, (30.0, 40.0));
-        assert_eq!(wide_origin, narrow_origin);
-        assert_ne!(wide_width, narrow_width);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 project(
   'diorama',
   'rust',
-  version: '0.2.8',
+  version: '0.3.0',
   meson_version: '>= 1.3.0',
   default_options: ['warning_level=2'],
 )
@@ -23,7 +23,10 @@ diorama = custom_target(
 subdir('data')
 subdir('po')
 
-gnome.post_install(glib_compile_schemas: true)
+gnome.post_install(
+  glib_compile_schemas: true,
+  gtk_update_icon_cache: true,
+)
 
 test(
   'cargo-tests',

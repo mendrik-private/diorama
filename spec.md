@@ -31,7 +31,7 @@ The interface must follow GNOME conventions rather than resemble a cross-platfor
 The initial product is not intended to provide:
 
 * Multi-layer document editing.
-* Text, vector shape, or typography tools.
+* General-purpose vector illustration and typography beyond the annotation tools defined in `docs/annotations-spec.md`.
 * Cloud storage or account synchronization.
 * Batch photo-library management.
 * RAW development controls comparable to a photography application.
@@ -119,7 +119,7 @@ The main menu contains:
 Selecting Edit changes the window into a temporary editing state:
 
 * The header shows **Cancel** and **Apply**.
-* A bottom tool rail shows Crop, Scale, Transform, Palette, Select Object and Pencil.
+* A bottom tool rail shows Crop, Scale, Transform, Palette, Select & Copy, and the annotation palette (Pencil, Highlight, Arrow, Measure, Text) — see `docs/annotations-spec.md` §2.
 * Only controls relevant to the selected tool are shown.
 * Escape exits the current tool or requests cancellation when edits would be lost.
 
@@ -136,6 +136,7 @@ Example stack:
 5. Palette reduction.
 6. AI mask or cutout.
 7. Pencil strokes.
+8. Annotation layer (vector, composited last).
 
 Operations must remain non-destructive until Save or Save As.
 
@@ -148,6 +149,8 @@ The document model must support:
 * Export from the complete operation stack.
 * Restoration of the original image during the session.
 * Atomic saving through a temporary file followed by replacement.
+
+Annotation edits satisfy “operation removal and replacement” via `Set`/`Delete` entries (`docs/annotations-spec.md` §4).
 
 Saving must never leave a partially written output file.
 
@@ -271,7 +274,7 @@ A single toggle switches the rendering filter:
 
 The selected mode must be saved in GSettings and restored across application launches.
 
-At exactly 100%, pixels should be aligned to physical device pixels when possible.
+In hard zoom, source pixels map to whole device pixels; see `docs/annotations-spec.md` §3 for the invariant.
 
 ### 9.3 Transparency background
 
@@ -320,14 +323,19 @@ Required shortcuts:
 | Rotate counterclockwise | Shift+R            |
 | Horizontal flip         | H                  |
 | Vertical flip           | V                  |
-| Crop                    | C                  |
+| Select region           | C                  |
 | Compare                 | D                  |
 | Pencil                  | P                  |
-| Object selection        | A                  |
+| Highlight               | O                  |
+| Arrow                   | A                  |
+| Measure                 | M                  |
+| Text                    | T                  |
 | Fullscreen              | F11                |
 | Exit active tool        | Escape             |
 
 Standard GNOME shortcuts must take precedence where there is a conflict. GNOME recommends standard shortcuts for Open, Save, Save As, Undo, Redo, Preferences and the shortcuts dialog, and requires keyboard access to primary functionality. ([GNOME Developer][6])
+
+Delete is scoped by the active tool and annotation selection as defined in `docs/annotations-spec.md` §2.7.
 
 ## 11. Save As and Conversion
 
@@ -508,21 +516,17 @@ Resampling modes:
 * Warns when the requested reduction is likely to create severe distortion.
 * May later support user-painted protect and remove masks.
 
-## 15. Crop and Crop to Content
+## 15. Region Selection and Crop to Content
 
-### 15.1 Manual crop
+### 15.1 Region selection
 
-* Draggable corner and edge handles.
-* Movable crop rectangle.
-* Grid overlay.
-* Free aspect ratio.
-* Original aspect ratio.
-* Common presets such as 1:1, 4:3, 3:2 and 16:9.
-* Numeric position and dimensions.
-* Arrow-key movement.
-* Shift+arrow for larger movement increments.
-* Enter applies the crop.
-* Escape cancels it.
+* One pixel-aligned rectangle is shared by zoom, crop, and clipboard copy.
+* The outline uses animated alternating black and white dashes.
+* Eight draggable handles resize the corners and edge midpoints.
+* Contextual icon buttons zoom to, crop to, or copy the selected region.
+* Arrow keys and Shift+arrow position keyboard selection points.
+* Enter zooms to the selected region.
+* Escape clears the selection, then exits the tool.
 
 ### 15.2 Crop to content
 
@@ -578,45 +582,11 @@ When Nautilus metadata is missing or unsupported:
 
 ## 17. AI Object Selection and Cutout
 
-### 17.1 User interaction
-
-Activating Select Object changes the cursor to a selection cursor.
-
-Workflow:
-
-1. The user clicks an object.
-2. Local inference generates a candidate mask.
-3. The mask appears as a translucent overlay.
-4. Additional left clicks or strokes add foreground hints.
-5. Right-clicks or modifier-assisted strokes add background hints.
-6. The user adjusts edge feathering.
-7. Apply converts the mask into a non-destructive selection operation.
-
-Available actions:
-
-* Cut the object, leaving transparency.
-* Copy the object to the clipboard.
-* Delete the selected region.
-* Invert the selection.
-* Save the selected object as PNG.
-* Refine edges.
-* Undo individual refinement prompts.
-
-### 17.2 AI requirements
-
-* Inference must be local.
-* The core viewer must work without the AI model.
-* The model should be distributed as an optional Flatpak extension or separately installable component.
-* Model size, license and storage use must be disclosed before installation.
-* CPU inference is mandatory.
-* Hardware acceleration is optional.
-* No image data may be uploaded without a separately designed and explicit online feature.
-
-The model backend must be replaceable. A promptable segmentation model such as SAM 2 is a possible reference because it supports point- and box-prompted masks for static images, but the shipped model should be selected according to desktop CPU latency and package size rather than benchmark quality alone. ([GitHub][8])
-
-An ONNX-based inference layer may be used to support different hardware execution providers while maintaining a common model interface. ([ONNX Runtime][9])
+Removed in 0.3.0. Rationale and removal inventory: `docs/annotations-spec.md` §2.5.
 
 ## 18. Pencil Tool
+
+Pencil is part of the annotation palette (`docs/annotations-spec.md` §6.5).
 
 When Pencil is active:
 
@@ -664,7 +634,7 @@ Persist through GSettings:
 * JPEG quality and transparency background.
 * Palette dithering preference.
 * Compare lens size and magnification.
-* AI model installation state.
+* Annotation stroke width and text size.
 
 Per-image zoom and pan should not normally persist after closing the file.
 
@@ -674,7 +644,7 @@ Per-image zoom and pan should not normally persist after closing the file.
 * Every action is keyboard accessible.
 * Tool state is announced to assistive technologies.
 * The application supports high-contrast mode.
-* Selection and crop indicators do not rely solely on color.
+* Region-selection indicators do not rely solely on color.
 * Focus order follows the visual control order.
 * Sliders expose numeric values.
 * Compare panels have distinct accessible labels.
@@ -695,8 +665,6 @@ Required error states:
 * File deleted or moved externally.
 * Save permission denied.
 * Export cancelled.
-* AI model unavailable.
-* AI inference failed.
 
 Decoder error details may be shown in an expandable technical-details section but should not replace a plain-language message.
 
@@ -797,10 +765,8 @@ The document and processing layers should not depend directly on GTK widgets. Th
 
 ### Phase 4: Computational features
 
-* AI object selection.
-* Edge refinement.
+* Annotation layer (see `docs/annotations-spec.md`).
 * Seam carving.
-* Optional hardware acceleration.
 * Additional export formats.
 
 ## 25. Release Acceptance Criteria
@@ -819,14 +785,26 @@ The first stable release is acceptable when:
 10. Palette reduction updates interactively and preserves protected colors.
 11. Crop to content previews its result before applying.
 12. Pencil right-click sampling returns the displayed source color.
-13. AI object selection performs no network requests.
-14. Cancelling a long-running scale, palette, AI or seam-carving operation restores the previous document state.
+13. No network access is performed by any editing tool.
+14. Cancelling a long-running scale, palette or seam-carving operation restores the previous document state.
 15. Corrupt and adversarial test images cannot allocate memory beyond configured limits.
 16. The GTK main thread remains responsive during decoding and export.
 17. The application passes keyboard, screen-reader and high-contrast smoke tests.
 18. Unsaved edits cannot be discarded without explicit confirmation.
 
-The next useful artifact would be an implementation backlog with epics, acceptance tests, and a proposed Cargo workspace and dependency layout.
+(a) The annotation palette is never hidden by colour, eyedropper, lens or size changes.
+
+(b) The startup annotation colour is pure red (`#FF0000`).
+
+(c) The hard-zoom checkerboard test passes at render scales 1, 1.25, 1.5 and 2.
+
+(d) Every annotation type is creatable, editable, deletable and undoable with mouse and keyboard.
+
+(e) Exported pixels equal the on-screen annotation composite.
+
+(f) No SAM 2 code, model download or x86_64 restriction remains.
+
+(g) `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test` pass.
 
 [1]: https://gtk-rs.org/?utm_source=chatgpt.com "gtk-rs: Unlocking the GNOME stack for Rust"
 [2]: https://gnome.pages.gitlab.gnome.org/glycin/ "Glycin – Safe image loading and editing"
@@ -835,5 +813,3 @@ The next useful artifact would be an implementation backlog with epics, acceptan
 [5]: https://gtk-rs.org/gtk4-rs/git/book/actions.html "Actions - GUI development with Rust and GTK 4"
 [6]: https://developer.gnome.org/hig/reference/keyboard.html?utm_source=chatgpt.com "Standard Keyboard Shortcuts"
 [7]: https://gitlab.gnome.org/GNOME/nautilus/-/issues/771?utm_source=chatgpt.com "Missing UI for changing and using the default sort order (#771)"
-[8]: https://github.com/facebookresearch/sam2 "GitHub - facebookresearch/sam2: The repository provides code for running inference with the Meta Segment Anything Model 2 (SAM 2), links for downloading the trained model checkpoints, and example notebooks that show how to use the model. · GitHub"
-[9]: https://onnxruntime.ai/docs/execution-providers/ "Execution Providers | onnxruntime"

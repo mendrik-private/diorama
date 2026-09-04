@@ -1,3 +1,4 @@
+pub mod annotation;
 pub mod crop;
 pub mod palette;
 pub mod pencil;

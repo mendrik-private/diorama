@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use gio::prelude::*;
 use gtk::prelude::*;
 use libadwaita as adw;
@@ -47,19 +49,59 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.toggle-filter", &["x"]),
     ("win.previous", &["<Alt>Left", "Page_Up"]),
     ("win.next", &["<Alt>Right", "Page_Down"]),
-    ("win.delete-file", &["Delete"]),
     ("win.rotate-clockwise", &["r"]),
     ("win.rotate-counterclockwise", &["<Shift>r"]),
     ("win.flip-horizontal", &["h"]),
     ("win.flip-vertical", &["v"]),
-    ("win.crop", &["c"]),
+    ("win.select", &["c"]),
+    ("win.highlight", &["o"]),
+    ("win.arrow", &["a"]),
     ("win.measure", &["m"]),
+    ("win.text", &["t"]),
     ("win.scale-preview", &["s"]),
     ("win.compare", &["d"]),
+    ("win.lens", &["l"]),
     ("win.pencil", &["p"]),
     ("win.fullscreen", &["F11"]),
     ("win.cancel-tool", &["Escape"]),
 ];
+
+thread_local! {
+    static ACCELERATOR_SUPPRESSIONS: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(crate) struct AcceleratorSuppression {
+    application: gtk::Application,
+}
+
+impl Drop for AcceleratorSuppression {
+    fn drop(&mut self) {
+        let restore = ACCELERATOR_SUPPRESSIONS.with(|count| {
+            let remaining = count.get().saturating_sub(1);
+            count.set(remaining);
+            remaining == 0
+        });
+        if restore {
+            install_accelerators(&self.application);
+        }
+    }
+}
+
+pub(crate) fn suppress_accelerators(application: &gtk::Application) -> AcceleratorSuppression {
+    let clear = ACCELERATOR_SUPPRESSIONS.with(|count| {
+        let previous = count.get();
+        count.set(previous.saturating_add(1));
+        previous == 0
+    });
+    if clear {
+        for (action, _) in SHORTCUTS {
+            application.set_accels_for_action(action, &[]);
+        }
+    }
+    AcceleratorSuppression {
+        application: application.clone(),
+    }
+}
 
 pub fn build() -> adw::Application {
     let application = adw::Application::builder()
@@ -69,7 +111,7 @@ pub fn build() -> adw::Application {
 
     application.connect_startup(|application| {
         application.set_resource_base_path(Some("/io/github/mendrik/Diorama"));
-        install_accelerators(application);
+        install_accelerators(application.upcast_ref());
     });
     application.connect_activate(|application| {
         if let Some(window) = application.active_window() {
@@ -84,7 +126,7 @@ pub fn build() -> adw::Application {
     application
 }
 
-fn install_accelerators(application: &adw::Application) {
+fn install_accelerators(application: &gtk::Application) {
     for (action, accelerators) in SHORTCUTS {
         application.set_accels_for_action(action, accelerators);
     }
@@ -139,8 +181,19 @@ mod tests {
 
     #[test]
     fn edit_tools_have_single_key_accelerators() {
+        assert!(SHORTCUTS.contains(&("win.highlight", &["o"])));
+        assert!(SHORTCUTS.contains(&("win.arrow", &["a"])));
+        assert!(SHORTCUTS.contains(&("win.select", &["c"])));
         assert!(SHORTCUTS.contains(&("win.measure", &["m"])));
+        assert!(SHORTCUTS.contains(&("win.text", &["t"])));
         assert!(SHORTCUTS.contains(&("win.scale-preview", &["s"])));
+        assert!(SHORTCUTS.contains(&("win.lens", &["l"])));
+        assert!(SHORTCUTS.contains(&("win.pencil", &["p"])));
+        assert!(
+            !SHORTCUTS
+                .iter()
+                .any(|(_, accelerators)| accelerators.contains(&"Delete"))
+        );
     }
 
     #[test]

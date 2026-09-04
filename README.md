@@ -34,8 +34,8 @@ editing and comparison tools.
   deletion, fullscreen viewing, and remembered window, folder, and zoom state.
 - Fit-to-window, fill, 25%–900% presets, smooth zoom, and pixel-perfect hard
   zoom that stays aligned on HiDPI and fractionally scaled displays.
-- Pinch zoom, pointer-anchored Ctrl+scroll zoom, drag-to-zoom rectangles,
-  middle-button panning, scrollbars for enlarged images, and an interactive
+- Pinch zoom, pointer-anchored Ctrl+scroll zoom, middle-button panning,
+  scrollbars for enlarged images, and an interactive
   click-and-drag minimap.
 - Checkerboard, automatic contrast, white, gray, and black transparency
   backgrounds.
@@ -54,19 +54,18 @@ editing and comparison tools.
   other image; Shift+scroll changes its size and Alt+scroll its magnification.
 - Comparison-folder navigation that follows matching filenames and monitors the
   comparison image for external changes or renames.
-- Pixel measurement by click or rectangle, including live coordinates and
-  dimensions copied to the clipboard.
-- A color picker that updates the pencil color and copies Hex, RGB(A), OKLab, or
+- Persistent, pixel-snapped measurements with Excalifont labels and automatic
+  gap markers between neighboring measurements.
+- A color picker that updates the active annotation color and copies Hex, RGB(A), OKLab, or
   HSL values.
-- Rectangular Select and Copy, plus click-to-select SAM 2 segmentation with a
-  locally cached 156 MB Apache-2.0 model downloaded on first use.
+- A persistent region selector with animated high-contrast dashes, eight
+  resize handles, and contextual zoom, crop, and copy actions.
 
 ### Non-destructive editing
 
 - An operation-based document model: edits leave the source pixels untouched
   until export and support multi-step undo and redo.
-- Crop by first marking a rectangle and then dragging any edge or corner, with
-  precise pixel-aligned bounds.
+- Crop through the shared region selector, with precise pixel-aligned bounds.
 - Clockwise and counterclockwise rotation plus horizontal and vertical
   flipping.
 - Live image scaling with exact width and height fields, aspect-ratio locking,
@@ -87,6 +86,17 @@ editing and comparison tools.
   rectangles, and Alt for circles.
 - Right-click color sampling directly from the image and drawing on either
   comparison panel.
+
+### Vector annotations
+
+- Highlight, curved-arrow, measurement, and curved-text tools share a compact
+  annotation palette with a red default swatch.
+- Annotations remain editable: select, move, resize, bend, rotate, recolor,
+  delete, and nudge them with the keyboard.
+- Annotation creation and edits participate in the document's undo/redo
+  history and are composited into PNG and JPEG exports.
+- The bundled Excalifont keeps text and measurement labels consistent without
+  relying on fonts installed on the system.
 
 ### Saving and GNOME integration
 
