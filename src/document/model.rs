@@ -17,7 +17,6 @@ pub struct Metadata {
     pub exif: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
     pub icc: Option<Vec<u8>>,
-    pub key_values: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,10 +46,6 @@ impl CancellationToken {
         } else {
             Ok(())
         }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -94,10 +89,6 @@ impl Document {
         &self.source
     }
 
-    pub fn set_metadata(&mut self, metadata: Metadata) {
-        self.source.metadata = metadata;
-    }
-
     pub(crate) fn set_path(&mut self, path: Option<PathBuf>) {
         self.source.path = path;
     }
@@ -109,22 +100,6 @@ impl Document {
     pub fn apply(&mut self, operation: Operation) {
         self.history.push(operation);
         self.truncate_cache(self.operations().len().saturating_sub(1));
-    }
-
-    pub fn replace_operation(&mut self, index: usize, operation: Operation) -> bool {
-        let replaced = self.history.replace_active(index, operation);
-        if replaced {
-            self.truncate_cache(index);
-        }
-        replaced
-    }
-
-    pub fn remove_operation(&mut self, index: usize) -> bool {
-        let removed = self.history.remove_active(index);
-        if removed {
-            self.truncate_cache(index);
-        }
-        removed
     }
 
     pub fn undo(&mut self) -> bool {
@@ -150,10 +125,6 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.operations() != self.saved_operations.as_ref()
-    }
-
-    pub fn mark_saved(&mut self) {
-        self.saved_operations = self.operations().into();
     }
 
     pub(crate) fn mark_saved_at(&mut self, operations: Arc<[Operation]>) {
@@ -233,7 +204,6 @@ fn apply_operation(
         Operation::Rotate(rotation) => match rotation {
             super::Rotation::Clockwise90 => dynamic.rotate90(),
             super::Rotation::CounterClockwise90 => dynamic.rotate270(),
-            super::Rotation::HalfTurn => dynamic.rotate180(),
         },
         Operation::FlipHorizontal => dynamic.fliph(),
         Operation::FlipVertical => dynamic.flipv(),
@@ -267,28 +237,6 @@ fn apply_operation(
         }
         Operation::Pencil(stroke) => {
             return tools::pencil::paint_stroke(&dynamic.into_rgba8(), stroke, cancellation);
-        }
-        Operation::SelectionCutout {
-            width,
-            height,
-            alpha_mask,
-            inverted,
-        } => {
-            let mut rgba = dynamic.into_rgba8();
-            if rgba.dimensions() != (*width, *height)
-                || u64::from(*width) * u64::from(*height)
-                    != u64::try_from(alpha_mask.len()).unwrap_or(u64::MAX)
-            {
-                return Err(AppError::InvalidDimensions);
-            }
-            for (index, (pixel, mask)) in rgba.pixels_mut().zip(alpha_mask).enumerate() {
-                if index % 4096 == 0 {
-                    cancellation.check()?;
-                }
-                let mask = if *inverted { 255 - mask } else { *mask };
-                pixel.0[3] = ((u16::from(pixel.0[3]) * u16::from(mask)) / 255) as u8;
-            }
-            return Ok(rgba);
         }
     };
 
@@ -342,7 +290,7 @@ mod tests {
     fn dirty_state_compares_history_content_instead_of_length() {
         let mut document = document();
         document.apply(Operation::Rotate(Rotation::Clockwise90));
-        document.mark_saved();
+        document.mark_saved_at(document.operations().into());
         assert!(!document.is_dirty());
 
         assert!(document.undo());
@@ -356,7 +304,7 @@ mod tests {
     fn returning_to_the_saved_history_clears_dirty_state() {
         let mut document = document();
         document.apply(Operation::Rotate(Rotation::Clockwise90));
-        document.mark_saved();
+        document.mark_saved_at(document.operations().into());
 
         assert!(document.undo());
         assert!(document.is_dirty());

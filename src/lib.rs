@@ -1,15 +1,34 @@
-pub mod ai;
-pub mod application;
-pub mod canvas;
-pub mod compare;
-pub mod document;
-pub mod error;
-pub mod export;
-pub mod i18n;
+mod ai;
+mod application;
+mod canvas;
+mod compare;
+mod document;
+mod error;
+mod export;
+mod i18n;
 pub mod image;
-pub mod navigation;
-pub mod settings;
-pub mod tools;
-pub mod window;
+mod navigation;
+mod settings;
+mod tools;
+mod window;
 
-pub const APP_ID: &str = "io.github.mendrik.Diorama";
+use gio::prelude::*;
+
+pub use error::AppError;
+
+pub(crate) const APP_ID: &str = "io.github.mendrik.Diorama";
+
+pub fn run() -> glib::ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("diorama=info")),
+        )
+        .init();
+
+    if let Err(error) = i18n::init() {
+        tracing::warn!(%error, "Could not initialize translations");
+    }
+
+    application::build().run()
+}

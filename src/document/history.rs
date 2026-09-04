@@ -1,5 +1,5 @@
 #[derive(Debug, Clone)]
-pub struct History<T> {
+pub(super) struct History<T> {
     entries: Vec<T>,
     cursor: usize,
 }
@@ -14,13 +14,13 @@ impl<T> Default for History<T> {
 }
 
 impl<T> History<T> {
-    pub fn push(&mut self, value: T) {
+    pub(super) fn push(&mut self, value: T) {
         self.entries.truncate(self.cursor);
         self.entries.push(value);
         self.cursor = self.entries.len();
     }
 
-    pub fn undo(&mut self) -> bool {
+    pub(super) fn undo(&mut self) -> bool {
         if self.cursor == 0 {
             false
         } else {
@@ -29,7 +29,7 @@ impl<T> History<T> {
         }
     }
 
-    pub fn redo(&mut self) -> bool {
+    pub(super) fn redo(&mut self) -> bool {
         if self.cursor == self.entries.len() {
             false
         } else {
@@ -38,44 +38,21 @@ impl<T> History<T> {
         }
     }
 
-    pub fn active(&self) -> &[T] {
+    pub(super) fn active(&self) -> &[T] {
         &self.entries[..self.cursor]
     }
 
-    pub fn can_undo(&self) -> bool {
+    pub(super) fn can_undo(&self) -> bool {
         self.cursor > 0
     }
 
-    pub fn can_redo(&self) -> bool {
+    pub(super) fn can_redo(&self) -> bool {
         self.cursor < self.entries.len()
     }
 
-    pub fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.cursor = 0;
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cursor == 0
-    }
-
-    pub fn replace_active(&mut self, index: usize, value: T) -> bool {
-        if index >= self.cursor {
-            return false;
-        }
-        self.entries.truncate(self.cursor);
-        self.entries[index] = value;
-        true
-    }
-
-    pub fn remove_active(&mut self, index: usize) -> bool {
-        if index >= self.cursor {
-            return false;
-        }
-        self.entries.truncate(self.cursor);
-        self.entries.remove(index);
-        self.cursor -= 1;
-        true
     }
 }
 
@@ -92,15 +69,5 @@ mod tests {
         history.push(3);
         assert_eq!(history.active(), &[1, 3]);
         assert!(!history.redo());
-    }
-
-    #[test]
-    fn active_entries_can_be_replaced_and_removed() {
-        let mut history = History::default();
-        history.push(1);
-        history.push(2);
-        assert!(history.replace_active(0, 3));
-        assert!(history.remove_active(1));
-        assert_eq!(history.active(), &[3]);
     }
 }

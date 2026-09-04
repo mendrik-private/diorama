@@ -2,7 +2,6 @@
 pub enum Rotation {
     Clockwise90,
     CounterClockwise90,
-    HalfTurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,10 +63,4 @@ pub enum Operation {
         protected: Vec<ProtectedColor>,
     },
     Pencil(Stroke),
-    SelectionCutout {
-        width: u32,
-        height: u32,
-        alpha_mask: Vec<u8>,
-        inverted: bool,
-    },
 }

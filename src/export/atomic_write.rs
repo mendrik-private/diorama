@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::{AppError, Result};
 
-pub fn atomic_save(
+pub(super) fn atomic_save(
     destination: &Path,
     encode: impl FnOnce(&mut dyn Write) -> Result<()>,
 ) -> Result<()> {

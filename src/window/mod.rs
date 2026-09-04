@@ -5,15 +5,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use adw::prelude::{
-    ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
-    ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt,
-};
-use gio::prelude::*;
-use gtk::prelude::*;
-use libadwaita as adw;
-use palette::FromColor as _;
-
 use crate::ai::ObjectDetector;
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
@@ -26,8 +17,41 @@ use crate::image::{
     AnimationFrame, DecodeLimits, decode_animation, decode_headless, decode_memory, load_preview,
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
-use crate::settings::{ColorFormat, Settings, ZoomMode};
+#[cfg(test)]
+use crate::settings::ColorFormat;
+use crate::settings::{Settings, ZoomMode};
 use crate::tools::crop::CropBounds;
+use adw::prelude::{
+    ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
+    ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt,
+};
+use gio::prelude::*;
+use gtk::prelude::*;
+use libadwaita as adw;
+
+mod color;
+mod file_state;
+mod presentation;
+mod scale;
+mod zoom;
+
+use color::{color_format_at, color_format_index, format_color, rgba_to_u8, u8_to_rgba};
+use file_state::{
+    PendingDirectoryChanges, export_context_matches, files_equal, first_existing_folder,
+    is_directory, is_regular_file, merge_directory_change, source_revision_changed,
+};
+#[cfg(test)]
+use presentation::relative_modified_time;
+use presentation::{compare_metadata, folder_path, image_subtitle};
+use scale::{
+    ScaleUnit, dimensions_from_percent, resampling_label, scale_unit, scaled_dimensions,
+    scaled_width_for_height,
+};
+use zoom::{
+    ZoomAlignment, aligned_hard_zoom, anchored_adjustment_value, centered_adjustment_value,
+    comparison_zoom, fit_on_load, normalized_render_scale, panel_fit_zoom, scale_preview_zoom,
+    stepped_hard_zoom, usable_panel_size, zoom_rect_target,
+};
 
 #[derive(Clone)]
 pub struct ViewerWindow(Rc<WindowState>);
@@ -204,12 +228,6 @@ struct ZoomGestureAnchor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaleUnit {
-    Pixels,
-    Percent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalePreviewView {
     Footprint,
     ActualSize,
@@ -223,74 +241,10 @@ struct ScaleViewState {
     vertical: f64,
 }
 
-#[derive(Clone, Copy)]
-enum ZoomAlignment {
-    Nearest,
-    Contain,
-    Cover,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompareLensSource {
     Primary,
     Comparison,
-}
-
-#[derive(Default)]
-struct PendingDirectoryChanges {
-    refresh_navigation: bool,
-    current_changed: bool,
-    current_removed: bool,
-    current_renamed_to: Option<gio::File>,
-}
-
-fn merge_directory_change(
-    pending: &mut PendingDirectoryChanges,
-    current: &gio::File,
-    file: &gio::File,
-    other_file: Option<&gio::File>,
-    event: gio::FileMonitorEvent,
-) {
-    let source_is_current = file.equal(current);
-    let source_is_parent = current.parent().is_some_and(|parent| file.equal(&parent));
-    let target_is_current = other_file.is_some_and(|target| target.equal(current));
-    pending.refresh_navigation = true;
-    match event {
-        gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::ChangesDoneHint => {
-            pending.current_changed |= source_is_current;
-        }
-        gio::FileMonitorEvent::AttributeChanged => {}
-        gio::FileMonitorEvent::Created | gio::FileMonitorEvent::MovedIn => {
-            pending.current_changed |= source_is_current || target_is_current;
-        }
-        gio::FileMonitorEvent::Deleted => {
-            pending.current_removed |= source_is_current || source_is_parent;
-        }
-        gio::FileMonitorEvent::MovedOut => {
-            if source_is_current && let Some(target) = other_file {
-                pending.current_renamed_to = Some(target.clone());
-            }
-            pending.current_removed |= source_is_current || source_is_parent;
-        }
-        gio::FileMonitorEvent::Moved | gio::FileMonitorEvent::Renamed => {
-            if source_is_current {
-                pending.current_renamed_to = other_file.cloned();
-                pending.current_removed = true;
-            } else if source_is_parent {
-                pending.current_renamed_to = other_file.and_then(|target_parent| {
-                    current
-                        .basename()
-                        .map(|basename| target_parent.child(basename))
-                });
-                pending.current_removed = true;
-            }
-            pending.current_changed |= target_is_current;
-        }
-        gio::FileMonitorEvent::PreUnmount | gio::FileMonitorEvent::Unmounted => {
-            pending.current_removed = true;
-        }
-        _ => {}
-    }
 }
 
 fn edit_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bool, bool) {
@@ -341,45 +295,6 @@ fn image_navigation_direction(
         gtk::gdk::Key::Right => Some(true),
         _ => None,
     }
-}
-
-fn files_equal(left: &Option<gio::File>, right: &Option<gio::File>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.equal(right),
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-fn is_regular_file(file: &gio::File) -> bool {
-    file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
-        == gio::FileType::Regular
-}
-
-fn is_directory(file: &gio::File) -> bool {
-    file.query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
-        == gio::FileType::Directory
-}
-
-fn first_existing_folder(candidates: impl IntoIterator<Item = gio::File>) -> Option<gio::File> {
-    candidates.into_iter().find(is_directory)
-}
-
-fn source_revision_changed(
-    previous: Option<SystemTime>,
-    current: Option<SystemTime>,
-    is_local: bool,
-) -> bool {
-    if is_local { previous != current } else { true }
-}
-
-fn export_context_matches(
-    current_load_generation: u64,
-    exported_load_generation: u64,
-    current_file: &Option<gio::File>,
-    exported_file: &Option<gio::File>,
-) -> bool {
-    current_load_generation == exported_load_generation && files_equal(current_file, exported_file)
 }
 
 fn resize_crop(
@@ -453,16 +368,6 @@ fn boundary_overlay(
     }
 }
 
-fn zoom_rect_target(viewport: (i32, i32), selection: CropOverlay) -> Option<f64> {
-    if !usable_panel_size(viewport) || selection.width == 0 || selection.height == 0 {
-        return None;
-    }
-    Some(
-        (f64::from(viewport.0) / f64::from(selection.width))
-            .min(f64::from(viewport.1) / f64::from(selection.height)),
-    )
-}
-
 fn pencil_zoom_key(
     key: gtk::gdk::Key,
     modifiers: gtk::gdk::ModifierType,
@@ -502,69 +407,6 @@ fn measurement_clipboard_text(measurement: CropOverlay) -> String {
     )
 }
 
-fn scaled_dimensions(width: u32, height: u32, target_width: u32) -> (u32, u32) {
-    let width = width.max(1);
-    let height = height.max(1);
-    let target_width = target_width.max(1);
-    let target_height = ((u64::from(height) * u64::from(target_width) + u64::from(width) / 2)
-        / u64::from(width))
-    .max(1)
-    .min(u64::from(u32::MAX)) as u32;
-    (target_width, target_height)
-}
-
-fn scaled_width_for_height(width: u32, height: u32, target_height: u32) -> u32 {
-    let width = width.max(1);
-    let height = height.max(1);
-    let target_height = target_height.max(1);
-    ((u64::from(width) * u64::from(target_height) + u64::from(height) / 2) / u64::from(height))
-        .max(1)
-        .min(u64::from(u32::MAX)) as u32
-}
-
-fn dimensions_from_percent(width: u32, height: u32, percent: f64) -> (u32, u32) {
-    let factor = percent.max(0.01) / 100.0;
-    (
-        (f64::from(width.max(1)) * factor)
-            .round()
-            .clamp(1.0, f64::from(u32::MAX)) as u32,
-        (f64::from(height.max(1)) * factor)
-            .round()
-            .clamp(1.0, f64::from(u32::MAX)) as u32,
-    )
-}
-
-fn scale_unit(index: u32) -> ScaleUnit {
-    if index == 1 {
-        ScaleUnit::Percent
-    } else {
-        ScaleUnit::Pixels
-    }
-}
-
-fn resampling_label(resampling: Resampling) -> &'static str {
-    match resampling {
-        Resampling::Nearest => "Nearest",
-        Resampling::Linear => "Linear",
-        Resampling::Bicubic => "Bicubic",
-        Resampling::SeamCarving => "Seam carving",
-    }
-}
-
-fn folder_path(file: &gio::File) -> String {
-    let Some(folder) = file.parent() else {
-        return file.uri().to_string();
-    };
-    folder.path().map_or_else(
-        || folder.uri().to_string(),
-        |path| path.display().to_string(),
-    )
-}
-
-fn compare_metadata(file: &gio::File, width: u32, height: u32) -> String {
-    format!("{} · {width} × {height}", folder_path(file))
-}
-
 fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32) -> gtk::Label {
     let details = compare_metadata(file, width, height);
     gtk::Label::builder()
@@ -593,141 +435,6 @@ fn image_property_row(title: &str, value: &str) -> adw::ActionRow {
     value_label.add_css_class("dim-label");
     row.add_suffix(&value_label);
     row
-}
-
-fn relative_modified_time(modified: SystemTime, now: SystemTime) -> String {
-    let (elapsed, is_past) = match now.duration_since(modified) {
-        Ok(elapsed) => (elapsed, true),
-        Err(error) => (error.duration(), false),
-    };
-    let seconds = elapsed.as_secs();
-    if seconds < 60 {
-        return "just now".to_owned();
-    }
-
-    let (value, unit) = if seconds < 60 * 60 {
-        (seconds / 60, "minute")
-    } else if seconds < 24 * 60 * 60 {
-        (seconds / (60 * 60), "hour")
-    } else if seconds < 30 * 24 * 60 * 60 {
-        (seconds / (24 * 60 * 60), "day")
-    } else if seconds < 365 * 24 * 60 * 60 {
-        (seconds / (30 * 24 * 60 * 60), "month")
-    } else {
-        (seconds / (365 * 24 * 60 * 60), "year")
-    };
-    let unit = if value == 1 {
-        unit.to_owned()
-    } else {
-        format!("{unit}s")
-    };
-    if is_past {
-        format!("{value} {unit} ago")
-    } else {
-        format!("in {value} {unit}")
-    }
-}
-
-fn image_subtitle(
-    folder: &str,
-    dimensions: (u32, u32),
-    zoom: f64,
-    modified: Option<SystemTime>,
-    now: SystemTime,
-) -> String {
-    let details = format!(
-        "{folder} · {} × {} · {:.0}%",
-        dimensions.0,
-        dimensions.1,
-        zoom * 100.0
-    );
-    match modified {
-        Some(modified) => format!("{details} · {}", relative_modified_time(modified, now)),
-        None => details,
-    }
-}
-
-fn panel_fit_zoom(size: (i32, i32), dimensions: (i32, i32)) -> f64 {
-    (f64::from(size.0.max(1)) / f64::from(dimensions.0.max(1)))
-        .min(f64::from(size.1.max(1)) / f64::from(dimensions.1.max(1)))
-}
-
-fn fit_on_load(force_fit: bool, zoom_mode: ZoomMode) -> Option<bool> {
-    if force_fit {
-        return Some(false);
-    }
-    match zoom_mode {
-        ZoomMode::Fit => Some(false),
-        ZoomMode::Fill => Some(true),
-        ZoomMode::Manual => None,
-    }
-}
-
-fn normalized_render_scale(scale: f64) -> f64 {
-    if scale.is_finite() && scale > 0.0 {
-        scale.round().max(1.0)
-    } else {
-        1.0
-    }
-}
-
-fn aligned_hard_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
-    if zoom < 1.0 {
-        return zoom;
-    }
-    let render_scale = normalized_render_scale(render_scale);
-    let render_zoom = zoom * render_scale;
-    let render_zoom = match alignment {
-        ZoomAlignment::Nearest => render_zoom.round(),
-        ZoomAlignment::Contain => render_zoom.floor(),
-        ZoomAlignment::Cover => render_zoom.ceil(),
-    }
-    .max(render_scale);
-    render_zoom / render_scale
-}
-
-fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {
-    let render_scale = normalized_render_scale(render_scale);
-    let render_zoom = zoom * render_scale;
-    let next = if zoom >= 1.0 {
-        if zoom_in {
-            render_zoom.floor() + 1.0
-        } else if zoom > 1.0 + 1e-6 {
-            (render_zoom.ceil() - 1.0).max(render_scale)
-        } else {
-            render_zoom * 0.8
-        }
-    } else {
-        render_zoom * if zoom_in { 1.25 } else { 0.8 }
-    };
-    next / render_scale
-}
-
-fn usable_panel_size(size: (i32, i32)) -> bool {
-    size.0 > 1 && size.1 > 1
-}
-
-fn comparison_zoom(primary_zoom: f64, fit_zooms: (f64, f64)) -> f64 {
-    primary_zoom * fit_zooms.1 / fit_zooms.0.max(0.01)
-}
-
-fn scale_preview_zoom(source_width: u32, target_width: u32, source_zoom: f64) -> f64 {
-    source_zoom * f64::from(source_width.max(1)) / f64::from(target_width.max(1))
-}
-
-fn anchored_adjustment_value(value: f64, content_position: f64, factor: f64) -> f64 {
-    let viewport_position = content_position - value;
-    content_position * factor - viewport_position
-}
-
-fn render_scale_preview(
-    image: &image::RgbaImage,
-    target_width: u32,
-    target_height: u32,
-    resampling: Resampling,
-    cancellation: &CancellationToken,
-) -> crate::error::Result<image::RgbaImage> {
-    crate::tools::scale::resize(image, target_width, target_height, resampling, cancellation)
 }
 
 struct WindowState {
@@ -1610,7 +1317,7 @@ impl ViewerWindow {
         });
         self.add_action("actual-size", {
             let this = self.clone();
-            move || this.set_zoom(1.0)
+            move || this.set_zoom_centered(1.0)
         });
         for (name, zoom) in [
             ("zoom-25", 0.25),
@@ -1627,7 +1334,7 @@ impl ViewerWindow {
             ("zoom-900", 9.0),
         ] {
             let this = self.clone();
-            self.add_action(name, move || this.set_zoom(zoom));
+            self.add_action(name, move || this.set_zoom_centered(zoom));
         }
         self.add_action("fit", {
             let this = self.clone();
@@ -2713,7 +2420,7 @@ impl ViewerWindow {
             let weak = Rc::downgrade(&state);
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
-                    render_scale_preview(
+                    crate::tools::scale::resize(
                         source.as_ref(),
                         target_width,
                         target_height,
@@ -3884,7 +3591,12 @@ impl ViewerWindow {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 worker_cancellation.check()?;
                 let rendered = document.render(&worker_cancellation)?;
-                crate::export::export(&rendered, &worker_path, &options, &worker_cancellation)
+                crate::export::export(&rendered, &worker_path, &options, &worker_cancellation)?;
+                Ok::<_, crate::error::AppError>(
+                    std::fs::metadata(&worker_path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok()),
+                )
             })
             .await;
             let Some(state) = weak.upgrade() else {
@@ -3903,7 +3615,7 @@ impl ViewerWindow {
                 return;
             }
             match result {
-                Ok(Ok(())) => {
+                Ok(Ok(modified)) => {
                     if let Some(document) = state.document.borrow_mut().as_mut() {
                         document.mark_saved_at(operations);
                         if replace_current_file {
@@ -3924,11 +3636,7 @@ impl ViewerWindow {
                         state.current_file.replace(Some(target.clone()));
                         ViewerWindow(state.clone()).rebuild_navigation(target);
                     }
-                    state.source_modified.replace(
-                        std::fs::metadata(&path)
-                            .ok()
-                            .and_then(|metadata| metadata.modified().ok()),
-                    );
+                    state.source_modified.replace(modified);
                     state.external_source_conflict.set(false);
                     let has_newer_edits = state
                         .document
@@ -5561,7 +5269,22 @@ impl ViewerWindow {
         } else {
             self.0.canvas.zoom() * if zoom_in { 1.25 } else { 0.8 }
         };
+        self.set_zoom_centered(zoom);
+    }
+
+    fn set_zoom_centered(&self, zoom: f64) {
         self.set_zoom(zoom);
+        let horizontal = self.0.scrolled.hadjustment();
+        let vertical = self.0.scrolled.vadjustment();
+        glib::idle_add_local_once(move || {
+            for adjustment in [horizontal, vertical] {
+                adjustment.set_value(centered_adjustment_value(
+                    adjustment.lower(),
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                ));
+            }
+        });
     }
 
     fn set_zoom(&self, zoom: f64) {
@@ -7154,109 +6877,6 @@ fn lens_size_index(diameter: f32) -> u32 {
     }
 }
 
-fn u8_to_rgba(color: [u8; 4]) -> gtk::gdk::RGBA {
-    gtk::gdk::RGBA::new(
-        f32::from(color[0]) / 255.0,
-        f32::from(color[1]) / 255.0,
-        f32::from(color[2]) / 255.0,
-        f32::from(color[3]) / 255.0,
-    )
-}
-
-fn rgba_to_u8(color: gtk::gdk::RGBA) -> [u8; 4] {
-    [
-        (color.red() * 255.0).round() as u8,
-        (color.green() * 255.0).round() as u8,
-        (color.blue() * 255.0).round() as u8,
-        (color.alpha() * 255.0).round() as u8,
-    ]
-}
-
-fn color_format_index(format: ColorFormat) -> u32 {
-    match format {
-        ColorFormat::Hex => 0,
-        ColorFormat::Rgb => 1,
-        ColorFormat::Oklab => 2,
-        ColorFormat::Hsl => 3,
-    }
-}
-
-fn color_format_at(index: u32) -> ColorFormat {
-    match index {
-        1 => ColorFormat::Rgb,
-        2 => ColorFormat::Oklab,
-        3 => ColorFormat::Hsl,
-        _ => ColorFormat::Hex,
-    }
-}
-
-fn format_decimal(value: f32, precision: usize) -> String {
-    let threshold = 0.5 * 10.0_f32.powi(-(precision as i32));
-    let value = if value.abs() < threshold { 0.0 } else { value };
-    let formatted = format!("{value:.precision$}");
-    formatted
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
-}
-
-fn format_color(color: [u8; 4], format: ColorFormat) -> String {
-    let [red, green, blue, alpha] = color;
-    match format {
-        ColorFormat::Hex if alpha == u8::MAX => format!("#{red:02X}{green:02X}{blue:02X}"),
-        ColorFormat::Hex => format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}"),
-        ColorFormat::Rgb if alpha == u8::MAX => format!("rgb({red}, {green}, {blue})"),
-        ColorFormat::Rgb => format!(
-            "rgba({red}, {green}, {blue}, {})",
-            format_decimal(f32::from(alpha) / 255.0, 3)
-        ),
-        ColorFormat::Oklab => {
-            let srgb = palette::Srgb::new(
-                f32::from(red) / 255.0,
-                f32::from(green) / 255.0,
-                f32::from(blue) / 255.0,
-            );
-            let oklab = palette::Oklab::from_color(srgb.into_linear());
-            let components = format!(
-                "{}% {} {}",
-                format_decimal(oklab.l * 100.0, 2),
-                format_decimal(oklab.a, 4),
-                format_decimal(oklab.b, 4)
-            );
-            if alpha == u8::MAX {
-                format!("oklab({components})")
-            } else {
-                format!(
-                    "oklab({components} / {})",
-                    format_decimal(f32::from(alpha) / 255.0, 3)
-                )
-            }
-        }
-        ColorFormat::Hsl => {
-            let srgb = palette::Srgb::new(
-                f32::from(red) / 255.0,
-                f32::from(green) / 255.0,
-                f32::from(blue) / 255.0,
-            );
-            let hsl = palette::Hsl::from_color(srgb);
-            let components = format!(
-                "{} {}% {}%",
-                format_decimal(hsl.hue.into_positive_degrees(), 1),
-                format_decimal(hsl.saturation * 100.0, 1),
-                format_decimal(hsl.lightness * 100.0, 1)
-            );
-            if alpha == u8::MAX {
-                format!("hsl({components})")
-            } else {
-                format!(
-                    "hsl({components} / {})",
-                    format_decimal(f32::from(alpha) / 255.0, 3)
-                )
-            }
-        }
-    }
-}
-
 fn spin(minimum: f64, maximum: f64, value: f64) -> gtk::SpinButton {
     let adjustment = gtk::Adjustment::new(value, minimum, maximum, 1.0, 10.0, 0.0);
     gtk::SpinButton::builder()
@@ -7994,7 +7614,7 @@ mod tests {
             }
         });
 
-        let preview = render_scale_preview(
+        let preview = crate::tools::scale::resize(
             &image,
             4,
             2,
@@ -8040,6 +7660,13 @@ mod tests {
 
         assert_eq!(content_position - old_adjustment, 180.0);
         assert_eq!(content_position * factor - new_adjustment, 180.0);
+    }
+
+    #[test]
+    fn centered_zoom_places_the_content_midpoint_at_the_viewport_midpoint() {
+        assert_eq!(centered_adjustment_value(0.0, 1_600.0, 800.0), 400.0);
+        assert_eq!(centered_adjustment_value(20.0, 1_620.0, 800.0), 420.0);
+        assert_eq!(centered_adjustment_value(0.0, 600.0, 800.0), 0.0);
     }
 
     #[test]

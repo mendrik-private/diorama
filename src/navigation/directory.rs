@@ -31,8 +31,6 @@ struct Entry {
 pub struct DirectorySequence {
     entries: Vec<gio::File>,
     current: usize,
-    pub order: SortOrder,
-    pub reversed: bool,
 }
 
 impl DirectorySequence {
@@ -40,8 +38,6 @@ impl DirectorySequence {
         (!files.is_empty()).then(|| Self {
             entries: files.to_vec(),
             current: 0,
-            order: SortOrder::Name,
-            reversed: false,
         })
     }
 
@@ -111,11 +107,10 @@ impl DirectorySequence {
         Ok(Self {
             entries,
             current: current_index,
-            order,
-            reversed,
         })
     }
 
+    #[cfg(test)]
     pub fn current(&self) -> &gio::File {
         &self.entries[self.current]
     }
@@ -140,10 +135,6 @@ impl DirectorySequence {
 
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     pub fn neighbors(&self) -> Vec<gio::File> {
@@ -512,7 +503,7 @@ mod tests {
             Some("first.png".into())
         );
         assert!(sequence.remove_file(&files[0]).is_none());
-        assert!(sequence.is_empty());
+        assert!(sequence.entries.is_empty());
         assert!(sequence.remove_file(&files[1]).is_none());
     }
 

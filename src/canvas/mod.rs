@@ -917,14 +917,6 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
-    pub fn zoom_in(&self) {
-        self.set_zoom(self.zoom() * 1.25);
-    }
-
-    pub fn zoom_out(&self) {
-        self.set_zoom(self.zoom() / 1.25);
-    }
-
     pub fn filter(&self) -> ZoomFilter {
         self.imp().filter.get()
     }

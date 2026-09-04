@@ -2,7 +2,6 @@ mod atomic_write;
 mod jpeg;
 mod png;
 
-pub use atomic_write::atomic_save;
 pub use jpeg::JpegOptions;
 pub use png::PngOptions;
 
@@ -24,7 +23,7 @@ pub fn export(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     cancellation.check()?;
-    atomic_save(path, |writer| {
+    atomic_write::atomic_save(path, |writer| {
         match options {
             ExportOptions::Png(options) => png::encode(writer, image, options)?,
             ExportOptions::Jpeg(options) => jpeg::encode(writer, image, options)?,

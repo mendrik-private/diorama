@@ -1,3 +1,3 @@
-pub mod mapping;
+mod mapping;
 
-pub use mapping::{NormalizedPoint, SplitOrientation, choose_split, map_corresponding_point};
+pub use mapping::{SplitOrientation, choose_split};

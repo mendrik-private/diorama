@@ -12,14 +12,5 @@ pub fn from_glycin(image: &glycin::Image, frame: &glycin::Frame) -> Metadata {
         icc: frame_details
             .color_icc_profile()
             .and_then(|data| data.get_full().ok()),
-        key_values: details
-            .metadata_key_value()
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
     }
 }

@@ -1,35 +1,7 @@
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NormalizedPoint {
-    pub x: f64,
-    pub y: f64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitOrientation {
     Vertical,
     Horizontal,
-}
-
-pub fn map_corresponding_point(
-    source_point: (f64, f64),
-    source_dimensions: (u32, u32),
-    target_dimensions: (u32, u32),
-) -> Option<(f64, f64)> {
-    if source_dimensions.0 == 0
-        || source_dimensions.1 == 0
-        || target_dimensions.0 == 0
-        || target_dimensions.1 == 0
-    {
-        return None;
-    }
-    let normalized = NormalizedPoint {
-        x: (source_point.0 / f64::from(source_dimensions.0)).clamp(0.0, 1.0),
-        y: (source_point.1 / f64::from(source_dimensions.1)).clamp(0.0, 1.0),
-    };
-    Some((
-        normalized.x * f64::from(target_dimensions.0),
-        normalized.y * f64::from(target_dimensions.1),
-    ))
 }
 
 pub fn choose_split(first: (u32, u32), second: (u32, u32)) -> SplitOrientation {
@@ -60,15 +32,7 @@ fn fit_score(dimensions: (u32, u32), available_width: f64, available_height: f64
 
 #[cfg(test)]
 mod tests {
-    use super::{SplitOrientation, choose_split, map_corresponding_point};
-
-    #[test]
-    fn maps_unequal_dimensions_by_normalized_coordinates() {
-        assert_eq!(
-            map_corresponding_point((50.0, 25.0), (100, 50), (400, 200)),
-            Some((200.0, 100.0))
-        );
-    }
+    use super::{SplitOrientation, choose_split};
 
     #[test]
     fn landscapes_use_vertical_split() {
