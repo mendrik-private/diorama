@@ -32,7 +32,7 @@ editing and comparison tools.
   deletion.
 - Open With integration, full-image clipboard copying, confirmed permanent
   deletion, fullscreen viewing, and remembered window, folder, and zoom state.
-- Fit-to-window, fill, 25%–900% presets, smooth zoom, and pixel-perfect hard
+- Aspect-preserving fit-to-window, fill, 25%–900% presets, smooth zoom, and pixel-perfect hard
   zoom that stays aligned on HiDPI and fractionally scaled displays.
 - Pinch zoom, pointer-anchored Ctrl+scroll zoom, middle-button panning,
   scrollbars for enlarged images, and an interactive

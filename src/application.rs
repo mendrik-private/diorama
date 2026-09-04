@@ -36,7 +36,7 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
             "<Control>KP_Subtract",
         ],
     ),
-    ("win.fit", &["0"]),
+    ("win.fit", &["0", "KP_0"]),
     ("win.zoom-100", &["1"]),
     ("win.zoom-200", &["2"]),
     ("win.zoom-300", &["3"]),
@@ -158,11 +158,18 @@ mod tests {
             .find(|(action, _)| *action == "win.zoom-out")
             .map(|(_, shortcuts)| *shortcuts)
             .expect("zoom-out shortcuts");
+        let fit = SHORTCUTS
+            .iter()
+            .find(|(action, _)| *action == "win.fit")
+            .map(|(_, shortcuts)| *shortcuts)
+            .expect("fit shortcuts");
 
         assert!(zoom_in.contains(&"equal"));
         assert!(zoom_in.contains(&"KP_Add"));
         assert!(zoom_out.contains(&"minus"));
         assert!(zoom_out.contains(&"KP_Subtract"));
+        assert!(fit.contains(&"0"));
+        assert!(fit.contains(&"KP_0"));
     }
 
     #[test]

@@ -1,13 +1,6 @@
 use crate::canvas::CropOverlay;
 use crate::settings::ZoomMode;
 
-#[derive(Clone, Copy)]
-pub(super) enum ZoomAlignment {
-    Nearest,
-    Contain,
-    Cover,
-}
-
 pub(super) fn zoom_rect_target(viewport: (f64, f64), selection: CropOverlay) -> Option<f64> {
     if !viewport.0.is_finite()
         || !viewport.1.is_finite()
@@ -45,23 +38,18 @@ pub(super) fn sanitized_render_scale(scale: f64) -> f64 {
     }
 }
 
-pub(super) fn aligned_hard_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
-    let render_scale = sanitized_render_scale(render_scale);
-    let render_zoom = zoom * render_scale;
-    let render_zoom = match alignment {
-        ZoomAlignment::Nearest => render_zoom.round(),
-        ZoomAlignment::Contain => render_zoom.floor(),
-        ZoomAlignment::Cover => render_zoom.ceil(),
-    }
-    .max(1.0);
-    render_zoom / render_scale
+pub(super) fn device_zoom(logical_zoom: f64, render_scale: f64) -> f64 {
+    logical_zoom * sanitized_render_scale(render_scale)
 }
 
-pub(super) fn aligned_hard_fit_zoom(zoom: f64, render_scale: f64, alignment: ZoomAlignment) -> f64 {
-    if zoom * sanitized_render_scale(render_scale) < 1.0 {
-        return zoom;
-    }
-    aligned_hard_zoom(zoom, render_scale, alignment)
+pub(super) fn logical_zoom(device_zoom: f64, render_scale: f64) -> f64 {
+    device_zoom / sanitized_render_scale(render_scale)
+}
+
+pub(super) fn aligned_hard_zoom(zoom: f64, render_scale: f64) -> f64 {
+    let render_scale = sanitized_render_scale(render_scale);
+    let render_zoom = (zoom * render_scale).round().max(1.0);
+    render_zoom / render_scale
 }
 
 pub(super) fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {

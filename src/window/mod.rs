@@ -54,10 +54,9 @@ use scale::{
 };
 use tool::{Tool, palette_visible, pencil_drag_available, resting_tool};
 use zoom::{
-    ZoomAlignment, aligned_hard_fit_zoom, aligned_hard_zoom, anchored_adjustment_value,
-    centered_adjustment_value, comparison_zoom, fit_on_load, panel_fit_zoom,
-    sanitized_render_scale, scale_preview_zoom, stepped_hard_zoom, usable_panel_size,
-    zoom_rect_target,
+    aligned_hard_zoom, anchored_adjustment_value, centered_adjustment_value, comparison_zoom,
+    device_zoom, fit_on_load, logical_zoom, panel_fit_zoom, sanitized_render_scale,
+    scale_preview_zoom, stepped_hard_zoom, usable_panel_size, zoom_rect_target,
 };
 
 #[derive(Clone)]
@@ -313,18 +312,15 @@ fn pencil_can_activate(has_image: bool) -> bool {
 fn image_navigation_direction(
     key: gtk::gdk::Key,
     modifiers: gtk::gdk::ModifierType,
-    contextual_mode_active: bool,
 ) -> Option<bool> {
-    if contextual_mode_active
-        || modifiers.intersects(
-            gtk::gdk::ModifierType::SHIFT_MASK
-                | gtk::gdk::ModifierType::CONTROL_MASK
-                | gtk::gdk::ModifierType::ALT_MASK
-                | gtk::gdk::ModifierType::SUPER_MASK
-                | gtk::gdk::ModifierType::HYPER_MASK
-                | gtk::gdk::ModifierType::META_MASK,
-        )
-    {
+    if modifiers.intersects(
+        gtk::gdk::ModifierType::SHIFT_MASK
+            | gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK
+            | gtk::gdk::ModifierType::SUPER_MASK
+            | gtk::gdk::ModifierType::HYPER_MASK
+            | gtk::gdk::ModifierType::META_MASK,
+    ) {
         return None;
     }
     match key {
@@ -1335,7 +1331,7 @@ impl ViewerWindow {
         });
         self.add_action("actual-size", {
             let this = self.clone();
-            move || this.set_zoom_centered(1.0)
+            move || this.set_device_zoom_centered(1.0)
         });
         for (name, zoom) in [
             ("zoom-25", 0.25),
@@ -1352,7 +1348,7 @@ impl ViewerWindow {
             ("zoom-900", 9.0),
         ] {
             let this = self.clone();
-            self.add_action(name, move || this.set_zoom_centered(zoom));
+            self.add_action(name, move || this.set_device_zoom_centered(zoom));
         }
         self.add_action("fit", {
             let this = self.clone();
@@ -1522,7 +1518,7 @@ impl ViewerWindow {
                     return;
                 }
                 this.0.scale_preview_view.set(ScalePreviewView::ActualSize);
-                this.set_zoom(1.0);
+                this.set_zoom(logical_zoom(1.0, this.0.render_scale.get()));
             }
         });
         self.add_action("scale-fit", {
@@ -1702,7 +1698,9 @@ impl ViewerWindow {
                 }) {
                     return glib::Propagation::Proceed;
                 }
-                if this.handle_annotation_key(key, modifiers) {
+                if this.handle_annotation_key(key, modifiers)
+                    || this.move_keyboard_tool_cursor_for_key(key, modifiers)
+                {
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -1740,29 +1738,17 @@ impl ViewerWindow {
                 {
                     return glib::Propagation::Stop;
                 }
-                if this.active_keyboard_tool().is_some() {
-                    let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-                        10
-                    } else {
-                        1
-                    };
-                    let moved = match key {
-                        gtk::gdk::Key::Left => this.move_keyboard_tool_cursor(-step, 0),
-                        gtk::gdk::Key::Right => this.move_keyboard_tool_cursor(step, 0),
-                        gtk::gdk::Key::Up => this.move_keyboard_tool_cursor(0, -step),
-                        gtk::gdk::Key::Down => this.move_keyboard_tool_cursor(0, step),
-                        _ => false,
-                    };
-                    if moved {
-                        return glib::Propagation::Stop;
-                    }
-                    if matches!(
+                if this.move_keyboard_tool_cursor_for_key(key, modifiers) {
+                    return glib::Propagation::Stop;
+                }
+                if this.active_keyboard_tool().is_some()
+                    && matches!(
                         key,
                         gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-                    ) {
-                        this.activate_keyboard_tool();
-                        return glib::Propagation::Stop;
-                    }
+                    )
+                {
+                    this.activate_keyboard_tool();
+                    return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             }
@@ -1778,14 +1764,19 @@ impl ViewerWindow {
         self.0.canvas.add_controller(keys);
 
         let navigation = gtk::EventControllerKey::new();
+        navigation.set_propagation_phase(gtk::PropagationPhase::Capture);
         navigation.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
-                let contextual_mode_active =
-                    this.active_keyboard_tool().is_some() || this.0.tool.get() == Tool::Scale;
-                let Some(forward) =
-                    image_navigation_direction(key, modifiers, contextual_mode_active)
-                else {
+                if gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|focus| {
+                    focus.is::<gtk::Text>()
+                        || focus.is::<gtk::Entry>()
+                        || focus.is::<gtk::TextView>()
+                        || focus.is::<gtk::SpinButton>()
+                }) {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(forward) = image_navigation_direction(key, modifiers) else {
                     return glib::Propagation::Proceed;
                 };
                 this.navigate(forward);
@@ -1832,13 +1823,37 @@ impl ViewerWindow {
         if self.keyboard_tool_dimensions(tool).is_none() {
             return;
         }
+        let horizontal = self.0.scrolled.hadjustment();
+        let vertical = self.0.scrolled.vadjustment();
+        let viewport = (horizontal.value(), vertical.value());
         self.0.canvas.grab_focus();
+        horizontal.set_value(viewport.0);
+        vertical.set_value(viewport.1);
         self.0.canvas.announce(
             &gettext(
-                "Use the arrow keys to move, Shift with an arrow to move faster, and Space or Enter to act.",
+                "Use Up and Down to move, Shift with an arrow to move faster, and Space or Enter to act. Left and Right change images.",
             ),
             gtk::AccessibleAnnouncementPriority::Medium,
         );
+    }
+
+    fn move_keyboard_tool_cursor_for_key(
+        &self,
+        key: gtk::gdk::Key,
+        modifiers: gtk::gdk::ModifierType,
+    ) -> bool {
+        let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            10
+        } else {
+            1
+        };
+        match key {
+            gtk::gdk::Key::Left => self.move_keyboard_tool_cursor(-step, 0),
+            gtk::gdk::Key::Right => self.move_keyboard_tool_cursor(step, 0),
+            gtk::gdk::Key::Up => self.move_keyboard_tool_cursor(0, -step),
+            gtk::gdk::Key::Down => self.move_keyboard_tool_cursor(0, step),
+            _ => false,
+        }
     }
 
     fn move_keyboard_tool_cursor(&self, dx: i32, dy: i32) -> bool {
@@ -2837,7 +2852,9 @@ impl ViewerWindow {
                     ));
                 }
             }
-            ScalePreviewView::ActualSize => self.set_scale_preview_zoom(1.0),
+            ScalePreviewView::ActualSize => {
+                self.set_scale_preview_zoom(logical_zoom(1.0, self.0.render_scale.get()));
+            }
             ScalePreviewView::Fit => self.fit(false),
         }
     }
@@ -2933,9 +2950,10 @@ impl ViewerWindow {
     }
 
     fn update_scale_preview_zoom(&self) {
-        self.0
-            .zoom_label
-            .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
+        self.0.zoom_label.set_label(&format!(
+            "{:.0}%",
+            device_zoom(self.0.canvas.zoom(), self.0.render_scale.get()) * 100.0
+        ));
         self.update_subtitle();
         self.update_minimap();
     }
@@ -3529,7 +3547,7 @@ impl ViewerWindow {
         self.0.title.set_subtitle(&image_subtitle(
             &folder_path(&file),
             dimensions,
-            self.0.canvas.zoom(),
+            device_zoom(self.0.canvas.zoom(), self.0.render_scale.get()),
             modified,
             SystemTime::now(),
         ));
@@ -5011,7 +5029,7 @@ impl ViewerWindow {
             ),
         );
         self.0.compare_fit_zooms.set(Some(fit_zooms));
-        self.apply_fit_zoom_with_alignment(fit_zooms.0, Some(ZoomAlignment::Contain));
+        self.apply_fit_zoom(fit_zooms.0);
         true
     }
 
@@ -5371,7 +5389,7 @@ impl ViewerWindow {
         let generation = self.0.load_generation.get();
         self.0.zoom_mode.set(ZoomMode::Manual);
         self.0.settings.set_last_zoom_mode(ZoomMode::Manual);
-        self.apply_fit_zoom_with_alignment(target_zoom, None);
+        self.apply_fit_zoom(target_zoom);
         let this = self.clone();
         glib::idle_add_local_once(move || {
             this.center_selection_native_point(selection, generation);
@@ -5484,39 +5502,33 @@ impl ViewerWindow {
         });
     }
 
-    fn set_zoom(&self, zoom: f64) {
-        self.set_zoom_with_alignment(zoom, Some(ZoomAlignment::Nearest));
+    fn set_device_zoom_centered(&self, zoom: f64) {
+        self.set_zoom_centered(logical_zoom(zoom, self.0.render_scale.get()));
     }
 
-    fn set_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
+    fn set_zoom(&self, zoom: f64) {
+        self.set_zoom_with_alignment(zoom, true);
+    }
+
+    fn set_zoom_with_alignment(&self, zoom: f64, align: bool) {
         self.0.zoom_mode.set(ZoomMode::Manual);
         self.0.settings.set_last_zoom_mode(ZoomMode::Manual);
-        self.apply_zoom_with_alignment(zoom, alignment);
+        self.apply_zoom_with_alignment(zoom, align);
     }
 
-    fn apply_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
-        self.apply_zoom_with_bounds(zoom, alignment, false);
+    fn apply_zoom_with_alignment(&self, zoom: f64, align: bool) {
+        self.apply_zoom_with_bounds(zoom, align, false);
     }
 
-    fn apply_fit_zoom_with_alignment(&self, zoom: f64, alignment: Option<ZoomAlignment>) {
-        self.apply_zoom_with_bounds(zoom, alignment, true);
+    fn apply_fit_zoom(&self, zoom: f64) {
+        // Fit is an exact viewport ratio, even with nearest-neighbor rendering.
+        self.apply_zoom_with_bounds(zoom, false, true);
     }
 
-    fn apply_zoom_with_bounds(
-        &self,
-        zoom: f64,
-        alignment: Option<ZoomAlignment>,
-        fit_bounds: bool,
-    ) {
+    fn apply_zoom_with_bounds(&self, zoom: f64, align: bool, fit_bounds: bool) {
         self.0.pending_fit.set(None);
-        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
-            alignment.map_or(zoom, |alignment| {
-                if fit_bounds {
-                    aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
-                } else {
-                    aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
-                }
-            })
+        let zoom = if align && self.0.canvas.filter() == ZoomFilter::Hard {
+            aligned_hard_zoom(zoom, self.0.render_scale.get())
         } else {
             zoom
         };
@@ -5525,11 +5537,14 @@ impl ViewerWindow {
         } else {
             self.0.canvas.set_zoom(zoom);
         }
-        self.0
-            .zoom_label
-            .set_label(&format!("{:.0}%", self.0.canvas.zoom() * 100.0));
+        self.0.zoom_label.set_label(&format!(
+            "{:.0}%",
+            device_zoom(self.0.canvas.zoom(), self.0.render_scale.get()) * 100.0
+        ));
         self.update_subtitle();
-        self.0.settings.set_last_zoom(self.0.canvas.zoom());
+        self.0
+            .settings
+            .set_last_zoom(device_zoom(self.0.canvas.zoom(), self.0.render_scale.get()));
         if self.0.compare_locked.get()
             && let Some(compare) = self.0.compare_canvas.borrow().as_ref()
         {
@@ -5540,14 +5555,8 @@ impl ViewerWindow {
                 .map_or(self.0.canvas.zoom(), |fit_zooms| {
                     comparison_zoom(self.0.canvas.zoom(), fit_zooms)
                 });
-            let zoom = if compare.filter() == ZoomFilter::Hard {
-                alignment.map_or(zoom, |alignment| {
-                    if fit_bounds {
-                        aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
-                    } else {
-                        aligned_hard_zoom(zoom, self.0.render_scale.get(), alignment)
-                    }
-                })
+            let zoom = if align && compare.filter() == ZoomFilter::Hard {
+                aligned_hard_zoom(zoom, self.0.render_scale.get())
             } else {
                 zoom
             };
@@ -5565,7 +5574,7 @@ impl ViewerWindow {
             ZoomMode::Fit if self.0.canvas.texture().is_some() => self.fit(false),
             ZoomMode::Fill if self.0.canvas.texture().is_some() => self.fit(true),
             ZoomMode::Fit | ZoomMode::Fill | ZoomMode::Manual => {
-                self.apply_zoom_with_alignment(self.0.canvas.zoom(), Some(ZoomAlignment::Nearest))
+                self.apply_zoom_with_alignment(self.0.canvas.zoom(), true)
             }
         }
     }
@@ -5590,7 +5599,9 @@ impl ViewerWindow {
 
     fn update_render_scale(&self, scale: f64) {
         let scale = sanitized_render_scale(scale);
-        self.0.render_scale.set(scale);
+        let previous_scale = self.0.render_scale.replace(scale);
+        let zoom = device_zoom(self.0.canvas.zoom(), previous_scale);
+        self.0.canvas.set_zoom(logical_zoom(zoom, scale));
         self.0.canvas.set_render_scale(scale);
         if let Some(compare) = self.0.compare_canvas.borrow().as_ref() {
             compare.set_render_scale(scale);
@@ -5985,29 +5996,19 @@ impl ViewerWindow {
         let height = f64::from(viewport.1);
         let horizontal = width / f64::from(texture.width());
         let vertical = height / f64::from(texture.height());
+        let scale_preview_fit = !fill
+            && self.0.tool.get() == Tool::Scale
+            && self.0.scale_preview_view.get() == ScalePreviewView::Fit;
         let zoom = if fill {
             horizontal.max(vertical)
         } else {
             horizontal.min(vertical)
         };
-        let alignment = if fill {
-            ZoomAlignment::Cover
-        } else {
-            ZoomAlignment::Contain
-        };
-        if !fill
-            && self.0.tool.get() == Tool::Scale
-            && self.0.scale_preview_view.get() == ScalePreviewView::Fit
-        {
+        if scale_preview_fit {
             self.0.pending_fit.set(None);
-            let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
-                aligned_hard_fit_zoom(zoom, self.0.render_scale.get(), alignment)
-            } else {
-                zoom
-            };
             self.set_scale_preview_fit_zoom(zoom);
         } else {
-            self.apply_fit_zoom_with_alignment(zoom, Some(alignment));
+            self.apply_fit_zoom(zoom);
         }
         true
     }
@@ -6072,7 +6073,7 @@ impl ViewerWindow {
                     applied_factor,
                 );
                 zoom_adjustment_target.set(Some((horizontal_target, vertical_target)));
-                this.set_zoom_with_alignment(target_zoom, None);
+                this.set_zoom_with_alignment(target_zoom, false);
                 let horizontal = this.0.scrolled.hadjustment();
                 let vertical = this.0.scrolled.vadjustment();
                 horizontal.set_value(horizontal_target);
@@ -6086,11 +6087,7 @@ impl ViewerWindow {
             move |_, _| {
                 if let Some(anchor) = zoom_anchor.take() {
                     let target_zoom = if this.0.canvas.filter() == ZoomFilter::Hard {
-                        aligned_hard_zoom(
-                            this.0.canvas.zoom(),
-                            this.0.render_scale.get(),
-                            ZoomAlignment::Nearest,
-                        )
+                        aligned_hard_zoom(this.0.canvas.zoom(), this.0.render_scale.get())
                     } else {
                         this.0.canvas.zoom()
                     };
@@ -6959,31 +6956,23 @@ mod tests {
     #[test]
     fn unmodified_horizontal_arrows_navigate_images() {
         assert_eq!(
-            image_navigation_direction(gtk::gdk::Key::Left, gtk::gdk::ModifierType::empty(), false),
+            image_navigation_direction(gtk::gdk::Key::Left, gtk::gdk::ModifierType::empty()),
             Some(false)
         );
         assert_eq!(
-            image_navigation_direction(
-                gtk::gdk::Key::Right,
-                gtk::gdk::ModifierType::LOCK_MASK,
-                false
-            ),
+            image_navigation_direction(gtk::gdk::Key::Right, gtk::gdk::ModifierType::LOCK_MASK,),
             Some(true)
         );
         assert_eq!(
-            image_navigation_direction(
-                gtk::gdk::Key::Left,
-                gtk::gdk::ModifierType::SHIFT_MASK,
-                false
-            ),
+            image_navigation_direction(gtk::gdk::Key::Left, gtk::gdk::ModifierType::SHIFT_MASK,),
             None
         );
         assert_eq!(
-            image_navigation_direction(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty(), true),
-            None
+            image_navigation_direction(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty()),
+            Some(true)
         );
         assert_eq!(
-            image_navigation_direction(gtk::gdk::Key::Up, gtk::gdk::ModifierType::empty(), false),
+            image_navigation_direction(gtk::gdk::Key::Up, gtk::gdk::ModifierType::empty()),
             None
         );
     }
@@ -7215,6 +7204,12 @@ mod tests {
     }
 
     #[test]
+    fn fit_scales_images_up_or_down_to_the_largest_contained_size() {
+        assert_eq!(panel_fit_zoom((800, 600), (100, 80)), 7.5);
+        assert_eq!(panel_fit_zoom((800, 600), (1_600, 1_200)), 0.5);
+    }
+
+    #[test]
     fn navigation_reapplies_the_selected_fit_mode() {
         assert_eq!(fit_on_load(false, ZoomMode::Fit), Some(false));
         assert_eq!(fit_on_load(false, ZoomMode::Fill), Some(true));
@@ -7226,41 +7221,21 @@ mod tests {
     fn hard_zoom_aligns_to_the_integer_render_grid() {
         let render_scale = 2.0;
 
-        assert_eq!(
-            aligned_hard_zoom(1.0, render_scale, ZoomAlignment::Nearest),
-            1.0
-        );
-        assert_eq!(
-            aligned_hard_zoom(1.24, render_scale, ZoomAlignment::Nearest),
-            1.0
-        );
-        assert_eq!(
-            aligned_hard_zoom(1.26, render_scale, ZoomAlignment::Nearest),
-            1.5
-        );
-        assert_eq!(
-            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Contain),
-            1.0
-        );
-        assert_eq!(
-            aligned_hard_zoom(1.4, render_scale, ZoomAlignment::Cover),
-            1.5
-        );
-        assert_eq!(
-            aligned_hard_zoom(0.75, render_scale, ZoomAlignment::Nearest),
-            1.0
-        );
-        assert_eq!(
-            aligned_hard_zoom(1.0, f64::NAN, ZoomAlignment::Nearest),
-            1.0
-        );
+        assert_eq!(aligned_hard_zoom(1.0, render_scale), 1.0);
+        assert_eq!(aligned_hard_zoom(1.24, render_scale), 1.0);
+        assert_eq!(aligned_hard_zoom(1.26, render_scale), 1.5);
+        assert_eq!(aligned_hard_zoom(0.75, render_scale), 1.0);
+        assert_eq!(aligned_hard_zoom(1.0, f64::NAN), 1.0);
         assert_eq!(sanitized_render_scale(1.666_667), 1.666_667);
     }
 
     #[test]
-    fn hard_fit_can_downscale_an_oversized_image() {
-        assert_eq!(aligned_hard_fit_zoom(0.2, 1.0, ZoomAlignment::Contain), 0.2);
-        assert_eq!(aligned_hard_fit_zoom(0.4, 2.0, ZoomAlignment::Contain), 0.4);
+    fn user_zoom_percentages_round_trip_through_fractional_display_scale() {
+        let render_scale = 5.0 / 3.0;
+        let logical = logical_zoom(1.0, render_scale);
+
+        assert!((logical - 0.6).abs() < 1e-6);
+        assert!((device_zoom(logical, render_scale) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -9050,6 +9025,54 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn fit_action_enlarges_small_images_to_the_largest_contained_size() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.SmallImageFitTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.window.set_default_size(800, 600);
+        let image = image::RgbaImage::from_pixel(100, 80, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        window.present();
+
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !usable_panel_size((window.0.scrolled.width(), window.0.scrolled.height()))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "fit", None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while window.0.pending_fit.get().is_some() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+
+        let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
+        let requested_zoom = panel_fit_zoom(viewport, (100, 80));
+        assert!(requested_zoom > 1.0);
+        assert!(
+            (window.0.canvas.zoom() - requested_zoom).abs() < 1e-6,
+            "Fit leaves unused space: zoom {}, required {requested_zoom}, viewport {viewport:?}",
+            window.0.canvas.zoom(),
+        );
+        assert_eq!(window.0.zoom_mode.get(), ZoomMode::Fit);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn fit_action_stays_locked_to_each_scale_preview_size() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -9080,14 +9103,7 @@ mod tests {
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
         assert!(window.0.canvas.zoom() > 64.0);
-        assert_eq!(
-            window.0.canvas.zoom(),
-            aligned_hard_zoom(
-                panel_fit_zoom(viewport, (4, 3)),
-                window.0.render_scale.get(),
-                ZoomAlignment::Contain,
-            )
-        );
+        assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (4, 3)));
     }
 
     #[test]
@@ -9240,19 +9256,12 @@ mod tests {
         assert!(usable_panel_size(viewport));
         let requested_zoom = panel_fit_zoom(viewport, (1_600, 1_200));
         assert!(requested_zoom * window.0.render_scale.get() < 1.0);
-        assert_eq!(
-            window.0.canvas.zoom(),
-            aligned_hard_fit_zoom(
-                requested_zoom,
-                window.0.render_scale.get(),
-                ZoomAlignment::Contain,
-            )
-        );
+        assert_eq!(window.0.canvas.zoom(), requested_zoom);
     }
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn hard_zoom_keeps_one_hundred_percent_at_fractional_gnome_scaling() {
+    fn actual_size_and_fit_use_device_pixel_percentages_at_fractional_scaling() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik.Diorama.PhysicalZoomTest")
@@ -9263,12 +9272,85 @@ mod tests {
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
 
-        window.update_render_scale(2.0);
-        window.set_zoom(1.0);
+        let render_scale = 5.0 / 3.0;
+        window.update_render_scale(render_scale);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "zoom-100", None);
 
-        assert_eq!(window.0.render_scale.get(), 2.0);
-        assert_eq!(window.0.canvas.zoom(), 1.0);
         assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+        assert!((window.0.canvas.zoom() * render_scale - 1.0).abs() < 1e-6);
+
+        window.update_render_scale(2.0);
+        assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+        assert!((window.0.canvas.zoom() * 2.0 - 1.0).abs() < 1e-6);
+        window.update_render_scale(render_scale);
+
+        let image = image::RgbaImage::new(1_672, 941);
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.scrolled.allocate(1_023, 620, -1, None);
+        window.update_action_states();
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "fit", None);
+
+        let expected = panel_fit_zoom((1_003, 600), (1_672, 941)) * render_scale;
+        let actual = window.0.canvas.zoom() * render_scale;
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "Fit device zoom was {actual}, expected {expected}; viewport is {:?}",
+            (window.0.scrolled.width(), window.0.scrolled.height()),
+        );
+        assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn fit_between_one_and_two_device_pixels_fills_the_viewport() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.FractionalFitTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::new(1_672, 941);
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.update_action_states();
+        window.update_render_scale(5.0 / 3.0);
+        window.0.scrolled.allocate(1_800, 1_100, -1, None);
+
+        for filter in [ZoomFilter::Hard, ZoomFilter::Soft] {
+            window.0.canvas.set_filter(filter);
+            gio::prelude::ActionGroupExt::activate_action(&window.0.window, "zoom-100", None);
+            assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+            gio::prelude::ActionGroupExt::activate_action(&window.0.window, "fit", None);
+            let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
+            let expected = panel_fit_zoom(viewport, (1_672, 941));
+            let physical = device_zoom(expected, window.0.render_scale.get());
+            assert!((1.0..2.0).contains(&physical));
+            assert!(
+                (window.0.canvas.zoom() - expected).abs() < 1e-6,
+                "{filter:?}: Fit shows {:?}, but the viewport requires {:.1}%",
+                window.0.zoom_label.label(),
+                physical * 100.0,
+            );
+            window.0.scrolled.allocate(1_800, 1_100, -1, None);
+            let drawn = window
+                .0
+                .canvas
+                .crop_display_bounds(CropOverlay {
+                    x: 0,
+                    y: 0,
+                    width: 1_672,
+                    height: 941,
+                    image_width: 1_672,
+                    image_height: 941,
+                })
+                .unwrap();
+            assert!((drawn.width() - viewport.0 as f32).abs() < 1.0);
+            assert!(drawn.height() <= viewport.1 as f32 + 1.0);
+        }
     }
 
     #[test]
@@ -9345,6 +9427,120 @@ mod tests {
                 - f64::from(selected.y() + selected.height() / 2.0))
             .abs()
                 < 1.0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn drawing_tool_switch_preserves_rectangle_zoom_viewport_and_image_navigation() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.ZoomToolSwitchTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.window.set_default_size(820, 620);
+        let image = image::RgbaImage::new(1_600, 1_200);
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.present();
+
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while (window.0.scrolled.hadjustment().page_size() <= 1.0
+            || window.0.scrolled.vadjustment().page_size() <= 1.0)
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        window.set_tool(Tool::Select);
+        let selection = CropOverlay {
+            x: 1_200,
+            y: 850,
+            width: 200,
+            height: 150,
+            image_width: 1_600,
+            image_height: 1_200,
+        };
+        window.set_region_selection(Some(selection));
+        assert!(window.zoom_selected_region());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::yield_now();
+        }
+        let horizontal = window.0.scrolled.hadjustment();
+        let vertical = window.0.scrolled.vadjustment();
+        window.0.pencil_button.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let before = (horizontal.value(), vertical.value());
+
+        window.0.pencil_button.set_active(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::yield_now();
+        }
+
+        assert_eq!(window.0.tool.get(), Tool::Pencil);
+        assert_eq!(
+            gtk::prelude::GtkWindowExt::focus(&window.0.window),
+            Some(window.0.canvas.clone().upcast()),
+            "drawing tool must retain keyboard focus on the canvas",
+        );
+        window.0.pencil_button.grab_focus();
+        let controllers = window.0.window.observe_controllers();
+        let arrow_was_handled = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::Right,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                )
+            });
+        assert!(
+            arrow_was_handled,
+            "Right must navigate while a drawing tool is active"
+        );
+        assert_eq!(window.0.keyboard_tool_cursor.get(), None);
+        assert!(
+            (horizontal.value() - before.0).abs() < 1.0,
+            "horizontal viewport jumped from {} to {}",
+            before.0,
+            horizontal.value(),
+        );
+        assert!(
+            (vertical.value() - before.1).abs() < 1.0,
+            "vertical viewport jumped from {} to {}",
+            before.1,
+            vertical.value(),
         );
     }
 

@@ -245,7 +245,7 @@ After displaying the current file:
 
 The image canvas supports:
 
-* Fit to window.
+* Fit to window, scaling images up or down to the largest contained size while preserving aspect ratio. The exact viewport ratio applies in both soft and hard modes, with no rounding to integer zoom multiples.
 * Fill window.
 * Actual size, or 100%.
 * Arbitrary zoom from 1% to at least 6400%.
@@ -275,6 +275,7 @@ A single toggle switches the rendering filter:
 The selected mode must be saved in GSettings and restored across application launches.
 
 In hard zoom, source pixels map to whole device pixels; see `docs/annotations-spec.md` §3 for the invariant.
+Displayed zoom percentages are measured in device pixels: 100% maps one source pixel to one physical display pixel, independent of fractional display scaling.
 
 ### 9.3 Transparency background
 
@@ -314,7 +315,7 @@ Required shortcuts:
 | Zoom in                 | + or Ctrl++        |
 | Zoom out                | - or Ctrl+-        |
 | Actual size             | 1                  |
-| Fit to window           | 2                  |
+| Fit to window           | 0 or keypad 0      |
 | Fill window             | 3                  |
 | Toggle soft/hard zoom   | X                  |
 | Previous image          | Left or Page Up    |
@@ -524,7 +525,7 @@ Resampling modes:
 * The outline uses animated alternating black and white dashes.
 * Eight draggable handles resize the corners and edge midpoints.
 * Contextual icon buttons zoom to, crop to, or copy the selected region.
-* Arrow keys and Shift+arrow position keyboard selection points.
+* Up/Down and Shift+arrow position keyboard selection points; unmodified Left/Right navigate images.
 * Enter zooms to the selected region.
 * Escape clears the selection, then exits the tool.
 

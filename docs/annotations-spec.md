@@ -1,5 +1,5 @@
 # Diorama — Annotation Tools, Tool Model and Hard-Zoom Alignment
-**Status:** Draft for review · **Target release:** 0.3.0 · **Supersedes:** spec.md §5.3 (tool rail), §17 (AI object selection), §18 controls list (partially)
+**Status:** Draft for review · **Target release:** 0.3.1 · **Supersedes:** spec.md §5.3 (tool rail), §17 (AI object selection), §18 controls list (partially)
 **Baseline:** working tree after the window-module refactor (commit 71f180b plus uncommitted `src/window/*` split)
 
 ## 0. Scope
@@ -99,8 +99,9 @@ Specification:
 - `ImageCanvas::snapshot()` (hard filter): `snapshot.scale(1/rs)`, then `append_scaled_texture(Nearest)` with device-pixel bounds; the rect origin is aligned so `surface_origin + x` is integral, where `surface_origin` = widget origin in surface coordinates (`compute_point` to the native + `surface_transform()`), and centring slack is absorbed by ±0.5 device px. Soft filter path unchanged.
 - One shared `layout()` feeds `snapshot()` and `image_bounds_for_texture()` so `pixel_at`, `normalized_at`, `crop_display_bounds` and the overlays match the drawn rect exactly.
 - `render_scale` uses `gdk::Surface::scale()` (f64) with `connect_scale_notify`; `normalized_render_scale` becomes a non-rounding `sanitized_render_scale` (finite, > 0).
-- `aligned_hard_zoom` and `stepped_hard_zoom` evaluate their guards in device space (`zoom × rs`) with a floor of 1 device pixel per source pixel. Behaviour change to accept: the minimum hard zoom is a true 1:1 device mapping (at 2× a 75 % request becomes 50 %; at 1.25× the "100 %" key yields 80 % logical). Zoom < 1 and unaligned pinch states keep Nearest with a snapped origin (uneven blocks during the gesture are inherent; `connect_end` re-aligns).
+- `aligned_hard_zoom` and `stepped_hard_zoom` evaluate their guards in device space (`zoom × rs`) with a floor of 1 device pixel per source pixel. User-facing percentages are also device-space values: the `1` shortcut always displays 100% and maps one source pixel to one device pixel, while the internal logical zoom is `1 / rs`. Zoom < 100% and unaligned pinch states keep Nearest with a snapped origin (uneven blocks during the gesture are inherent; `connect_end` re-aligns).
 - `preview_scale` multiplies `pixel_scale` before layout. `Overflow::Hidden` stays.
+- Fit (`0`), Fill, rectangle zoom, and comparison/scale-preview fitting use the exact viewport ratio without integer zoom snapping, including above 100%. Hard mode still uses nearest-neighbor rendering and a snapped origin; the filtering mode must not reduce the fitted image size.
 - Redraw on adjustment `value-changed` only when the device fraction of the surface origin changed (never fires at integer scales); Compare: `paned.connect_position_notify` → `queue_draw` on both canvases.
 - Hairline overlays use a shared `snap_to_device(v, rs) = round(v·rs)/rs` and `1/rs` thickness (crop border, measurement crosshair, selection outline, handles). The measurement crosshair is white in the top child of a `GskBlendNode` using `BlendMode::Difference`, producing an XOR-style inversion against every image colour.
 
@@ -217,8 +218,11 @@ enum AnnotationDrag {
 | `P` `O` `A` `M` `T` | any | toggle Pencil / Highlight / Arrow / Measure / Text |
 | Escape | see §2.1 | cancel in the defined order |
 | Delete, KP_Delete, BackSpace | annotation selected | delete it |
-| Arrow keys / Shift+Arrows | annotation selected | nudge 1 px / 10 px (coalesced) |
-| Arrow keys | no selection, annotation tool | move the keyboard cursor (existing mechanism) |
+| Left / Right | outside text entry | previous / next image, including while an annotation tool is active |
+| Up / Down | annotation selected | nudge vertically by 1 px (coalesced) |
+| Shift+Arrows | annotation selected | nudge by 10 px (coalesced) |
+| Up / Down | no selection, annotation tool | move the keyboard cursor vertically by 1 px |
+| Shift+Arrows | no selection, annotation tool | move the keyboard cursor by 10 px |
 | Space / Enter | no selection | keyboard creation at the cursor: Pencil creates an editable dot; Measure anchors then commits (as today); Highlight creates a 64×40 px rect centred on the cursor; Arrow creates an 80 px horizontal arrow; Text opens the editor at the cursor |
 | Enter | Text selected | open the text editor |
 | Ctrl+Z / Ctrl+Shift+Z | any | undo / redo |
