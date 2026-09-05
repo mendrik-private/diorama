@@ -3242,7 +3242,11 @@ impl ViewerWindow {
         self.0.canvas.clear_pencil_overlay();
         self.commit_annotation_preview(&annotation);
         self.apply(Operation::Annotate(AnnotationEdit::Create(annotation)));
-        self.select_annotation(Some(id));
+        if mode == PencilDragMode::Freehand && points.len() == 1 {
+            self.select_annotation(None);
+        } else {
+            self.select_annotation(Some(id));
+        }
         if mode == PencilDragMode::Line {
             self.0.pencil_line_annotation.set(Some(id));
         } else {
@@ -3280,11 +3284,15 @@ impl ViewerWindow {
     fn begin_pencil_drag(
         &self,
         canvas: &ImageCanvas,
+        button: u32,
         screen_x: f64,
         screen_y: f64,
         modifiers: gtk::gdk::ModifierType,
         timestamp_ms: u32,
     ) {
+        if button != 1 {
+            return;
+        }
         let Some(origin) = canvas
             .pixel_at(screen_x, screen_y)
             .map(|(x, y)| BrushPoint {
@@ -6383,6 +6391,7 @@ impl ViewerWindow {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 this.begin_pencil_drag(
                     &this.0.canvas,
+                    gesture.current_button(),
                     x,
                     y,
                     gesture.current_event_state(),
@@ -6445,6 +6454,7 @@ impl ViewerWindow {
                     return;
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.abort_pencil_drag();
                 let pixel = this.0.canvas.pixel_at(x, y).and_then(|(x, y)| {
                     this.0
                         .rendered
@@ -6507,6 +6517,7 @@ impl ViewerWindow {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 this.begin_pencil_drag(
                     &canvas,
+                    gesture.current_button(),
                     x,
                     y,
                     gesture.current_event_state(),
@@ -6572,6 +6583,8 @@ impl ViewerWindow {
                 if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                this.abort_pencil_drag();
                 let pixel = canvas.pixel_at(x, y).and_then(|(x, y)| {
                     this.0
                         .compare_rendered
@@ -6582,7 +6595,6 @@ impl ViewerWindow {
                 let Some(color) = pixel else {
                     return;
                 };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
                 this.apply_picked_color(color);
             }
         });
@@ -8433,6 +8445,87 @@ mod tests {
         assert_eq!(document.annotations().len(), 3);
         assert!(document.redo());
         assert_eq!(document.annotations().len(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn single_pixel_pencil_commit_does_not_select_resize_handles() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilPixelTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let pixels = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(pixels),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        let pixel = BrushPoint {
+            x: 8.5,
+            y: 8.5,
+            pressure: 1.0,
+        };
+
+        window.commit_editable_pencil_stroke(&[pixel], PencilDragMode::Freehand);
+
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .len(),
+            1
+        );
+        assert_eq!(window.0.selected_annotation.get(), None);
+
+        window.commit_editable_pencil_stroke(
+            &[
+                pixel,
+                BrushPoint {
+                    x: 16.5,
+                    y: 12.5,
+                    pressure: 1.0,
+                },
+            ],
+            PencilDragMode::Freehand,
+        );
+        assert!(window.0.selected_annotation.get().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn secondary_button_cannot_begin_pencil_drag() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.PencilSecondaryButtonTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.canvas.allocate(64, 64, -1, None);
+
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            3,
+            32.0,
+            32.0,
+            gtk::gdk::ModifierType::empty(),
+            0,
+        );
+
+        assert!(window.0.pencil_drag.borrow().is_none());
     }
 
     #[test]
