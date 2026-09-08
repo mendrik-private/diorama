@@ -10,6 +10,9 @@ use gtk::subclass::prelude::*;
 use crate::document::{Annotation, BrushPoint, PencilGeometry, Point, Shape, StrokePath};
 use crate::i18n::gettext;
 use crate::tools::annotation::hit::{HandleKind, handles};
+use crate::tools::annotation::pixel_font::{
+    CELL_HEIGHT as PIXEL_LABEL_HEIGHT, for_each_ink_pixel, text_width,
+};
 
 const MAX_FIT_ZOOM: f64 = 16_384.0;
 const COORDINATE_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
@@ -404,6 +407,10 @@ mod imp {
                 object.width().max(1) as f32,
                 object.height().max(1) as f32,
             );
+            let crop_overlay = *self.crop_overlay.borrow();
+            if crop_overlay.is_some() {
+                snapshot.push_blend(gtk::gsk::BlendMode::Difference);
+            }
             draw_background(
                 snapshot,
                 bounds,
@@ -523,15 +530,24 @@ mod imp {
                 draw_marker(snapshot, bounds, x, y);
             }
             if let Some(image_bounds) = image_bounds
-                && let Some(overlay) = self.crop_overlay.borrow().as_ref()
+                && let Some(overlay) = crop_overlay
             {
                 draw_crop_overlay(
                     snapshot,
                     image_bounds,
-                    overlay,
+                    &overlay,
                     self.render_scale.get(),
                     self.crop_dash_phase.get(),
                 );
+            }
+            if let Some(overlay) = crop_overlay {
+                // The completed canvas is the bottom of the Difference blend;
+                // labels make up its top child.
+                snapshot.pop();
+                if let Some(image_bounds) = image_bounds {
+                    draw_crop_labels(snapshot, overlay_rect(image_bounds, &overlay), &overlay);
+                }
+                snapshot.pop();
             }
         }
     }
@@ -998,6 +1014,46 @@ mod imp {
                 snapshot.append_fill(&builder.to_path(), gtk::gsk::FillRule::Winding, &color);
             }
         }
+    }
+
+    fn draw_crop_labels(
+        snapshot: &gtk::Snapshot,
+        rect: gtk::graphene::Rect,
+        overlay: &CropOverlay,
+    ) {
+        const GAP: f32 = 10.0;
+        let origin = format!("{}/{}", overlay.x, overlay.y);
+        let width = format!("{}px", overlay.width);
+        let height = format!("{}px", overlay.height);
+        let origin_position = (
+            rect.x() - text_width(&origin) / 2.0,
+            rect.y() - PIXEL_LABEL_HEIGHT - GAP,
+        );
+        let width_position = (
+            rect.x() + (rect.width() - text_width(&width)) / 2.0,
+            rect.y() - PIXEL_LABEL_HEIGHT - GAP,
+        );
+        let height_position = (
+            rect.x() + rect.width() + GAP,
+            rect.y() + (rect.height() - PIXEL_LABEL_HEIGHT) / 2.0,
+        );
+        let labels = [
+            (origin, origin_position),
+            (width, width_position),
+            (height, height_position),
+        ];
+        for (text, (x, y)) in labels {
+            draw_crop_label(snapshot, x, y, &text);
+        }
+    }
+
+    fn draw_crop_label(snapshot: &gtk::Snapshot, x: f32, y: f32, text: &str) {
+        for_each_ink_pixel(text, |column, row| {
+            snapshot.append_color(
+                &gdk::RGBA::WHITE,
+                &gtk::graphene::Rect::new(x + column as f32, y + row as f32, 1.0, 1.0),
+            );
+        });
     }
 
     fn draw_background(

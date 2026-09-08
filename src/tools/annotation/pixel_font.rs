@@ -44,6 +44,7 @@ fn glyph_rows(character: char) -> [u8; 7] {
         '9' => [0, 0b0110, 0b1001, 0b0111, 0b0001, 0b1110, 0],
         'p' => [0, 0, 0b1110, 0b1001, 0b1110, 0b1000, 0b1000],
         'x' => [0, 0, 0b1001, 0b0110, 0b0110, 0b1001, 0],
+        '/' => [0, 0b0001, 0b0010, 0b0010, 0b0100, 0b1000, 0],
         ' ' => [0; 7],
         _ => [0, 0b0110, 0b1001, 0b0010, 0, 0b0010, 0],
     }
@@ -80,5 +81,9 @@ mod tests {
         assert_eq!(p_rows.iter().copied().max(), Some(6));
         assert_eq!(x_rows.iter().copied().min(), Some(2));
         assert_eq!(x_rows.iter().copied().max(), Some(5));
+
+        let mut slash_rows = Vec::new();
+        for_each_ink_pixel("/", |_, y| slash_rows.push(y));
+        assert_eq!(slash_rows, [1, 2, 3, 4, 5]);
     }
 }

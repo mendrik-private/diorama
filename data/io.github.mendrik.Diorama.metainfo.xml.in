@@ -15,6 +15,11 @@
   <launchable type="desktop-id">io.github.mendrik.Diorama.desktop</launchable>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.4" date="2026-09-08">
+      <description>
+        <p>Adds live coordinate and dimension labels to region selections.</p>
+      </description>
+    </release>
     <release version="0.3.3" date="2026-09-08">
       <description>
         <p>Adds native image printing with paper and printer selection, and keeps the minimap visibility in sync with zooming and viewport resizing.</p>
