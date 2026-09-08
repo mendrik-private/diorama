@@ -1,5 +1,5 @@
 {
-  "app-id": "io.github.mendrik.Diorama",
+  "app-id": "io.github.mendrik_private.Diorama",
   "runtime": "org.gnome.Platform",
   "runtime-version": "50",
   "sdk": "org.gnome.Sdk",
@@ -12,8 +12,9 @@
     "--socket=wayland",
     "--socket=fallback-x11",
     "--device=dri",
-    "--filesystem=host",
-    "--talk-name=org.freedesktop.portal.Desktop"
+    "--filesystem=xdg-pictures",
+    "--filesystem=/media",
+    "--filesystem=/run/media"
   ],
   "modules": [
     {
@@ -56,7 +57,15 @@
             ".github",
             ".flatpak-builder",
             "build",
-            "target"
+            "target",
+            "build-local",
+            "build-local-stable",
+            "build-property-fix",
+            "build-release",
+            "build-repo",
+            ".rust-repo-intelligence",
+            "Diorama.flatpak",
+            "Diorama.flatpak.sha256"
           ]
         },
         "cargo-sources.json"

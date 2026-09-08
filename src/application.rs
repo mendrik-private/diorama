@@ -111,7 +111,7 @@ pub fn build() -> adw::Application {
         .build();
 
     application.connect_startup(|application| {
-        application.set_resource_base_path(Some("/io/github/mendrik/Diorama"));
+        application.set_resource_base_path(Some("/io/github/mendrik_private/Diorama"));
         install_accelerators(application.upcast_ref());
     });
     application.connect_activate(|application| {

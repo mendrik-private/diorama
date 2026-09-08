@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="data/icons/hicolor/scalable/apps/io.github.mendrik.Diorama.svg" width="128" height="128" alt="Diorama application icon">
+  <img src="data/icons/hicolor/scalable/apps/io.github.mendrik_private.Diorama.svg" width="128" height="128" alt="Diorama application icon">
 </p>
 
 <h1 align="center">Diorama</h1>
@@ -218,7 +218,7 @@ then run:
 
 ```sh
 flatpak install --user ./Diorama.flatpak
-flatpak run io.github.mendrik.Diorama
+flatpak run io.github.mendrik_private.Diorama
 ```
 
 The bundle uses the GNOME 50 runtime. Flatpak will offer to install the runtime
@@ -233,8 +233,8 @@ provides the expected GNOME SDK and Rust toolchain:
 flatpak remote-add --user --if-not-exists flathub \
   https://flathub.org/repo/flathub.flatpakrepo
 flatpak-builder --user --install-deps-from=flathub --install --force-clean \
-  build build-aux/io.github.mendrik.Diorama.Devel.json
-flatpak run io.github.mendrik.Diorama
+  build build-aux/io.github.mendrik_private.Diorama.Devel.json
+flatpak run io.github.mendrik_private.Diorama
 ```
 
 For a native build, install Rust 1.92 or newer, Meson 1.3 or newer, Ninja,

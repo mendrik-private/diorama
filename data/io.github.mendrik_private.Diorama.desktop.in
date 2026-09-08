@@ -2,7 +2,7 @@
 Name=Diorama
 Comment=View, compare, and edit images
 Exec=diorama %U
-Icon=io.github.mendrik.Diorama
+Icon=io.github.mendrik_private.Diorama
 Terminal=false
 Type=Application
 Categories=Graphics;Viewer;

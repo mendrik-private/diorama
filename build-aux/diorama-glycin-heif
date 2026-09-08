@@ -1,6 +1,10 @@
 #!/bin/sh
 
-codec_path=/usr/lib/x86_64-linux-gnu/codecs-extra/lib
-export LD_LIBRARY_PATH="${codec_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+for codec_path in /usr/lib/*-linux-gnu/codecs-extra/lib; do
+    if [ -d "$codec_path" ]; then
+        export LD_LIBRARY_PATH="${codec_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        break
+    fi
+done
 
 exec /usr/libexec/glycin-loaders/2+/glycin-heif "$@"

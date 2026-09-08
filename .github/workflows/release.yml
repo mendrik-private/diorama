@@ -33,15 +33,15 @@ jobs:
           test "v${package_version}" = "$GITHUB_REF_NAME"
           grep -Fq "version: '${package_version}'" meson.build
           grep -Fq "<release version=\"${package_version}\"" \
-            data/io.github.mendrik.Diorama.metainfo.xml.in
+            data/io.github.mendrik_private.Diorama.metainfo.xml.in
 
       - name: Use development application ID
         run: |
           sed -i \
-            's/"app-id": "io.github.mendrik.Diorama"/"app-id": "io.github.mendrik.Diorama.Devel"/' \
-            build-aux/io.github.mendrik.Diorama.Devel.json
-          grep -Fq '"app-id": "io.github.mendrik.Diorama.Devel"' \
-            build-aux/io.github.mendrik.Diorama.Devel.json
+            's/"app-id": "io.github.mendrik_private.Diorama"/"app-id": "io.github.mendrik_private.Diorama.Devel"/' \
+            build-aux/io.github.mendrik_private.Diorama.Devel.json
+          grep -Fq '"app-id": "io.github.mendrik_private.Diorama.Devel"' \
+            build-aux/io.github.mendrik_private.Diorama.Devel.json
 
       - name: Install image codec extension
         run: >-
@@ -51,7 +51,7 @@ jobs:
       - name: Build and test development Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
         with:
-          manifest-path: build-aux/io.github.mendrik.Diorama.Devel.json
+          manifest-path: build-aux/io.github.mendrik_private.Diorama.Devel.json
           build-bundle: false
           run-tests: true
           upload-artifact: false
@@ -60,19 +60,19 @@ jobs:
       - name: Restore release application ID
         run: |
           sed -i \
-            's/"app-id": "io.github.mendrik.Diorama.Devel"/"app-id": "io.github.mendrik.Diorama"/' \
-            build-aux/io.github.mendrik.Diorama.Devel.json
-          grep -Fq '"app-id": "io.github.mendrik.Diorama"' \
-            build-aux/io.github.mendrik.Diorama.Devel.json
+            's/"app-id": "io.github.mendrik_private.Diorama.Devel"/"app-id": "io.github.mendrik_private.Diorama"/' \
+            build-aux/io.github.mendrik_private.Diorama.Devel.json
+          grep -Fq '"app-id": "io.github.mendrik_private.Diorama"' \
+            build-aux/io.github.mendrik_private.Diorama.Devel.json
 
       - name: Build release Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
         with:
           bundle: Diorama.flatpak
-          manifest-path: build-aux/io.github.mendrik.Diorama.Devel.json
+          manifest-path: build-aux/io.github.mendrik_private.Diorama.Devel.json
           branch: stable
           upload-artifact: false
-          cache-key: flatpak-release-${{ hashFiles('Cargo.lock', 'build-aux/io.github.mendrik.Diorama.Devel.json', 'build-aux/cargo-sources.json') }}
+          cache-key: flatpak-release-${{ hashFiles('Cargo.lock', 'build-aux/io.github.mendrik_private.Diorama.Devel.json', 'build-aux/cargo-sources.json') }}
 
       - name: Create checksum
         run: sha256sum Diorama.flatpak > Diorama.flatpak.sha256

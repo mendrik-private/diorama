@@ -1,20 +1,39 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.mendrik.Diorama</id>
+  <id>io.github.mendrik_private.Diorama</id>
   <name>Diorama</name>
   <summary>View, compare, and edit images</summary>
-  <developer id="io.github.mendrik">
+  <developer id="io.github.mendrik_private">
     <name>Mendrik</name>
   </developer>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-only</project_license>
   <description>
     <p>Diorama is a fast native GNOME image viewer for browsing, comparing, and making focused non-destructive edits to images.</p>
+    <p>Inspect pixel details, compare related images side by side, and annotate with drawings, arrows, measurements, and text. Crop, resize, and export images while keeping edits reversible during your session.</p>
   </description>
   <url type="homepage">https://github.com/mendrik-private/diorama</url>
-  <launchable type="desktop-id">io.github.mendrik.Diorama.desktop</launchable>
+  <url type="bugtracker">https://github.com/mendrik-private/diorama/issues</url>
+  <url type="vcs-browser">https://github.com/mendrik-private/diorama</url>
+  <translation type="gettext">diorama</translation>
+  <launchable type="desktop-id">io.github.mendrik_private.Diorama.desktop</launchable>
   <content_rating type="oars-1.1" />
+  <screenshots>
+    <screenshot type="default">
+      <image width="1280" height="800">https://raw.githubusercontent.com/mendrik-private/diorama/v0.3.5/data/screenshots/browse.png</image>
+      <caption>Browse images and inspect pixel art</caption>
+    </screenshot>
+    <screenshot>
+      <image width="1280" height="800">https://raw.githubusercontent.com/mendrik-private/diorama/v0.3.5/data/screenshots/selection.png</image>
+      <caption>Select a region with live coordinates and dimensions</caption>
+    </screenshot>
+  </screenshots>
   <releases>
+    <release version="0.3.5" date="2026-09-08">
+      <description>
+        <p>Adopts the io.github.mendrik_private.Diorama application ID, narrows filesystem permissions to Pictures and removable media, and adds store screenshots and portable HEIF codec discovery.</p>
+      </description>
+    </release>
     <release version="0.3.4" date="2026-09-08">
       <description>
         <p>Adds live coordinate and dimension labels to region selections.</p>

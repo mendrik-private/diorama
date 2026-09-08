@@ -273,7 +273,7 @@ Right-click sampling and the Pencil preference controls are unchanged. The size 
 
 ## 8. Settings and shortcuts
 
-GSettings (`data/io.github.mendrik.Diorama.gschema.xml`, `src/settings.rs`):
+GSettings (`data/io.github.mendrik_private.Diorama.gschema.xml`, `src/settings.rs`):
 
 | Key | Type | Default | Change |
 |---|---|---|---|

@@ -1,27 +1,27 @@
 gnome.compile_schemas(build_by_default: true)
 
 install_data(
-  'io.github.mendrik.Diorama.gschema.xml',
+  'io.github.mendrik_private.Diorama.gschema.xml',
   install_dir: get_option('datadir') / 'glib-2.0' / 'schemas',
 )
 i18n.merge_file(
-  input: 'io.github.mendrik.Diorama.desktop.in',
-  output: 'io.github.mendrik.Diorama.desktop',
+  input: 'io.github.mendrik_private.Diorama.desktop.in',
+  output: 'io.github.mendrik_private.Diorama.desktop',
   type: 'desktop',
   po_dir: '../po',
   install: true,
   install_dir: get_option('datadir') / 'applications',
 )
 i18n.merge_file(
-  input: 'io.github.mendrik.Diorama.metainfo.xml.in',
-  output: 'io.github.mendrik.Diorama.metainfo.xml',
+  input: 'io.github.mendrik_private.Diorama.metainfo.xml.in',
+  output: 'io.github.mendrik_private.Diorama.metainfo.xml',
   type: 'xml',
   po_dir: '../po',
   install: true,
   install_dir: get_option('datadir') / 'metainfo',
 )
 install_data(
-  'icons/hicolor/scalable/apps/io.github.mendrik.Diorama.svg',
+  'icons/hicolor/scalable/apps/io.github.mendrik_private.Diorama.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
 )
 install_data(
@@ -41,5 +41,9 @@ install_data(
 )
 install_data(
   'fonts/OFL-Excalifont.txt',
-  install_dir: get_option('datadir') / 'doc' / meson.project_name(),
+  install_dir: get_option('datadir') / 'licenses' / 'io.github.mendrik_private.Diorama',
+)
+install_data(
+  '../LICENSE',
+  install_dir: get_option('datadir') / 'licenses' / 'io.github.mendrik_private.Diorama',
 )

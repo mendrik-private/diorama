@@ -63,6 +63,9 @@ use zoom::{
 #[derive(Clone)]
 pub struct ViewerWindow(Rc<WindowState>);
 
+#[cfg(test)]
+mod screenshots;
+
 struct HeaderWidgets {
     header: adw::HeaderBar,
     save_as_button: gtk::Button,
@@ -7576,7 +7579,7 @@ mod tests {
     fn open_with_action_uses_an_always_ask_writable_launcher() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.OpenWithTest")
+            .application_id("io.github.mendrik_private.Diorama.OpenWithTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -7757,7 +7760,7 @@ mod tests {
     fn annotation_palette_icons_resolve_without_installing_the_app() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.AnnotationIconTest")
+            .application_id("io.github.mendrik_private.Diorama.AnnotationIconTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -7783,7 +7786,7 @@ mod tests {
     fn tool_state_clears_selection_and_eyedropper_escape_returns_to_its_tool() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ToolStateTest")
+            .application_id("io.github.mendrik_private.Diorama.ToolStateTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -7841,7 +7844,7 @@ mod tests {
     fn select_is_the_resting_tool_and_escape_cannot_deactivate_it() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.SelectRestingToolTest")
+            .application_id("io.github.mendrik_private.Diorama.SelectRestingToolTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -7876,7 +7879,7 @@ mod tests {
     fn keyboard_creation_matches_the_pencil_highlight_and_arrow_spec() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.KeyboardAnnotationTest")
+            .application_id("io.github.mendrik_private.Diorama.KeyboardAnnotationTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -7961,7 +7964,7 @@ mod tests {
     fn inline_text_editor_commits_renderable_text_and_delete_removes_it() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.InlineTextTest")
+            .application_id("io.github.mendrik_private.Diorama.InlineTextTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8060,7 +8063,7 @@ mod tests {
     fn nudge_coalescing_never_absorbs_a_separate_style_edit() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.NudgeHistoryTest")
+            .application_id("io.github.mendrik_private.Diorama.NudgeHistoryTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8156,7 +8159,7 @@ mod tests {
     fn selection_tool_shows_region_actions_and_keeps_the_selection_after_copy() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.SelectionClipboardTest")
+            .application_id("io.github.mendrik_private.Diorama.SelectionClipboardTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8224,7 +8227,7 @@ mod tests {
     fn copy_image_action_places_the_complete_canvas_texture_on_the_clipboard() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ImageClipboardTest")
+            .application_id("io.github.mendrik_private.Diorama.ImageClipboardTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8253,7 +8256,7 @@ mod tests {
     fn color_picker_updates_the_pencil_color_and_works_with_the_lens() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ColorPickerButtonTest")
+            .application_id("io.github.mendrik_private.Diorama.ColorPickerButtonTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8296,7 +8299,7 @@ mod tests {
     fn pencil_color_sampling_forgets_any_pending_line_origin() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilSamplingStateTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilSamplingStateTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8320,7 +8323,7 @@ mod tests {
     fn annotation_palette_is_contextual_and_pencil_settings_define_each_stroke() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilControlsTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilControlsTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8369,7 +8372,7 @@ mod tests {
     fn every_pencil_drag_mode_commits_an_editable_annotation_node() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilCommitTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilCommitTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8465,7 +8468,7 @@ mod tests {
     fn single_pixel_pencil_commit_does_not_select_resize_handles() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilPixelTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilPixelTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -8519,7 +8522,7 @@ mod tests {
     fn secondary_button_cannot_begin_pencil_drag() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilSecondaryButtonTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilSecondaryButtonTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -8546,7 +8549,7 @@ mod tests {
     fn ctrl_line_chain_is_one_annotation_with_every_vertex_handle() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PencilLineChainTest")
+            .application_id("io.github.mendrik_private.Diorama.PencilLineChainTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8644,7 +8647,7 @@ mod tests {
 
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.UnifiedPropertiesTest")
+            .application_id("io.github.mendrik_private.Diorama.UnifiedPropertiesTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8755,7 +8758,7 @@ mod tests {
     fn annotation_tools_share_the_canvas_palette_and_have_window_actions() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.EditMenuTest")
+            .application_id("io.github.mendrik_private.Diorama.EditMenuTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8830,7 +8833,7 @@ mod tests {
     fn empty_and_loaded_states_drive_content_and_action_availability() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ContentStateTest")
+            .application_id("io.github.mendrik_private.Diorama.ContentStateTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8882,7 +8885,7 @@ mod tests {
     fn keyboard_region_cursor_selects_source_pixels_without_pointer_input() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.KeyboardCropTest")
+            .application_id("io.github.mendrik_private.Diorama.KeyboardCropTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -8929,7 +8932,7 @@ mod tests {
     fn arrow_tool_keeps_the_selected_line_thickness() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ArrowThicknessTest")
+            .application_id("io.github.mendrik_private.Diorama.ArrowThicknessTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9000,7 +9003,7 @@ mod tests {
 
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ScaleLayoutTest")
+            .application_id("io.github.mendrik_private.Diorama.ScaleLayoutTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9092,7 +9095,7 @@ mod tests {
     fn scale_action_enables_after_the_editable_decode() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ScaleActivationTest")
+            .application_id("io.github.mendrik_private.Diorama.ScaleActivationTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9134,7 +9137,7 @@ mod tests {
     fn fit_action_enlarges_small_images_to_the_largest_contained_size() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.SmallImageFitTest")
+            .application_id("io.github.mendrik_private.Diorama.SmallImageFitTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9182,7 +9185,7 @@ mod tests {
     fn fit_action_stays_locked_to_each_scale_preview_size() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ScaleFitTest")
+            .application_id("io.github.mendrik_private.Diorama.ScaleFitTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9217,7 +9220,7 @@ mod tests {
     fn scale_controls_keep_dimensions_units_and_properties_method_in_sync() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ScaleDraftTest")
+            .application_id("io.github.mendrik_private.Diorama.ScaleDraftTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9305,7 +9308,7 @@ mod tests {
     fn multiple_opened_files_seed_one_explicit_navigation_sequence() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.MultiFileOpenTest")
+            .application_id("io.github.mendrik_private.Diorama.MultiFileOpenTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9331,7 +9334,7 @@ mod tests {
     fn new_window_fit_waits_for_the_real_viewport_and_downscales_large_images() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.InitialFitTest")
+            .application_id("io.github.mendrik_private.Diorama.InitialFitTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9370,7 +9373,7 @@ mod tests {
     fn actual_size_and_fit_use_device_pixel_percentages_at_fractional_scaling() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.PhysicalZoomTest")
+            .application_id("io.github.mendrik_private.Diorama.PhysicalZoomTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9413,7 +9416,7 @@ mod tests {
     fn fit_between_one_and_two_device_pixels_fills_the_viewport() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.FractionalFitTest")
+            .application_id("io.github.mendrik_private.Diorama.FractionalFitTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -9464,7 +9467,7 @@ mod tests {
     fn minimap_visibility_tracks_fit_zoom_and_viewport_resize_without_panning() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.MinimapVisibilityTest")
+            .application_id("io.github.mendrik_private.Diorama.MinimapVisibilityTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -9522,7 +9525,7 @@ mod tests {
     fn selected_region_remains_available_after_copy_and_zoom() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ZoomRectangleTest")
+            .application_id("io.github.mendrik_private.Diorama.ZoomRectangleTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9599,7 +9602,7 @@ mod tests {
     fn drawing_tool_switch_preserves_rectangle_zoom_viewport_and_image_navigation() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.ZoomToolSwitchTest")
+            .application_id("io.github.mendrik_private.Diorama.ZoomToolSwitchTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9713,7 +9716,7 @@ mod tests {
     fn zoom_to_large_selected_region_fits_and_centers_in_the_actual_viewport() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.LargeSelectionZoomTest")
+            .application_id("io.github.mendrik_private.Diorama.LargeSelectionZoomTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application
@@ -9803,7 +9806,7 @@ mod tests {
     fn compare_mode_round_trip_restores_overlay_and_disconnects_session_state() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik.Diorama.CompareLifecycleTest")
+            .application_id("io.github.mendrik_private.Diorama.CompareLifecycleTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application

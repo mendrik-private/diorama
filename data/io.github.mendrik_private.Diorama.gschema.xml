@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
-  <schema id="io.github.mendrik.Diorama" path="/io/github/mendrik/Diorama/">
+  <schema id="io.github.mendrik_private.Diorama" path="/io/github/mendrik_private/Diorama/">
     <key name="zoom-filter" type="s"><default>'hard'</default></key>
     <key name="transparency-background" type="s"><default>'gray'</default></key>
     <key name="window-width" type="i"><default>1000</default></key>

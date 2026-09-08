@@ -15,7 +15,7 @@ use gio::prelude::*;
 
 pub use error::AppError;
 
-pub(crate) const APP_ID: &str = "io.github.mendrik.Diorama";
+pub(crate) const APP_ID: &str = "io.github.mendrik_private.Diorama";
 
 pub fn run() -> glib::ExitCode {
     tracing_subscriber::fmt()

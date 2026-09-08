@@ -17,27 +17,27 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: data/io.github.mendrik.Diorama.desktop.in:2
-#: data/io.github.mendrik.Diorama.metainfo.xml.in:4
+#: data/io.github.mendrik_private.Diorama.desktop.in:2
+#: data/io.github.mendrik_private.Diorama.metainfo.xml.in:4
 msgid "Diorama"
 msgstr ""
 
-#: data/io.github.mendrik.Diorama.desktop.in:3
-#: data/io.github.mendrik.Diorama.metainfo.xml.in:5
+#: data/io.github.mendrik_private.Diorama.desktop.in:3
+#: data/io.github.mendrik_private.Diorama.metainfo.xml.in:5
 msgid "View, compare, and edit images"
 msgstr ""
 
-#: data/io.github.mendrik.Diorama.metainfo.xml.in:7
+#: data/io.github.mendrik_private.Diorama.metainfo.xml.in:7
 msgid "Mendrik"
 msgstr ""
 
-#: data/io.github.mendrik.Diorama.metainfo.xml.in:12
+#: data/io.github.mendrik_private.Diorama.metainfo.xml.in:12
 msgid ""
 "Diorama is a fast native GNOME image viewer for browsing, comparing, and "
 "making focused non-destructive edits to images."
 msgstr ""
 
-#: data/io.github.mendrik.Diorama.metainfo.xml.in:20
+#: data/io.github.mendrik_private.Diorama.metainfo.xml.in:20
 msgid ""
 "Adds editable vector highlights, arrows, measurements, and curved text; "
 "improves pixel-perfect zoom under fractional scaling; and removes object-"
