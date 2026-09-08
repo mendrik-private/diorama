@@ -21,8 +21,8 @@ i18n.merge_file(
   install_dir: get_option('datadir') / 'metainfo',
 )
 install_data(
-  'icons/hicolor/scalable/apps/io.github.mendrik_private.Diorama.svg',
-  install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
+  'icons/hicolor/1254x1254/apps/io.github.mendrik_private.Diorama.png',
+  install_dir: get_option('datadir') / 'icons' / 'hicolor' / '1254x1254' / 'apps',
 )
 install_data(
   'icons/hicolor/scalable/actions/ruler-measure-symbolic.svg',

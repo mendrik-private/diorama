@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="data/icons/hicolor/scalable/apps/io.github.mendrik_private.Diorama.svg" width="128" height="128" alt="Diorama application icon">
+  <img src="data/icons/hicolor/1254x1254/apps/io.github.mendrik_private.Diorama.png" width="128" height="128" alt="Diorama application icon">
 </p>
 
 <h1 align="center">Diorama</h1>
@@ -26,6 +26,20 @@ export.
 > [!NOTE]
 > Diorama is under active development. File-format support and editing behavior
 > may change before the first stable release.
+
+## See Diorama in action
+
+Compare related images with synchronized views and magnified pixel details.
+
+![Side-by-side image comparison with inspection lenses](data/screenshots/compare-lenses.png)
+
+Inspect individual pixels without losing sight of the whole image.
+
+![Pixel inspection lens over shrine artwork](data/screenshots/pixel-lens.png)
+
+Mark what matters with drawings, curved arrows, and text, then export the result.
+
+![Exported shrine artwork with red circles, an arrow, and a handwritten label](data/screenshots/shrine-annotated.png)
 
 ## Made for visual work
 
