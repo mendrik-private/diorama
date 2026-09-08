@@ -190,6 +190,7 @@ modern formats depends on the codecs supplied by the installed GNOME runtime.
 | Open | Ctrl+O |
 | Copy image or selection | Ctrl+C |
 | Save / Save As | Ctrl+S / Ctrl+Shift+S |
+| Print | Ctrl+P |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Fit / actual size | 0 / 1 |
 | Zoom 200%–900% | 2–9 |

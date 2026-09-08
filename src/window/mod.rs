@@ -35,6 +35,7 @@ mod annotation;
 mod color;
 mod file_state;
 mod presentation;
+mod print;
 mod scale;
 mod tool;
 mod zoom;
@@ -1423,6 +1424,10 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.save(true)
         });
+        self.add_action("print", {
+            let this = self.clone();
+            move || this.print()
+        });
         self.add_action("cancel-export", {
             let this = self.clone();
             move || {
@@ -2160,6 +2165,7 @@ impl ViewerWindow {
 
         for action in [
             "copy-image",
+            "print",
             "zoom-in",
             "zoom-out",
             "actual-size",
@@ -4291,6 +4297,7 @@ impl ViewerWindow {
                     (gettext("Copy Image or Selection"), "<Control>c"),
                     (gettext("Save"), "<Control>s"),
                     (gettext("Save As"), "<Control><Shift>s"),
+                    (gettext("Print"), "<Control>p"),
                     (gettext("Close"), "<Control>w"),
                     (gettext("Preferences"), "<Control>comma"),
                 ],
@@ -5642,6 +5649,11 @@ impl ViewerWindow {
         });
         self.0.minimap.add_controller(drag);
         for adjustment in [self.0.scrolled.hadjustment(), self.0.scrolled.vadjustment()] {
+            // Fit, zoom, and resize can change the scrollable range without moving it.
+            adjustment.connect_changed({
+                let this = self.clone();
+                move |_| this.update_minimap()
+            });
             let this = self.clone();
             adjustment.connect_value_changed(move |_| {
                 this.0.canvas.queue_draw_if_device_phase_changed();
@@ -6822,6 +6834,7 @@ fn main_menu() -> gio::Menu {
     menu_item(&menu, "Copy Image or Selection", "win.copy-image");
     menu_item(&menu, "Save", "win.save");
     menu_item(&menu, "Save As…", "win.save-as");
+    menu_item(&menu, "Print…", "win.print");
     menu_item(&menu, "Compare Images…", "win.compare");
     let edit_menu = gio::Menu::new();
     menu_item(&edit_menu, "Pencil", "win.pencil");
@@ -9443,6 +9456,64 @@ mod tests {
                 .unwrap();
             assert!((drawn.width() - viewport.0 as f32).abs() < 1.0);
             assert!(drawn.height() <= viewport.1 as f32 + 1.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn minimap_visibility_tracks_fit_zoom_and_viewport_resize_without_panning() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik.Diorama.MinimapVisibilityTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::new(1_600, 1_200);
+        let texture = texture_from_rgba(&image).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
+        let horizontal = window.0.scrolled.hadjustment();
+        let vertical = window.0.scrolled.vadjustment();
+
+        for filter in [ZoomFilter::Hard, ZoomFilter::Soft] {
+            window.0.canvas.set_filter(filter);
+            window.set_zoom(1.0);
+            window.0.scrolled.allocate(800, 600, -1, None);
+            window.update_minimap();
+            assert!(window.0.minimap.get_visible());
+
+            window.fit(false);
+            window.0.scrolled.allocate(800, 600, -1, None);
+            assert!(horizontal.upper() - horizontal.lower() <= horizontal.page_size());
+            assert!(vertical.upper() - vertical.lower() <= vertical.page_size());
+            assert!(
+                !window.0.minimap.get_visible(),
+                "{filter:?}: fitting the image must hide the minimap when panning is impossible"
+            );
+
+            window.set_zoom(1.0);
+            window.0.scrolled.allocate(800, 600, -1, None);
+            assert!(
+                window.0.minimap.get_visible(),
+                "{filter:?}: zooming in must show the minimap without first panning"
+            );
+
+            for (width, height, visible) in [
+                (1_800, 1_400, false),
+                (800, 1_400, true),
+                (1_800, 1_400, false),
+                (1_800, 600, true),
+            ] {
+                window.0.scrolled.allocate(width, height, -1, None);
+                assert_eq!(
+                    window.0.minimap.get_visible(),
+                    visible,
+                    "{filter:?}: minimap visibility after resizing to {width}×{height}"
+                );
+            }
+            assert_eq!(horizontal.value(), 0.0);
+            assert_eq!(vertical.value(), 0.0);
         }
     }
 

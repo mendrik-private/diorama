@@ -11,6 +11,7 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.copy-image", &["<Control>c"]),
     ("win.save", &["<Control>s"]),
     ("win.save-as", &["<Control><Shift>s"]),
+    ("win.print", &["<Control>p"]),
     ("win.close", &["<Control>w"]),
     ("win.preferences", &["<Control>comma"]),
     ("win.shortcuts", &["<Control>question"]),

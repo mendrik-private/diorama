@@ -15,6 +15,11 @@
   <launchable type="desktop-id">io.github.mendrik.Diorama.desktop</launchable>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.3" date="2026-09-08">
+      <description>
+        <p>Adds native image printing with paper and printer selection, and keeps the minimap visibility in sync with zooming and viewport resizing.</p>
+      </description>
+    </release>
     <release version="0.3.2" date="2026-09-05">
       <description>
         <p>Improves the Pencil so click-only dots are committed without resize controls and right-click color sampling cannot leave stray marks, and introduces a product-focused feature guide.</p>

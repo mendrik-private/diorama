@@ -7,7 +7,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use crate::document::{Annotation, BrushPoint, Point, Shape, StrokePath};
+use crate::document::{Annotation, BrushPoint, PencilGeometry, Point, Shape, StrokePath};
 use crate::i18n::gettext;
 use crate::tools::annotation::hit::{HandleKind, handles};
 
@@ -677,6 +677,12 @@ mod imp {
         };
         let mut outline = Vec::new();
         match &selection.annotation.shape {
+            Shape::Pencil {
+                geometry: PencilGeometry::Freehand(_),
+                ..
+            } => {
+                // Keep the drawn pixels unobscured; resize handles indicate selection.
+            }
             Shape::Pencil { geometry, .. } => {
                 outline = crate::tools::annotation::pencil::outline_points(geometry);
             }
@@ -1997,6 +2003,69 @@ mod tests {
             16,
             "eight handles must each have an outer and inner node"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn selected_freehand_draws_handles_without_a_vector_outline() {
+        gtk::init().expect("GTK display initialization");
+        for anti_aliasing in [false, true] {
+            for zoom in [1.0, 8.0] {
+                let snapshot = gtk::Snapshot::new();
+                imp::draw_annotation_selection(
+                    &snapshot,
+                    gtk::graphene::Rect::new(0.0, 0.0, 100.0 * zoom, 80.0 * zoom),
+                    (100, 80),
+                    &SelectionHandles {
+                        annotation: Annotation {
+                            id: AnnotationId(1),
+                            shape: Shape::Pencil {
+                                geometry: PencilGeometry::Freehand(vec![
+                                    BrushPoint {
+                                        x: 10.0,
+                                        y: 10.0,
+                                        pressure: 0.25,
+                                    },
+                                    BrushPoint {
+                                        x: 50.0,
+                                        y: 40.0,
+                                        pressure: 1.0,
+                                    },
+                                    BrushPoint {
+                                        x: 20.0,
+                                        y: 60.0,
+                                        pressure: 0.5,
+                                    },
+                                ]),
+                                style: StrokeStyle {
+                                    color: [255, 0, 0, 255],
+                                    width: 3.0,
+                                },
+                                anti_aliasing,
+                            },
+                        },
+                        hot: None,
+                    },
+                    1.0,
+                );
+
+                let node = snapshot.to_node().expect("freehand selection render node");
+                let container = node
+                    .downcast::<gtk::gsk::ContainerNode>()
+                    .expect("resize handle container");
+                for index in 0..container.n_children() {
+                    assert!(
+                        container.child(index).is::<gtk::gsk::ColorNode>(),
+                        "freehand selection must contain only handles, without a vector outline"
+                    );
+                }
+                assert_eq!(
+                    container.n_children(),
+                    16,
+                    "eight resize handles must retain their outer and inner nodes"
+                );
+            }
+        }
     }
 
     #[test]
