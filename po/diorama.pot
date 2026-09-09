@@ -233,18 +233,8 @@ msgstr ""
 msgid "Diorama contributors"
 msgstr ""
 
-#: src/window/mod.rs:1836
-msgid ""
-"Use Up and Down to move, Shift with an arrow to move faster, and Space or "
-"Enter to act. Left and Right change images."
-msgstr ""
-
 #: src/window/mod.rs:1927
 msgid "Column {column}, row {row}"
-msgstr ""
-
-#: src/window/mod.rs:2053
-msgid "Start point set. Move to the end point and press Space or Enter."
 msgstr ""
 
 #: src/window/mod.rs:2112 src/window/mod.rs:6350
@@ -760,7 +750,7 @@ msgid "Choose Comparison Image"
 msgstr ""
 
 #: src/window/mod.rs:4826
-msgid "Comparison image B"
+msgid "Comparison image B, read-only"
 msgstr ""
 
 #: src/window/mod.rs:4829
@@ -943,4 +933,27 @@ msgstr ""
 
 #: src/window/annotation.rs:794
 msgid "Type annotation text; press Enter to commit or Escape to cancel"
+msgstr ""
+
+
+#: src/window/mod.rs:1868
+msgid ""
+"Use Up and Down to move, Shift with an arrow to move faster, and Enter to "
+"act. Left and Right change images."
+msgstr ""
+
+#: src/window/mod.rs:2084
+msgid "Start point set. Move to the end point and press Enter."
+msgstr ""
+
+#: src/window/mod.rs:4342 src/window/mod.rs:6902
+msgid "Fullscreen Image Preview"
+msgstr ""
+
+#: src/window/mod.rs:4343
+msgid "Leave Image Preview"
+msgstr ""
+
+#: src/window/fullscreen_preview.rs:43
+msgid "Fullscreen image preview. Press Escape to return."
 msgstr ""

@@ -113,8 +113,8 @@ Mark what matters with drawings, curved arrows, and text, then export the result
 - Navigate comparison folders by matching normalized filenames, even when the
   extensions or separators differ.
 - Track external changes and renames of the comparison image.
-- Draw with the Pencil on either comparison panel and right-click to sample a
-  color without leaving stray marks.
+- Keep the comparison image read-only while editing the primary image with the
+  normal reversible tools.
 
 ### Make reversible image edits
 
@@ -216,10 +216,11 @@ modern formats depends on the codecs supplied by the installed GNOME runtime.
 | Compare / Lens | D / L |
 | Rotate clockwise / counterclockwise | R / Shift+R |
 | Flip horizontally / vertically | H / V |
-| Apply the active keyboard tool | Enter or Space, depending on the tool |
+| Apply the active keyboard tool | Enter |
 | Clear a selection or leave a tool | Escape |
 | Delete the current image | Delete |
-| Fullscreen | F11 |
+| Fullscreen image preview / leave preview | Space / Escape |
+| Fullscreen window | F11 |
 
 Open **Keyboard Shortcuts** from Diorama's main menu for the complete in-app
 reference.

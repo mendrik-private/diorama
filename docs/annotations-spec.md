@@ -6,7 +6,7 @@
 
 In scope: unified tool model and annotation palette; default colour; overlay styling; removal of object segmentation; removal of the transient measure tool; device-pixel-exact hard zoom; a vector annotation layer with five tools (Pencil, Highlight, Arrow, Measure, Text); selection, editing, deletion, undo/redo; Excalifont bundling.
 
-Out of scope (explicit non-goals for 0.3): multiple selection, z-order controls, grouping, sidecar persistence of annotations after the file is closed, multi-line text, arbitrary imported vector paths, vector annotation tools inside Compare mode, copying annotations between images.
+Out of scope (explicit non-goals for 0.3): multiple selection, z-order controls, grouping, sidecar persistence of annotations after the file is closed, multi-line text, arbitrary imported vector paths, editing comparison image B, copying annotations between images.
 
 ## 1. Terminology
 
@@ -179,7 +179,7 @@ Track the current dimensions `(W, H)` through the fold. Every point maps through
 
 - Single selection, stored in the window as `Option<AnnotationId>`. Only available while an annotation tool (incl. Pencil) is active; cleared on tool cancel, Crop/Scale entry, image change, or when the object no longer exists after undo/redo.
 - With any annotation tool active: pressing on an existing annotation's body or handle selects it (and starts the corresponding drag) even if a creation tool is active; pressing on empty image space starts creation with the current tool.
-- Selected object shows: outline (Pencil: stored path/shape; Highlight: its rect; Arrow: chord; Text: the baseline curve), handles, and a hot-handle highlight on hover. Measurement uses its non-antialiased one-pixel rendered line as the outline and adds only the endpoint handles, so selection never changes its apparent width or pixel coverage.
+- Selected object shows: outline (Pencil: stored path/shape; Highlight: its rect; Arrow: quadratic curve; Text: the baseline curve), handles, and a hot-handle highlight on hover. Measurement uses its non-antialiased one-pixel rendered line as the outline and adds only the endpoint handles, so selection never changes its apparent width or pixel coverage.
 
 ### 5.2 Handles, hit-testing, cursors (`src/tools/annotation/hit.rs`, pure)
 
@@ -216,14 +216,15 @@ enum AnnotationDrag {
 | Key | Context | Effect |
 |---|---|---|
 | `P` `O` `A` `M` `T` | any | toggle Pencil / Highlight / Arrow / Measure / Text |
-| Escape | see §2.1 | cancel in the defined order |
+| Space | outside text entry | fit the current image fullscreen with tools inactive; Escape restores the previous view |
+| Escape | see §2.1 | leave fullscreen image preview, otherwise cancel in the defined order |
 | Delete, KP_Delete, BackSpace | annotation selected | delete it |
 | Left / Right | outside text entry | previous / next image, including while an annotation tool is active |
 | Up / Down | annotation selected | nudge vertically by 1 px (coalesced) |
 | Shift+Arrows | annotation selected | nudge by 10 px (coalesced) |
 | Up / Down | no selection, annotation tool | move the keyboard cursor vertically by 1 px |
 | Shift+Arrows | no selection, annotation tool | move the keyboard cursor by 10 px |
-| Space / Enter | no selection | keyboard creation at the cursor: Pencil creates an editable dot; Measure anchors then commits (as today); Highlight creates a 64×40 px rect centred on the cursor; Arrow creates an 80 px horizontal arrow; Text opens the editor at the cursor |
+| Enter | no selection | keyboard creation at the cursor: Pencil creates an editable dot; Measure anchors then commits (as today); Highlight creates a 64×40 px rect centred on the cursor; Arrow creates an 80 px horizontal arrow; Text opens the editor at the cursor |
 | Enter | Text selected | open the text editor |
 | Ctrl+Z / Ctrl+Shift+Z | any | undo / redo |
 
@@ -262,7 +263,7 @@ enum AnnotationDrag {
 
 Pencil creates editable `Shape::Pencil` annotation nodes in the primary document. A normal drag creates `Freehand`; Ctrl creates or extends one `Line` polyline until the chain is cancelled; Shift creates a `Rectangle`; Alt creates a circular `Ellipse`. Every polyline vertex is retained and has a repositioning handle. The stored geometry, colour, width, anti-aliasing flag and freehand pressure samples remain editable and participate in undo/redo and image transforms. Rendering adapts the node to the existing Pencil rasterizer, preserving pixel-perfect one-pixel strokes and the established visual output. Rectangle and ellipse nodes have eight bounding-box handles; freehand nodes can be moved or scaled through their bounds. Changing palette colour or size updates a selected Pencil node.
 
-Right-click sampling and the Pencil preference controls are unchanged. The size spin binds to `pencil-size`, whose fresh-profile default is 1 image pixel; existing saved preferences remain authoritative. Compare mode has no document annotation model, so Pencil marks made directly on comparison image B remain transient raster edits rather than document operations.
+Right-click sampling and the Pencil preference controls are unchanged. The size spin binds to `pencil-size`, whose fresh-profile default is 1 image pixel; existing saved preferences remain authoritative. In Compare mode, image B is a read-only viewing reference. Annotation tools continue to edit primary image A through its normal undoable document operations.
 
 ## 7. Excalifont bundling
 
@@ -363,5 +364,5 @@ Release acceptance (adds to spec.md §25): (a) the palette is never hidden by co
 
 - Excalifont Reserved Font Name status is verified during Phase 4 (§7); the renaming path is specified so either outcome is covered.
 - `gdk::Surface::scale()` is available with the crate's `gnome_49` feature (GTK ≥ 4.12); GTK 4.20+ renders at the fractional surface scale on Wayland — verified against GTK sources by the design review, to be re-confirmed on the Flatpak runtime during Phase 3.
-- Compare mode keeps its existing pencil gestures; other annotation tools are unavailable there (non-goal).
+- Compare mode keeps image B read-only; annotation tools remain available for primary image A.
 - Animated images: annotation tools follow the existing `editable` gating (single frame).

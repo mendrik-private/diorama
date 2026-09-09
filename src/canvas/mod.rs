@@ -726,7 +726,14 @@ mod imp {
                     },
                 ]);
             }
-            Shape::Arrow { start, end, .. } => outline.extend([*start, *end]),
+            Shape::Arrow {
+                start,
+                end,
+                control,
+                ..
+            } => {
+                outline = crate::tools::annotation::arrow::curve_points(*start, *control, *end);
+            }
             Shape::Measurement { .. } => {
                 // The rendered one-pixel measurement remains the outline. Drawing a GSK
                 // selection stroke over it would reintroduce antialiasing and extra width.
@@ -1288,6 +1295,15 @@ impl ImageCanvas {
         self.queue_draw();
     }
 
+    #[cfg(test)]
+    pub(crate) fn lens_position(&self) -> Option<(f32, f32)> {
+        self.imp()
+            .lens
+            .borrow()
+            .as_ref()
+            .map(|lens| (lens.normalized_x, lens.normalized_y))
+    }
+
     pub fn clear_lens(&self) {
         self.imp().lens.replace(None);
         self.queue_draw();
@@ -1780,6 +1796,156 @@ mod tests {
             );
             assert!(snapshot.to_node().is_some());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn curved_arrow_preview_and_selection_survive_moving() {
+        use crate::document::{
+            AnnotationEdit, AnnotationId, CancellationToken, Document, ImageSource, Metadata,
+            Operation, StrokeStyle,
+        };
+        use crate::tools::annotation::{
+            edit::{handle_drag, moved},
+            hit::HandleKind,
+            render_annotation_preview,
+        };
+
+        gtk::init().expect("GTK display initialization");
+        let mut document = Document::new(ImageSource {
+            pixels: std::sync::Arc::new(image::RgbaImage::new(240, 200)),
+            path: None,
+            metadata: Metadata::default(),
+        });
+        let straight = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Arrow {
+                start: Point { x: 20.0, y: 20.0 },
+                end: Point { x: 180.0, y: 20.0 },
+                control: Point { x: 100.0, y: 20.0 },
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            straight.clone(),
+        )));
+        let curved = handle_drag(
+            &straight,
+            HandleKind::Control,
+            Point { x: 100.0, y: 140.0 },
+            false,
+        );
+        for (annotation, x, y) in [
+            (curved.clone(), 100, 80),
+            (moved(&curved, Point { x: 20.0, y: 30.0 }, false), 120, 110),
+        ] {
+            let preview = render_annotation_preview(
+                (240, 200),
+                &annotation,
+                &document.annotations(),
+                &CancellationToken::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                preview
+                    .pixels
+                    .get_pixel(x - preview.bounds.x as u32, y - preview.bounds.y as u32)
+                    .0[3]
+                    > 0
+            );
+            document.apply(Operation::Annotate(AnnotationEdit::Set(annotation.clone())));
+            let rendered = document.render(&CancellationToken::default()).unwrap();
+            assert!(rendered.pixels.get_pixel(x, y).0[3] > 0);
+            assert_eq!(rendered.pixels.get_pixel(x, y - 60).0[3], 0);
+
+            let snapshot = gtk::Snapshot::new();
+            imp::draw_annotation_selection(
+                &snapshot,
+                gtk::graphene::Rect::new(0.0, 0.0, 240.0, 200.0),
+                (240, 200),
+                &SelectionHandles {
+                    annotation,
+                    hot: None,
+                },
+                1.0,
+            );
+            let node = snapshot
+                .to_node()
+                .unwrap()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .unwrap();
+            let stroke = node.child(0).downcast::<gtk::gsk::StrokeNode>().unwrap();
+            assert!(
+                stroke.path().bounds().unwrap().height() > 50.0,
+                "selected arrow must follow the curved shaft, not draw a straight chord"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn lens_renders_at_clipped_viewport_edges() {
+        gtk::init().expect("GTK display initialization");
+        let window = gtk::Window::new();
+        gtk::prelude::WidgetExt::realize(&window);
+        let renderer = window.renderer().expect("GPU renderer");
+        let pixels = glib::Bytes::from_owned(vec![255_u8; 10 * 10 * 4]);
+        let texture: gdk::Texture =
+            gdk::MemoryTexture::new(10, 10, gdk::MemoryFormat::R8g8b8a8, &pixels, 10 * 4).upcast();
+        for size in [1.0, 100.0, 1000.0] {
+            for position in [0.0, 0.001, 0.25, 0.5, 0.999, 1.0] {
+                for show_cross in [false, true] {
+                    let lens = Lens {
+                        texture: texture.clone(),
+                        normalized_x: position,
+                        normalized_y: position,
+                        diameter: 160.0,
+                        magnification: 4.0,
+                        show_cross,
+                    };
+                    let snapshot = gtk::Snapshot::new();
+                    let bounds = gtk::graphene::Rect::new(0.0, 0.0, size, size);
+                    snapshot.push_clip(&bounds);
+                    let overlay = PencilOverlay {
+                        points: vec![
+                            BrushPoint {
+                                x: 0.5,
+                                y: 0.5,
+                                pressure: 1.0,
+                            },
+                            BrushPoint {
+                                x: 9.5,
+                                y: 9.5,
+                                pressure: 1.0,
+                            },
+                        ],
+                        path: StrokePath::Linear,
+                        color: [255, 0, 0, 255],
+                        width: 1.0,
+                    };
+                    imp::draw_lens(
+                        &snapshot,
+                        bounds,
+                        &lens,
+                        Some(&overlay),
+                        Background::Checkerboard,
+                        0.5,
+                    );
+                    snapshot.pop();
+                    let node = snapshot.to_node().expect("lens node");
+                    for offset in [0.0, size / 2.0, size - 1.0] {
+                        let viewport = gtk::graphene::Rect::new(offset, offset, 32.0, 32.0);
+                        let output = renderer.render_texture(&node, Some(&viewport));
+                        assert_eq!(output.width(), 32);
+                    }
+                }
+            }
+        }
+        window.close();
     }
 
     #[test]

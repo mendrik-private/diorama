@@ -16,3 +16,4 @@ src/tools/annotation/measure.rs
 src/tools/annotation/render.rs
 src/tools/annotation/text.rs
 src/settings.rs
+src/window/fullscreen_preview.rs

@@ -7,10 +7,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::canvas::{Background, CropOverlay, ImageCanvas, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
+#[cfg(test)]
+use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
     HIGHLIGHT_STROKE_WIDTH, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect,
-    Resampling, Rotation, Shape, Stroke, StrokePath, StrokeStyle,
+    Resampling, Rotation, Shape, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -34,6 +36,7 @@ use libadwaita as adw;
 mod annotation;
 mod color;
 mod file_state;
+mod fullscreen_preview;
 mod presentation;
 mod print;
 mod scale;
@@ -453,6 +456,7 @@ fn image_property_row(title: &str, value: &str) -> adw::ActionRow {
 
 struct WindowState {
     window: adw::ApplicationWindow,
+    fullscreen_preview: RefCell<Option<fullscreen_preview::FullscreenPreview>>,
     canvas: ImageCanvas,
     scrolled: gtk::ScrolledWindow,
     canvas_overlay: gtk::Overlay,
@@ -511,7 +515,6 @@ struct WindowState {
     color_button: gtk::ColorDialogButton,
     compare_canvas: RefCell<Option<ImageCanvas>>,
     compare_fit_zooms: Cell<Option<(f64, f64)>>,
-    compare_rendered: RefCell<Option<image::RgbaImage>>,
     compare_file: RefCell<Option<gio::File>>,
     pending_comparison: RefCell<Option<gio::File>>,
     navigation_generation: Cell<u64>,
@@ -912,6 +915,7 @@ impl ViewerWindow {
         let zoom_mode = settings.last_zoom_mode();
         let this = Self(Rc::new(WindowState {
             window,
+            fullscreen_preview: RefCell::new(None),
             canvas,
             scrolled,
             canvas_overlay,
@@ -970,7 +974,6 @@ impl ViewerWindow {
             color_button: header_widgets.color_button,
             compare_canvas: RefCell::new(None),
             compare_fit_zooms: Cell::new(None),
-            compare_rendered: RefCell::new(None),
             compare_file: RefCell::new(None),
             pending_comparison: RefCell::new(None),
             navigation_generation: Cell::new(0),
@@ -1109,6 +1112,7 @@ impl ViewerWindow {
     }
 
     fn load_with_fit(&self, file: gio::File, fit: bool) {
+        self.leave_fullscreen_preview();
         let fit_on_load = fit_on_load(fit, self.0.zoom_mode.get());
         self.clear_region_selection();
         self.0
@@ -1396,6 +1400,10 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.confirm_delete_current_file()
         });
+        self.add_action("image-preview", {
+            let this = self.clone();
+            move || this.show_fullscreen_preview()
+        });
         self.add_action("fullscreen", {
             let window = self.0.window.clone();
             move || {
@@ -1579,6 +1587,9 @@ impl ViewerWindow {
         self.add_action("cancel-tool", {
             let this = self.clone();
             move || {
+                if this.leave_fullscreen_preview() {
+                    return;
+                }
                 if this.0.tool.get() == Tool::Select
                     && (this.0.region_drag.get().is_some()
                         || this.0.region_selection.get().is_some())
@@ -1676,6 +1687,9 @@ impl ViewerWindow {
         pencil_zoom.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
+                if this.0.fullscreen_preview.borrow().is_some() {
+                    return glib::Propagation::Proceed;
+                }
                 let Some(direction) =
                     pencil_zoom_key(key, modifiers, this.0.tool.get() == Tool::Pencil)
                 else {
@@ -1692,6 +1706,9 @@ impl ViewerWindow {
         annotation_keys.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
+                if this.0.fullscreen_preview.borrow().is_some() {
+                    return glib::Propagation::Proceed;
+                }
                 if modifiers.intersects(
                     gtk::gdk::ModifierType::CONTROL_MASK
                         | gtk::gdk::ModifierType::ALT_MASK
@@ -1721,6 +1738,9 @@ impl ViewerWindow {
         keys.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
+                if this.0.fullscreen_preview.borrow().is_some() {
+                    return glib::Propagation::Proceed;
+                }
                 if modifiers.intersects(
                     gtk::gdk::ModifierType::CONTROL_MASK
                         | gtk::gdk::ModifierType::ALT_MASK
@@ -1739,10 +1759,8 @@ impl ViewerWindow {
                     this.confirm_scale_preview();
                     return glib::Propagation::Stop;
                 }
-                if matches!(
-                    key,
-                    gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-                ) && this.zoom_selected_region()
+                if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                    && this.zoom_selected_region()
                 {
                     return glib::Propagation::Stop;
                 }
@@ -1750,10 +1768,7 @@ impl ViewerWindow {
                     return glib::Propagation::Stop;
                 }
                 if this.active_keyboard_tool().is_some()
-                    && matches!(
-                        key,
-                        gtk::gdk::Key::space | gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-                    )
+                    && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
                 {
                     this.activate_keyboard_tool();
                     return glib::Propagation::Stop;
@@ -1776,6 +1791,9 @@ impl ViewerWindow {
         navigation.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
+                if this.0.fullscreen_preview.borrow().is_some() {
+                    return glib::Propagation::Proceed;
+                }
                 if gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|focus| {
                     focus.is::<gtk::Text>()
                         || focus.is::<gtk::Entry>()
@@ -1792,6 +1810,14 @@ impl ViewerWindow {
             }
         });
         self.0.window.add_controller(navigation);
+
+        let preview = gtk::EventControllerKey::new();
+        preview.set_propagation_phase(gtk::PropagationPhase::Capture);
+        preview.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, modifiers| this.fullscreen_preview_key(key, modifiers)
+        });
+        self.0.window.add_controller(preview);
     }
 
     fn active_keyboard_tool(&self) -> Option<KeyboardTool> {
@@ -1839,7 +1865,7 @@ impl ViewerWindow {
         vertical.set_value(viewport.1);
         self.0.canvas.announce(
             &gettext(
-                "Use Up and Down to move, Shift with an arrow to move faster, and Space or Enter to act. Left and Right change images.",
+                "Use Up and Down to move, Shift with an arrow to move faster, and Enter to act. Left and Right change images.",
             ),
             gtk::AccessibleAnnouncementPriority::Medium,
         );
@@ -2055,9 +2081,7 @@ impl ViewerWindow {
             KeyboardTool::Measure | KeyboardTool::Select => {
                 let Some(start) = self.0.keyboard_tool_anchor.replace(Some(current)) else {
                     self.0.canvas.announce(
-                        &gettext(
-                            "Start point set. Move to the end point and press Space or Enter.",
-                        ),
+                        &gettext("Start point set. Move to the end point and press Enter."),
                         gtk::AccessibleAnnouncementPriority::Medium,
                     );
                     return;
@@ -2140,6 +2164,9 @@ impl ViewerWindow {
     }
 
     fn set_action_enabled(&self, name: &str, enabled: bool) {
+        let enabled = enabled
+            && (self.0.fullscreen_preview.borrow().is_none()
+                || matches!(name, "cancel-tool" | "close"));
         if let Some(action) = self
             .0
             .window
@@ -2190,6 +2217,7 @@ impl ViewerWindow {
             "compare",
             "lens",
             "properties",
+            "image-preview",
         ] {
             self.set_action_enabled(action, has_image);
         }
@@ -2219,7 +2247,7 @@ impl ViewerWindow {
         for action in ["selection-zoom", "selection-crop", "selection-copy"] {
             self.set_action_enabled(action, region_selected);
         }
-        let vector_annotations_available = editable && self.0.compare_canvas.borrow().is_none();
+        let vector_annotations_available = editable;
         for action in ["measure", "highlight", "arrow", "text"] {
             self.set_action_enabled(action, vector_annotations_available);
         }
@@ -2282,9 +2310,6 @@ impl ViewerWindow {
         let tool = resting_tool(tool, editable);
         let previous = self.0.tool.get();
         if previous == tool {
-            return;
-        }
-        if tool.is_vector_annotation() && self.0.compare_canvas.borrow().is_some() {
             return;
         }
         if tool != Tool::None && self.0.rendered.borrow().is_none() {
@@ -2997,14 +3022,14 @@ impl ViewerWindow {
                 .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
             return;
         }
-        let cursor = if self.0.lens_active.get() || self.0.compare_canvas.borrow().is_some() {
+        let cursor = if self.0.lens_active.get() {
             Some("none")
         } else {
             active.then_some("crosshair")
         };
         self.0.canvas.set_cursor_from_name(cursor);
         if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
-            canvas.set_cursor_from_name(cursor);
+            canvas.set_cursor_from_name(self.0.lens_active.get().then_some("none"));
         }
         self.0.canvas.set_accessible_label(&if active {
             gettext("Image canvas, Color Picker tool active")
@@ -3134,37 +3159,7 @@ impl ViewerWindow {
         );
     }
 
-    fn preview_comparison_pencil_stroke(&self, canvas: &ImageCanvas) {
-        canvas.set_pencil_overlay(
-            &self.0.pencil_points.borrow(),
-            self.0.pencil_path.get(),
-            self.0.pencil_color.get(),
-            self.0.pencil_size.value().round() as f32,
-        );
-    }
-
-    fn paint_pencil_preview(
-        &self,
-        canvas: &ImageCanvas,
-        image: &image::RgbaImage,
-        points: &[BrushPoint],
-        path: StrokePath,
-    ) -> Option<image::RgbaImage> {
-        let stroke = self.pencil_stroke(points, path);
-        if let Ok(preview) =
-            crate::tools::pencil::paint_stroke(image, &stroke, &CancellationToken::default())
-            && let Ok(texture) = texture_from_rgba(&preview)
-        {
-            canvas.set_texture(Some(&texture));
-            canvas.update_lens_texture(&texture);
-            if canvas == &self.0.canvas {
-                self.update_minimap();
-            }
-            return Some(preview);
-        }
-        None
-    }
-
+    #[cfg(test)]
     fn pencil_stroke(&self, points: &[BrushPoint], path: StrokePath) -> Stroke {
         Stroke {
             points: points.to_vec(),
@@ -3175,23 +3170,6 @@ impl ViewerWindow {
             opacity: 1.0,
             hardness: 1.0,
         }
-    }
-
-    fn commit_comparison_pencil_stroke(
-        &self,
-        canvas: &ImageCanvas,
-        points: &[BrushPoint],
-        path: StrokePath,
-    ) {
-        self.0.pencil_line_annotation.set(None);
-        let Some(image) = self.0.compare_rendered.borrow().clone() else {
-            canvas.clear_pencil_overlay();
-            return;
-        };
-        if let Some(preview) = self.paint_pencil_preview(canvas, &image, points, path) {
-            self.0.compare_rendered.replace(Some(preview));
-        }
-        canvas.clear_pencil_overlay();
     }
 
     fn commit_editable_pencil_stroke(&self, points: &[BrushPoint], mode: PencilDragMode) {
@@ -3299,7 +3277,7 @@ impl ViewerWindow {
         modifiers: gtk::gdk::ModifierType,
         timestamp_ms: u32,
     ) {
-        if button != 1 {
+        if canvas != &self.0.canvas || button != 1 {
             return;
         }
         let Some(origin) = canvas
@@ -3377,12 +3355,10 @@ impl ViewerWindow {
         };
         self.0.pencil_points.replace(points);
         self.0.pencil_path.set(path);
-        if !should_preview {
+        if !should_preview || canvas != &self.0.canvas {
             canvas.clear_pencil_overlay();
-        } else if canvas == &self.0.canvas {
-            self.preview_pencil_stroke();
         } else {
-            self.preview_comparison_pencil_stroke(canvas);
+            self.preview_pencil_stroke();
         }
     }
 
@@ -4314,6 +4290,8 @@ impl ViewerWindow {
                     (gettext("Zoom 100%–900%"), "1–9"),
                     (gettext("Toggle Soft/Hard Zoom"), "x"),
                     (gettext("Magnifying Lens"), "l"),
+                    (gettext("Fullscreen Image Preview"), "space"),
+                    (gettext("Leave Image Preview"), "Escape"),
                     (gettext("Previous Image"), "Left"),
                     (gettext("Next Image"), "Right"),
                     (gettext("Delete Image"), "Delete"),
@@ -4336,7 +4314,7 @@ impl ViewerWindow {
                     (gettext("Scale"), "s"),
                     (gettext("Zoom Selected Region or Apply Scale"), "Return"),
                     (gettext("Move Active Tool"), "Left Right Up Down"),
-                    (gettext("Set Tool Point"), "space"),
+                    (gettext("Set Tool Point"), "Return"),
                     (gettext("Clear Selection or Cancel Scale"), "Escape"),
                     (gettext("Pencil"), "p"),
                     (gettext("Exit Active Tool"), "Escape"),
@@ -4828,9 +4806,6 @@ impl ViewerWindow {
 
     fn enter_compare(&self, file: gio::File, preview: crate::image::LoadedPreview) {
         self.exit_compare();
-        if self.0.tool.get().is_vector_annotation() {
-            self.set_tool(Tool::None);
-        }
         let Some(primary) = self.0.canvas.texture() else {
             return;
         };
@@ -4842,7 +4817,8 @@ impl ViewerWindow {
         compare_canvas.set_zoom(self.0.canvas.zoom());
         compare_canvas.set_halign(gtk::Align::Center);
         compare_canvas.set_valign(gtk::Align::Center);
-        compare_canvas.set_accessible_label(&gettext("Comparison image B"));
+        compare_canvas.set_focusable(false);
+        compare_canvas.set_accessible_label(&gettext("Comparison image B, read-only"));
         self.0
             .canvas
             .set_accessible_label(&gettext("Primary image A"));
@@ -4882,11 +4858,14 @@ impl ViewerWindow {
             "orientation",
             Some(&gtk::Orientation::Vertical.to_value()),
         );
-        let compare_bin = adw::BreakpointBin::builder().child(&paned).build();
+        let compare_bin = adw::BreakpointBin::builder()
+            .width_request(360)
+            .height_request(200)
+            .child(&paned)
+            .build();
         compare_bin.add_breakpoint(narrow_compare);
 
         self.0.canvas_overlay.set_child(None::<&gtk::Widget>);
-        self.0.toasts.set_child(None::<&gtk::Widget>);
         paned.set_start_child(Some(&self.0.scrolled));
         paned.set_end_child(Some(&compare_scrolled));
         let toolbar = gtk::CenterBox::builder()
@@ -4927,7 +4906,7 @@ impl ViewerWindow {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.append(&toolbar);
         root.append(&compare_bin);
-        self.0.toasts.set_child(Some(&root));
+        self.0.canvas_overlay.set_child(Some(&root));
         self.0.compare_canvas.replace(Some(compare_canvas.clone()));
         self.0.compare_file.replace(Some(file));
         self.0
@@ -4940,7 +4919,6 @@ impl ViewerWindow {
         if let Some(image) = compare_rendered.as_ref() {
             compare_canvas.set_auto_background_from_image(image);
         }
-        self.0.compare_rendered.replace(compare_rendered);
         self.update_action_states();
         self.monitor_comparison_file();
 
@@ -4953,20 +4931,13 @@ impl ViewerWindow {
             move |_| this.exit_compare()
         });
         self.connect_compare_adjustments(&compare_scrolled);
-        let cursor = if self.0.tool.get() == Tool::PickColor {
-            "crosshair"
-        } else {
-            "none"
-        };
-        self.0.canvas.set_cursor_from_name(Some(cursor));
-        compare_canvas.set_cursor_from_name(Some(cursor));
+        self.set_single_image_lens_active(self.0.lens_active.get());
         self.connect_lens(&self.0.canvas, &compare_canvas, CompareLensSource::Primary);
         self.connect_lens(
             &compare_canvas,
             &self.0.canvas,
             CompareLensSource::Comparison,
         );
-        self.install_comparison_pencil_gestures(&compare_canvas);
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll({
             let this = self.clone();
@@ -5087,16 +5058,14 @@ impl ViewerWindow {
             canvas.set_marker(None);
         }
         if let Some(paned) = self.0.compare_paned.borrow_mut().take() {
-            self.0.toasts.set_child(None::<&gtk::Widget>);
+            self.0.canvas_overlay.set_child(None::<&gtk::Widget>);
             paned.set_start_child(None::<&gtk::Widget>);
             paned.set_end_child(None::<&gtk::Widget>);
             self.0.canvas_overlay.set_child(Some(&self.0.scrolled));
-            self.0.toasts.set_child(Some(&self.0.canvas_overlay));
         }
         self.0.compare_scrolled.replace(None);
         self.0.compare_canvas.replace(None);
         self.0.compare_fit_zooms.set(None);
-        self.0.compare_rendered.replace(None);
         self.0.compare_file.replace(None);
         self.0.canvas.set_accessible_label(&gettext("Image canvas"));
         self.update_action_states();
@@ -5230,7 +5199,14 @@ impl ViewerWindow {
                 _ => Some("crosshair"),
             }
         });
+        if let Some(canvas) = self.0.compare_canvas.borrow().as_ref() {
+            canvas.set_cursor_from_name(active.then_some("none"));
+            if !active {
+                canvas.clear_lens();
+            }
+        }
         if !active {
+            self.0.compare_lens_source.set(None);
             self.0.canvas.clear_lens();
         }
     }
@@ -5279,15 +5255,15 @@ impl ViewerWindow {
             let source = source.clone();
             let target = target.clone();
             move |_, x, y| {
-                if this.0.compare_canvas.borrow().is_none()
-                    || matches!(this.0.tool.get(), Tool::Measure | Tool::Select)
-                {
+                if this.0.compare_canvas.borrow().is_none() || !this.0.lens_active.get() {
                     source.clear_lens();
                     target.clear_lens();
-                    let cursor = if source == this.0.canvas && this.0.tool.get() == Tool::Measure {
-                        Some("none")
-                    } else if source == this.0.canvas && this.0.tool.get() == Tool::Select {
-                        Some("crosshair")
+                    let cursor = if source == this.0.canvas {
+                        match this.0.tool.get() {
+                            Tool::Measure => Some("none"),
+                            Tool::None => None,
+                            _ => Some("crosshair"),
+                        }
                     } else {
                         None
                     };
@@ -5352,7 +5328,7 @@ impl ViewerWindow {
         scroll.connect_scroll({
             let this = self.clone();
             move |controller, _, dy| {
-                if this.0.compare_canvas.borrow().is_none() {
+                if this.0.compare_canvas.borrow().is_none() || !this.0.lens_active.get() {
                     return glib::Propagation::Proceed;
                 }
                 let state = controller.current_event_state();
@@ -6519,143 +6495,22 @@ impl ViewerWindow {
         self.0.canvas.add_controller(pan);
     }
 
-    fn install_comparison_pencil_gestures(&self, canvas: &ImageCanvas) {
-        let pencil = gtk::GestureDrag::new();
-        pencil.set_button(1);
-        pencil.connect_drag_begin({
-            let this = self.clone();
-            let canvas = canvas.clone();
-            move |gesture, x, y| {
-                if this.0.tool.get() != Tool::Pencil || this.0.compare_rendered.borrow().is_none() {
-                    return;
-                }
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.begin_pencil_drag(
-                    &canvas,
-                    gesture.current_button(),
-                    x,
-                    y,
-                    gesture.current_event_state(),
-                    pencil_event_time(gesture),
-                );
-            }
-        });
-        pencil.connect_drag_update({
-            let this = self.clone();
-            let canvas = canvas.clone();
-            move |gesture, offset_x, offset_y| {
-                if this.0.tool.get() != Tool::Pencil {
-                    return;
-                }
-                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
-                    (
-                        drag.start_screen.0 + offset_x,
-                        drag.start_screen.1 + offset_y,
-                    )
-                }) else {
-                    return;
-                };
-                this.update_pencil_drag(&canvas, drag.0, drag.1, pencil_event_time(gesture));
-            }
-        });
-        pencil.connect_drag_end({
-            let this = self.clone();
-            let canvas = canvas.clone();
-            move |gesture, offset_x, offset_y| {
-                if this.0.tool.get() != Tool::Pencil {
-                    return;
-                }
-                let Some(drag) = this.0.pencil_drag.borrow().as_ref().map(|drag| {
-                    (
-                        drag.start_screen.0 + offset_x,
-                        drag.start_screen.1 + offset_y,
-                    )
-                }) else {
-                    return;
-                };
-                let Some((points, path, _mode)) =
-                    this.finish_pencil_drag(&canvas, drag.0, drag.1, pencil_event_time(gesture))
-                else {
-                    return;
-                };
-                if !points.is_empty() {
-                    this.commit_comparison_pencil_stroke(&canvas, &points, path);
-                }
-            }
-        });
-        canvas.add_controller(pencil.clone());
-        self.0
-            .compare_controllers
-            .borrow_mut()
-            .push((canvas.clone(), pencil.upcast()));
-
-        let sampler = gtk::GestureClick::new();
-        sampler.set_button(3);
-        sampler.connect_pressed({
-            let this = self.clone();
-            let canvas = canvas.clone();
-            move |gesture, _, x, y| {
-                if this.0.tool.get() != Tool::Pencil {
-                    return;
-                }
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.abort_pencil_drag();
-                let pixel = canvas.pixel_at(x, y).and_then(|(x, y)| {
-                    this.0
-                        .compare_rendered
-                        .borrow()
-                        .as_ref()
-                        .and_then(|image| crate::tools::pencil::sample(image, x, y))
-                });
-                let Some(color) = pixel else {
-                    return;
-                };
-                this.apply_picked_color(color);
-            }
-        });
-        canvas.add_controller(sampler.clone());
-        self.0
-            .compare_controllers
-            .borrow_mut()
-            .push((canvas.clone(), sampler.upcast()));
-
-        let color_picker = gtk::GestureClick::new();
-        color_picker.set_button(1);
-        color_picker.connect_pressed({
-            let this = self.clone();
-            let canvas = canvas.clone();
-            move |gesture, _, x, y| {
-                if this.0.tool.get() != Tool::PickColor {
-                    return;
-                }
-                let color = canvas.pixel_at(x, y).and_then(|(x, y)| {
-                    this.0
-                        .compare_rendered
-                        .borrow()
-                        .as_ref()
-                        .and_then(|image| crate::tools::pencil::sample(image, x, y))
-                });
-                let Some(color) = color else {
-                    return;
-                };
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                this.copy_color_to_clipboard(color);
-            }
-        });
-        canvas.add_controller(color_picker.clone());
-        self.0
-            .compare_controllers
-            .borrow_mut()
-            .push((canvas.clone(), color_picker.upcast()));
-    }
-
     fn install_state_persistence(&self) {
         self.0.window.connect_close_request({
             let this = self.clone();
             let settings = self.0.settings.clone();
             move |window| {
-                settings.set_window_size(window.width(), window.height());
+                let (width, height) = this
+                    .0
+                    .fullscreen_preview
+                    .borrow()
+                    .as_ref()
+                    .map_or((window.width(), window.height()), |preview| {
+                        preview.window_size
+                    });
+                settings.set_window_size(width, height);
                 settings.set_maximized(window.is_maximized());
+                this.leave_fullscreen_preview();
                 if this.0.close_approved.get()
                     || !this
                         .0
@@ -6857,6 +6712,7 @@ fn main_menu() -> gio::Menu {
     menu_item(&edit_menu, "Scale", "win.scale-preview");
     menu_submenu(&menu, "Edit", &edit_menu);
     menu_item(&menu, "Magnifying Lens", "win.lens");
+    menu_item(&menu, "Fullscreen Image Preview", "win.image-preview");
     menu_item(&menu, "Image Properties", "win.properties");
     menu_item(&menu, "Preferences", "win.preferences");
     menu_item(&menu, "Keyboard Shortcuts", "win.shortcuts");
@@ -9839,22 +9695,144 @@ mod tests {
         };
         let comparison = gio::File::for_path("/images/comparison.png");
 
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.0.window.present();
+
         for _ in 0..2 {
             assert!(window.0.highlight_button.is_sensitive());
             window.set_tool(Tool::Highlight);
             window.enter_compare(comparison.clone(), preview.clone());
-            assert_eq!(window.0.tool.get(), Tool::Select);
+            assert_eq!(window.0.tool.get(), Tool::Highlight);
             assert!(
-                !window
+                window
                     .0
                     .window
                     .lookup_action("highlight")
                     .expect("highlight action")
                     .is_enabled()
             );
-            assert!(!window.0.highlight_button.is_sensitive());
-            assert_eq!(window.0.compare_controllers.borrow().len(), 8);
+            assert!(window.0.highlight_button.is_sensitive());
+            assert!(window.0.pencil_controls.is_visible());
+            assert!(window.0.pencil_controls.is_ancestor(&window.0.window));
+            let paned = window.0.compare_paned.borrow().clone().unwrap();
+            let compare_bin = paned
+                .parent()
+                .unwrap()
+                .downcast::<adw::BreakpointBin>()
+                .unwrap();
+            assert!(compare_bin.width_request() > 0);
+            assert!(compare_bin.height_request() > 0);
+            for width in [1024, 560] {
+                window.0.canvas_overlay.allocate(width, 600, -1, None);
+                assert!(window.0.pencil_controls.width() > 0);
+                assert!(
+                    window.0.pencil_controls.width() + window.0.pencil_controls.margin_start()
+                        <= window.0.canvas_overlay.width()
+                );
+            }
+            assert_eq!(paned.orientation(), gtk::Orientation::Vertical);
+            assert_eq!(window.0.compare_controllers.borrow().len(), 5);
             assert_eq!(window.0.compare_adjustment_handlers.borrow().len(), 4);
+
+            let other = window.0.compare_canvas.borrow().clone().unwrap();
+            assert!(!other.is_focusable());
+            let controllers = other.observe_controllers();
+            assert!(
+                (0..controllers.n_items())
+                    .filter_map(|index| controllers.item(index))
+                    .all(|controller| !controller.is::<gtk::GestureDrag>()
+                        && !controller.is::<gtk::GestureClick>()),
+                "the comparison canvas must not install editing gestures",
+            );
+            window.0.canvas.allocate(200, 100, -1, None);
+            other.allocate(200, 100, -1, None);
+            window.set_tool(Tool::Pencil);
+            let primary_center = window
+                .0
+                .canvas
+                .widget_point_for_image(crate::document::Point { x: 1.0, y: 0.5 })
+                .unwrap();
+            window.begin_pencil_drag(
+                &window.0.canvas,
+                1,
+                f64::from(primary_center.x()),
+                f64::from(primary_center.y()),
+                gtk::gdk::ModifierType::empty(),
+                0,
+            );
+            assert!(
+                window.0.pencil_drag.borrow().is_some(),
+                "the primary canvas must remain editable in comparison mode",
+            );
+            window.abort_pencil_drag();
+            let other_center = other
+                .widget_point_for_image(crate::document::Point { x: 1.0, y: 0.5 })
+                .unwrap();
+            window.begin_pencil_drag(
+                &other,
+                1,
+                f64::from(other_center.x()),
+                f64::from(other_center.y()),
+                gtk::gdk::ModifierType::empty(),
+                0,
+            );
+            assert!(
+                window.0.pencil_drag.borrow().is_none(),
+                "the comparison canvas must reject direct drawing attempts",
+            );
+            let move_pointer = |canvas: &ImageCanvas| {
+                let center = canvas
+                    .widget_point_for_image(crate::document::Point { x: 1.0, y: 0.5 })
+                    .unwrap();
+                let x = f64::from(center.x());
+                let y = f64::from(center.y());
+                let controllers = canvas.observe_controllers();
+                for index in 0..controllers.n_items() {
+                    if let Ok(motion) = controllers
+                        .item(index)
+                        .unwrap()
+                        .downcast::<gtk::EventControllerMotion>()
+                    {
+                        motion.emit_by_name::<()>("motion", &[&x, &y]);
+                    }
+                }
+            };
+            for tool in [
+                Tool::Pencil,
+                Tool::Highlight,
+                Tool::Arrow,
+                Tool::Text,
+                Tool::Measure,
+                Tool::Select,
+            ] {
+                window.set_tool(tool);
+                assert_eq!(window.0.tool.get(), tool);
+                assert_eq!(window.0.pencil_controls.is_visible(), tool.is_annotation());
+                assert!(!window.0.lens_active.get());
+                move_pointer(&window.0.canvas);
+                assert_eq!(window.0.canvas.lens_position(), None);
+                assert_eq!(other.lens_position(), None);
+                window
+                    .0
+                    .window
+                    .lookup_action("lens")
+                    .unwrap()
+                    .activate(None);
+                assert!(window.0.lens_active.get());
+                for source in [&window.0.canvas, &other] {
+                    move_pointer(source);
+                    assert!(source.lens_position().is_some());
+                    assert_eq!(window.0.canvas.lens_position(), other.lens_position());
+                }
+                window
+                    .0
+                    .window
+                    .lookup_action("lens")
+                    .unwrap()
+                    .activate(None);
+                assert_eq!(window.0.canvas.lens_position(), None);
+                assert_eq!(other.lens_position(), None);
+            }
 
             window.exit_compare();
             assert!(window.0.highlight_button.is_sensitive());
@@ -9886,6 +9864,23 @@ mod tests {
             assert!(window.0.canvas.cursor().is_some());
             assert!(window.0.compare_controllers.borrow().is_empty());
             assert!(window.0.compare_adjustment_handlers.borrow().is_empty());
+            assert!(!window.0.pencil_controls.is_visible());
+            window
+                .0
+                .window
+                .lookup_action("lens")
+                .unwrap()
+                .activate(None);
+            move_pointer(&window.0.canvas);
+            assert!(window.0.canvas.lens_position().is_some());
+            window
+                .0
+                .window
+                .lookup_action("lens")
+                .unwrap()
+                .activate(None);
+            assert_eq!(window.0.canvas.lens_position(), None);
         }
+        window.0.window.close();
     }
 }
