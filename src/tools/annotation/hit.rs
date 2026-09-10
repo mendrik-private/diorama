@@ -129,6 +129,10 @@ pub fn hit_test(
 pub fn handles(annotation: &Annotation) -> Vec<(HandleKind, Point)> {
     match &annotation.shape {
         Shape::Pencil {
+            geometry: PencilGeometry::Freehand(points),
+            ..
+        } if points.len() == 1 => Vec::new(),
+        Shape::Pencil {
             geometry: PencilGeometry::Line(points),
             ..
         } => points
@@ -259,6 +263,11 @@ fn text_rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32)
 
 fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
     match &annotation.shape {
+        // Single-click dots paint pixels; their hit tolerance must not capture the next click.
+        Shape::Pencil {
+            geometry: PencilGeometry::Freehand(points),
+            ..
+        } if points.len() == 1 => false,
         Shape::Pencil {
             geometry, style, ..
         } => {
@@ -437,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_point_pencil_node_can_be_selected() {
+    fn single_pixel_pencil_dots_do_not_capture_drawing_or_expose_handles() {
         let annotation = Annotation {
             id: AnnotationId(3),
             shape: Shape::Pencil {
@@ -454,12 +463,28 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            hit_test(&[annotation], None, Point { x: 12.5, y: 14.5 }, 2.0),
-            Some(Hit {
-                id: AnnotationId(3),
-                kind: HitKind::Body,
-            })
-        );
+        for selected in [None, Some(annotation.id)] {
+            for tolerance in [0.25, 2.0, 8.0] {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let point = Point {
+                            x: 12.5 + dx as f32,
+                            y: 14.5 + dy as f32,
+                        };
+                        assert_eq!(
+                            hit_test(
+                                std::slice::from_ref(&annotation),
+                                selected,
+                                point,
+                                tolerance
+                            ),
+                            None,
+                            "pixel dot captured {point:?} with selection {selected:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(handles(&annotation).is_empty());
     }
 }

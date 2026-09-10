@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.8" date="2026-09-10">
+      <description>
+        <p>Fixes single-pixel Pencil dots so they never capture a subsequent draw action or expose drag and resize controls.</p>
+      </description>
+    </release>
     <release version="0.3.7" date="2026-09-09">
       <description>
         <p>Adds a distraction-free fullscreen preview, makes image comparison read-only while retaining mirrored pixel inspection, fixes curved-arrow editing, and improves comparison layout and rendering stability.</p>
