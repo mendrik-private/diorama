@@ -25,6 +25,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
+rustybuzz = "0.20.1"
 
 [dev-dependencies]
 base64 = "0.22.1"

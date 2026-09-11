@@ -502,8 +502,8 @@ fn draw_text(
     style: DrawStyle,
 ) {
     let mut builder = PathBuilder::new();
-    let scale = font_size / units_per_em();
     for placement in glyph_placements(anchor, angle, bend, text, font_size) {
+        let scale = placement.font_size / units_per_em();
         let direction = Point {
             x: placement.tangent_angle.cos(),
             y: placement.tangent_angle.sin(),
@@ -514,11 +514,11 @@ fn draw_text(
         };
         let map = |x: f32, y: f32| Point {
             x: placement.position.x
-                + (x * scale - placement.advance / 2.0) * direction.x
-                + (-y * scale) * perpendicular.x,
+                + (x * scale + placement.offset.x - placement.advance / 2.0) * direction.x
+                + (-y * scale + placement.offset.y) * perpendicular.x,
             y: placement.position.y
-                + (x * scale - placement.advance / 2.0) * direction.y
-                + (-y * scale) * perpendicular.y,
+                + (x * scale + placement.offset.x - placement.advance / 2.0) * direction.y
+                + (-y * scale + placement.offset.y) * perpendicular.y,
         };
         for command in glyph_outline(placement.glyph) {
             match command {
@@ -824,10 +824,12 @@ fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<
             ..
         } => {
             let mut bounds = Bounds::point(*anchor);
+            let mut rendered_font_size = *font_size;
             for placement in glyph_placements(*anchor, *angle, *bend, text, *font_size) {
                 bounds.include(placement.position);
+                rendered_font_size = rendered_font_size.max(placement.font_size);
             }
-            bounds.expand(font_size * 1.5 + 2.0);
+            bounds.expand(rendered_font_size * 1.5 + 2.0);
             Some(bounds)
         }
     }

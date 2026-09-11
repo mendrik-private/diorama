@@ -3,7 +3,7 @@ use crate::document::{
 };
 
 use super::arrow::curve_points;
-use super::geometry::{distance_to_polyline, distance_to_segment};
+use super::geometry::{distance_to_polyline, distance_to_segment, polyline_length};
 use super::highlight::sloppy_ellipse;
 use super::pencil::{geometry_bounds, outline_points};
 use super::text::baseline;
@@ -109,7 +109,7 @@ pub fn hit_test(
                 kind: HitKind::Handle(kind),
             });
         }
-        if text_rotation_ring_hit(annotation, point, tolerance) {
+        if rotation_ring_hit(annotation, point, tolerance) {
             return Some(Hit {
                 id: selected,
                 kind: HitKind::Rotate,
@@ -149,6 +149,33 @@ pub fn handles(annotation: &Annotation) -> Vec<(HandleKind, Point)> {
                 (kind, *point)
             })
             .collect(),
+        Shape::Pencil {
+            geometry: PencilGeometry::RotatedRectangle(points),
+            ..
+        } => {
+            let kinds = [
+                HandleKind::NorthWest,
+                HandleKind::North,
+                HandleKind::NorthEast,
+                HandleKind::East,
+                HandleKind::SouthEast,
+                HandleKind::South,
+                HandleKind::SouthWest,
+                HandleKind::West,
+            ];
+            (0..8)
+                .map(|i| {
+                    (
+                        kinds[i],
+                        if i % 2 == 0 {
+                            points[i / 2]
+                        } else {
+                            points[i / 2].midpoint(points[(i / 2 + 1) % 4])
+                        },
+                    )
+                })
+                .collect()
+        }
         Shape::Pencil { geometry, .. } => rectangular_handles(geometry_bounds(geometry)),
         Shape::Highlight { rect, .. } => rectangular_handles(*rect),
         Shape::Arrow {
@@ -248,14 +275,27 @@ fn handle_hit(annotation: &Annotation, point: Point, tolerance: f32) -> Option<H
         .find_map(|(kind, handle)| (point.distance(handle) <= tolerance).then_some(kind))
 }
 
-fn text_rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
-    let Shape::Text { .. } = annotation.shape else {
+fn rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
+    if !matches!(
+        annotation.shape,
+        Shape::Text { .. }
+            | Shape::Pencil {
+                geometry: PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_),
+                ..
+            }
+    ) {
         return false;
-    };
+    }
     handles(annotation).into_iter().any(|(kind, handle)| {
         matches!(
             kind,
-            HandleKind::Start | HandleKind::End | HandleKind::Vertex(_)
+            HandleKind::Start
+                | HandleKind::End
+                | HandleKind::Vertex(_)
+                | HandleKind::NorthWest
+                | HandleKind::NorthEast
+                | HandleKind::SouthEast
+                | HandleKind::SouthWest
         ) && point.distance(handle) > tolerance
             && point.distance(handle) <= tolerance * 2.5
     })
@@ -308,8 +348,14 @@ fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
             text,
             ..
         } => {
-            distance_to_polyline(point, &baseline(*anchor, *angle, *bend, text, *font_size))
-                <= tolerance + *font_size / 2.0
+            let curve = baseline(*anchor, *angle, *bend, text, *font_size);
+            let chord = anchor.distance(*curve.last().unwrap_or(anchor));
+            let scale = if chord > f32::EPSILON {
+                polyline_length(&curve) / chord
+            } else {
+                1.0
+            };
+            distance_to_polyline(point, &curve) <= tolerance + *font_size * scale / 2.0
         }
     }
 }

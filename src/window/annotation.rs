@@ -6,7 +6,7 @@ use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, HIGHLIGHT_STROKE_WIDTH,
     MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect, Shape, StrokeStyle,
 };
-use crate::tools::annotation::edit::{handle_drag, moved, rotated_text};
+use crate::tools::annotation::edit::{handle_drag, moved, rotated};
 use crate::tools::annotation::hit::{HitKind, cursor_for_hit, hit_test};
 use crate::tools::annotation::render_annotation_preview;
 use crate::window::tool::Tool;
@@ -151,7 +151,7 @@ impl ViewerWindow {
                             start: point,
                         },
                         HitKind::Rotate => {
-                            let center = text_midpoint(&original);
+                            let center = rotation_center(&original);
                             AnnotationDrag::Rotate {
                                 original,
                                 center,
@@ -451,7 +451,7 @@ impl ViewerWindow {
                 center,
                 start_angle,
                 ..
-            } => rotated_text(
+            } => rotated(
                 original,
                 (pointer.y - center.y).atan2(pointer.x - center.x) - start_angle,
                 modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
@@ -586,7 +586,7 @@ impl ViewerWindow {
                     ..
                 } => crate::i18n::gettext("Pencil line"),
                 Shape::Pencil {
-                    geometry: PencilGeometry::Rectangle(_),
+                    geometry: PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_),
                     ..
                 } => crate::i18n::gettext("Pencil rectangle"),
                 Shape::Pencil {
@@ -943,12 +943,10 @@ impl ViewerWindow {
                 .round() as i32,
         );
         let attributes = gtk::pango::AttrList::new();
-        // The canvas renderer places raw Excalifont glyph advances. Give the
-        // invisible native editor the same layout so its caret stays on the
-        // visible preview, including across whitespace.
+        // Match the canvas shaper so the caret follows the visible preview.
         attributes.insert(gtk::pango::AttrString::new_family("Excalifont"));
         attributes.insert(gtk::pango::AttrFontFeatures::new(
-            "kern=0,liga=0,clig=0,calt=0",
+            crate::tools::annotation::font::FONT_FEATURES,
         ));
         attributes.insert(gtk::pango::AttrInt::new_fallback(false));
         attributes.insert(gtk::pango::AttrSize::new_size_absolute(
@@ -1037,7 +1035,10 @@ impl ViewerWindow {
     }
 }
 
-fn text_midpoint(annotation: &Annotation) -> Point {
+fn rotation_center(annotation: &Annotation) -> Point {
+    if let Shape::Pencil { geometry, .. } = &annotation.shape {
+        return crate::tools::annotation::pencil::geometry_bounds(geometry).center();
+    }
     if let Shape::Text {
         anchor,
         angle,
@@ -1075,20 +1076,14 @@ fn reset_arrow_control(annotation: &mut Annotation, hit: HitKind) -> bool {
 
 fn highlight_creation_rect(start: Point, pointer: Point) -> Rect {
     const MINIMUM_SIZE: f32 = 4.0;
-    let endpoint = |origin: f32, value: f32| {
-        if value >= origin {
-            origin + (value - origin).max(MINIMUM_SIZE)
-        } else {
-            origin - (origin - value).max(MINIMUM_SIZE)
-        }
-    };
-    Rect::from_points(
-        start,
-        Point {
-            x: endpoint(start.x, pointer.x),
-            y: endpoint(start.y, pointer.y),
-        },
-    )
+    let radius_x = (pointer.x - start.x).abs().max(MINIMUM_SIZE / 2.0);
+    let radius_y = (pointer.y - start.y).abs().max(MINIMUM_SIZE / 2.0);
+    Rect {
+        x: start.x - radius_x,
+        y: start.y - radius_y,
+        width: radius_x * 2.0,
+        height: radius_y * 2.0,
+    }
 }
 
 #[cfg(test)]
@@ -1132,23 +1127,42 @@ mod tests {
     }
 
     #[test]
+    fn highlight_drags_keep_the_press_point_at_the_center_in_every_direction() {
+        let start = Point { x: 50.0, y: 60.0 };
+        for dx in [-20.0, 0.0, 20.0] {
+            for dy in [-10.0, 0.0, 10.0] {
+                let rect = highlight_creation_rect(
+                    start,
+                    Point {
+                        x: start.x + dx,
+                        y: start.y + dy,
+                    },
+                );
+                assert_eq!(rect.center(), start);
+                assert_eq!(rect.width, if dx == 0.0 { 4.0 } else { 40.0 });
+                assert_eq!(rect.height, if dy == 0.0 { 4.0 } else { 20.0 });
+            }
+        }
+    }
+
+    #[test]
     fn narrow_highlight_drags_still_create_a_four_pixel_minor_axis() {
         assert_eq!(
             highlight_creation_rect(Point { x: 10.0, y: 10.0 }, Point { x: 20.0, y: 11.0 }),
             Rect {
-                x: 10.0,
-                y: 10.0,
-                width: 10.0,
+                x: 0.0,
+                y: 8.0,
+                width: 20.0,
                 height: 4.0,
             }
         );
         assert_eq!(
             highlight_creation_rect(Point { x: 10.0, y: 10.0 }, Point { x: 9.0, y: 0.0 }),
             Rect {
-                x: 6.0,
+                x: 8.0,
                 y: 0.0,
                 width: 4.0,
-                height: 10.0,
+                height: 20.0,
             }
         );
     }

@@ -16,6 +16,9 @@ pub fn outline_points(geometry: &PencilGeometry) -> Vec<Point> {
             .collect(),
         PencilGeometry::Line(points) => points.clone(),
         PencilGeometry::Rectangle(rect) => rectangle_points(*rect),
+        PencilGeometry::RotatedRectangle(points) => {
+            points.iter().copied().chain([points[0]]).collect()
+        }
         PencilGeometry::Ellipse(rect) => ellipse_points(*rect, SELECTION_ELLIPSE_SEGMENTS),
     }
 }
@@ -28,6 +31,7 @@ pub fn geometry_bounds(geometry: &PencilGeometry) -> Rect {
             y: point.y,
         })),
         PencilGeometry::Line(points) => point_bounds(points.iter().copied()),
+        PencilGeometry::RotatedRectangle(points) => point_bounds(points.iter().copied()),
         PencilGeometry::Rectangle(rect) | PencilGeometry::Ellipse(rect) => *rect,
     }
 }
@@ -38,6 +42,10 @@ pub fn stroke_for(geometry: &PencilGeometry, style: StrokeStyle, anti_aliasing: 
         PencilGeometry::Freehand(points) => (points.clone(), StrokePath::Smooth),
         PencilGeometry::Line(points) => (
             points.iter().copied().map(brush).collect(),
+            StrokePath::Linear,
+        ),
+        PencilGeometry::RotatedRectangle(_) => (
+            outline_points(geometry).into_iter().map(brush).collect(),
             StrokePath::Linear,
         ),
         PencilGeometry::Rectangle(rect) => (

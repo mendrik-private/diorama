@@ -76,6 +76,7 @@ pub enum PencilGeometry {
     Freehand(Vec<BrushPoint>),
     Line(Vec<Point>),
     Rectangle(Rect),
+    RotatedRectangle([Point; 4]),
     Ellipse(Rect),
 }
 
@@ -266,6 +267,11 @@ fn transform_annotation(annotation: &mut Annotation, transform: TransformKind) {
                         });
                         point.x = transformed.x;
                         point.y = transformed.y;
+                    }
+                }
+                PencilGeometry::RotatedRectangle(points) => {
+                    for point in points {
+                        *point = transform.point(*point);
                     }
                 }
                 PencilGeometry::Line(points) => {

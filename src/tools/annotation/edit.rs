@@ -4,6 +4,7 @@ use super::arrow::{chord_relative_control, control_from_chord};
 use super::font::text_advance;
 use super::hit::HandleKind;
 use super::pencil::geometry_bounds;
+use super::text::clamped_bend;
 
 #[must_use]
 pub fn moved(annotation: &Annotation, delta: Point, snap: bool) -> Annotation {
@@ -19,6 +20,12 @@ pub fn moved(annotation: &Annotation, delta: Point, snap: bool) -> Annotation {
     match &mut changed.shape {
         Shape::Pencil { geometry, .. } => match geometry {
             PencilGeometry::Freehand(points) => {
+                for point in points {
+                    point.x += delta.x;
+                    point.y += delta.y;
+                }
+            }
+            PencilGeometry::RotatedRectangle(points) => {
                 for point in points {
                     point.x += delta.x;
                     point.y += delta.y;
@@ -82,6 +89,48 @@ pub fn handle_drag(
     let mut changed = annotation.clone();
     match &mut changed.shape {
         Shape::Pencil { geometry, .. } => match geometry {
+            PencilGeometry::RotatedRectangle(points) => {
+                // Resize in the rectangle's own basis, including after image scaling/flipping.
+                let origin = points[0];
+                let u = Point {
+                    x: points[1].x - origin.x,
+                    y: points[1].y - origin.y,
+                };
+                let v = Point {
+                    x: points[3].x - origin.x,
+                    y: points[3].y - origin.y,
+                };
+                let width = u.x.hypot(u.y);
+                let height = v.x.hypot(v.y);
+                let determinant = u.x * v.y - u.y * v.x;
+                if determinant.abs() > f32::EPSILON {
+                    let dx = pointer.x - origin.x;
+                    let dy = pointer.y - origin.y;
+                    let local = Point {
+                        x: (dx * v.y - dy * v.x) / determinant * width,
+                        y: (u.x * dy - u.y * dx) / determinant * height,
+                    };
+                    let resized = resized_rect(
+                        Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            width,
+                            height,
+                        },
+                        kind,
+                        local,
+                        preserve_aspect,
+                    );
+                    for (point, local) in points.iter_mut().zip(super::pencil::outline_points(
+                        &PencilGeometry::Rectangle(resized),
+                    )) {
+                        *point = Point {
+                            x: origin.x + u.x * local.x / width + v.x * local.y / height,
+                            y: origin.y + u.y * local.x / width + v.y * local.y / height,
+                        };
+                    }
+                }
+            }
             PencilGeometry::Line(points) => match kind {
                 HandleKind::Start => {
                     if let Some(start) = points.first_mut() {
@@ -157,6 +206,7 @@ pub fn handle_drag(
                 let length_at_one = text_advance(text, 1.0).max(f32::EPSILON);
                 *font_size = anchor.distance(pointer) / length_at_one;
                 *angle = (pointer.y - anchor.y).atan2(pointer.x - anchor.x);
+                *bend = clamped_bend(*bend, text_advance(text, *font_size));
             }
             HandleKind::Start => {
                 let end = Point {
@@ -167,14 +217,17 @@ pub fn handle_drag(
                 *font_size = end.distance(pointer) / length_at_one;
                 *angle = (end.y - pointer.y).atan2(end.x - pointer.x);
                 *anchor = pointer;
+                *bend = clamped_bend(*bend, text_advance(text, *font_size));
             }
             HandleKind::Control => {
                 let midpoint = Point {
                     x: anchor.x + text_advance(text, *font_size) * angle.cos() / 2.0,
                     y: anchor.y + text_advance(text, *font_size) * angle.sin() / 2.0,
                 };
-                *bend = (pointer.x - midpoint.x)
+                // The visible midpoint is at half the quadratic control height.
+                let height = (pointer.x - midpoint.x)
                     .mul_add(-angle.sin(), (pointer.y - midpoint.y) * angle.cos());
+                *bend = clamped_bend(height * 2.0, text_advance(text, *font_size));
             }
             _ => {}
         },
@@ -209,8 +262,22 @@ fn resize_freehand(points: &mut [crate::document::BrushPoint], original: Rect, r
 }
 
 #[must_use]
-pub fn rotated_text(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotation {
+pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotation {
     let mut changed = annotation.clone();
+    if let Shape::Pencil { geometry, .. } = &mut changed.shape {
+        if matches!(
+            geometry,
+            PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_)
+        ) {
+            let outline = super::pencil::outline_points(geometry);
+            let center = outline[0].midpoint(outline[2]);
+            let delta = rotation_delta(delta_angle, snap);
+            *geometry = PencilGeometry::RotatedRectangle(std::array::from_fn(|i| {
+                rotate_point(outline[i], center, delta)
+            }));
+        }
+        return changed;
+    }
     let Shape::Text {
         anchor,
         angle,
@@ -226,24 +293,29 @@ pub fn rotated_text(annotation: &Annotation, delta_angle: f32, snap: bool) -> An
         y: anchor.y + text_advance(text, *font_size) * angle.sin(),
     };
     let midpoint = anchor.midpoint(end);
-    let delta = if snap {
-        let step = 15.0_f32.to_radians();
-        (delta_angle / step).round() * step
-    } else {
-        delta_angle
-    };
-    let cos = delta.cos();
-    let sin = delta.sin();
-    let relative = Point {
-        x: anchor.x - midpoint.x,
-        y: anchor.y - midpoint.y,
-    };
-    *anchor = Point {
-        x: midpoint.x + relative.x * cos - relative.y * sin,
-        y: midpoint.y + relative.x * sin + relative.y * cos,
-    };
+    let delta = rotation_delta(delta_angle, snap);
+    *anchor = rotate_point(*anchor, midpoint, delta);
     *angle += delta;
     changed
+}
+
+fn rotation_delta(delta: f32, snap: bool) -> f32 {
+    if snap {
+        let step = 15.0_f32.to_radians();
+        (delta / step).round() * step
+    } else {
+        delta
+    }
+}
+
+fn rotate_point(point: Point, center: Point, angle: f32) -> Point {
+    let (sin, cos) = angle.sin_cos();
+    let x = point.x - center.x;
+    let y = point.y - center.y;
+    Point {
+        x: center.x + x * cos - y * sin,
+        y: center.y + x * sin + y * cos,
+    }
 }
 
 fn resized_rect(rect: Rect, kind: HandleKind, pointer: Point, preserve_aspect: bool) -> Rect {
@@ -328,6 +400,144 @@ fn resized_rect(rect: Rect, kind: HandleKind, pointer: Point, preserve_aspect: b
 mod tests {
     use super::*;
     use crate::document::{AnnotationId, BrushPoint, StrokeStyle};
+
+    #[test]
+    fn rectangle_rotation_keeps_editing_and_closed_stroke_geometry() {
+        use super::super::hit::{HitKind, handles, hit_test};
+        use super::super::pencil::{outline_points, stroke_for};
+
+        let original = Annotation {
+            id: AnnotationId(9),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Rectangle(Rect {
+                    x: 40.0,
+                    y: 40.0,
+                    width: 120.0,
+                    height: 80.0,
+                }),
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        let close = |a: Point, b: Point| assert!(a.distance(b) < 0.001, "{a:?} != {b:?}");
+        for annotation in [
+            original.clone(),
+            rotated(&original, 37.0_f32.to_radians(), false),
+        ] {
+            let corner = handles(&annotation)[0].1;
+            assert_eq!(
+                hit_test(
+                    std::slice::from_ref(&annotation),
+                    Some(annotation.id),
+                    corner,
+                    8.0
+                )
+                .unwrap()
+                .kind,
+                HitKind::Handle(HandleKind::NorthWest)
+            );
+            let nearby = Point {
+                x: corner.x - 12.0,
+                y: corner.y,
+            };
+            assert_eq!(
+                hit_test(
+                    std::slice::from_ref(&annotation),
+                    Some(annotation.id),
+                    nearby,
+                    8.0
+                )
+                .unwrap()
+                .kind,
+                HitKind::Rotate
+            );
+            assert!(
+                !matches!(hit_test(std::slice::from_ref(&annotation), None, nearby, 8.0), Some(hit) if hit.kind == HitKind::Rotate)
+            );
+        }
+        let turned = rotated(&original, std::f32::consts::FRAC_PI_2, false);
+        let positions = handles(&turned);
+        close(positions[0].1, Point { x: 140.0, y: 20.0 });
+        close(positions[4].1, Point { x: 60.0, y: 140.0 });
+        let resized = handle_drag(
+            &turned,
+            HandleKind::SouthEast,
+            Point { x: 40.0, y: 180.0 },
+            false,
+        );
+        close(handles(&resized)[0].1, positions[0].1);
+        close(handles(&resized)[4].1, Point { x: 40.0, y: 180.0 });
+        let restored = rotated(&turned, -std::f32::consts::FRAC_PI_2, false);
+        for (actual, expected) in handles(&restored).iter().zip(handles(&original)) {
+            close(actual.1, expected.1);
+        }
+        let snapped = rotated(&original, 38.0_f32.to_radians(), true);
+        let expected = rotated(&original, 45.0_f32.to_radians(), false);
+        for (actual, expected) in handles(&snapped).iter().zip(handles(&expected)) {
+            close(actual.1, expected.1);
+        }
+        let translated = moved(&turned, Point { x: 10.0, y: -5.0 }, false);
+        close(handles(&translated)[0].1, Point { x: 150.0, y: 15.0 });
+        let Shape::Pencil {
+            geometry,
+            style,
+            anti_aliasing,
+        } = &turned.shape
+        else {
+            unreachable!()
+        };
+        let outline = outline_points(geometry);
+        assert_eq!(outline.len(), 5);
+        assert_eq!(outline.first(), outline.last());
+        let stroke = stroke_for(geometry, *style, *anti_aliasing);
+        assert_eq!(stroke.points.len(), 5);
+        for (point, expected) in stroke.points.iter().zip(outline) {
+            close(
+                Point {
+                    x: point.x,
+                    y: point.y,
+                },
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn text_bend_handle_tracks_pointer_and_stops_at_limit() {
+        let text = "Bending";
+        let width = text_advance(text, 24.0);
+        let annotation = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Text {
+                anchor: Point::default(),
+                angle: 0.0,
+                font_size: 24.0,
+                bend: 0.0,
+                text: text.to_owned(),
+                color: [255, 0, 0, 255],
+            },
+        };
+        for height in [-10000.0_f32, -5.0, 5.0, 10000.0] {
+            let changed = handle_drag(
+                &annotation,
+                HandleKind::Control,
+                Point {
+                    x: width / 2.0,
+                    y: height,
+                },
+                false,
+            );
+            let handles = super::super::hit::handles(&changed);
+            let (_, midpoint) = handles
+                .iter()
+                .find(|(kind, _)| *kind == HandleKind::Control)
+                .unwrap();
+            assert!((midpoint.y - height.clamp(-width / 4.0, width / 4.0)).abs() < 1e-4);
+        }
+    }
 
     #[test]
     fn highlight_resize_keeps_the_opposite_edge_pinned_at_minimum_size() {

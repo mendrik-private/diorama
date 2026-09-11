@@ -7226,8 +7226,11 @@ mod tests {
         ));
         assert!(matches!(
             pencil_geometry(PencilDragMode::Circle, &[start, end]),
-            Some(PencilGeometry::Ellipse(Rect { width, height, .. }))
-                if (width - height).abs() <= f32::EPSILON
+            Some(PencilGeometry::Ellipse(rect))
+                if rect.center() == (Point { x: start.x, y: start.y })
+                    && (rect.width - rect.height).abs() <= f32::EPSILON
+                    && (rect.width / 2.0 - Point { x: start.x, y: start.y }
+                        .distance(Point { x: end.x, y: end.y })).abs() <= f32::EPSILON
         ));
     }
 
@@ -7859,6 +7862,8 @@ mod tests {
         editor.set_text(sample);
         window.0.window.present();
         while glib::MainContext::default().iteration(false) {}
+        window.position_text_editor();
+        while glib::MainContext::default().iteration(false) {}
         let assert_caret_matches_preview = || {
             let caret_origin = editor.compute_cursor_extents(0).0.x();
             let rendered_font_size = window
@@ -7869,15 +7874,17 @@ mod tests {
                 .expect("inline text editor")
                 .font_size
                 * window.0.canvas.image_scale();
+            let shaped = crate::tools::annotation::font::shape_text(sample, rendered_font_size);
             for position in 0..=sample.len() {
                 let actual = editor.compute_cursor_extents(position).0.x() - caret_origin;
-                let expected = crate::tools::annotation::font::text_advance(
-                    &sample[..position],
-                    rendered_font_size,
-                );
+                let expected: f32 = shaped
+                    .iter()
+                    .take(position)
+                    .map(|glyph| glyph.advance)
+                    .sum();
                 assert!(
                     (actual - expected).abs() <= 1.0,
-                    "caret at {position} is {actual}, rendered prefix advance is {expected}"
+                    "caret at {position} is {actual}, shaped text advance is {expected}"
                 );
             }
         };

@@ -4,6 +4,44 @@ use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
 static FACE: OnceLock<Face<'static>> = OnceLock::new();
 static FONT_BYTES: &[u8] = include_bytes!("../../../data/fonts/Excalifont-Regular.ttf");
+static SHAPING_FACE: OnceLock<rustybuzz::Face<'static>> = OnceLock::new();
+
+pub struct ShapedGlyph {
+    pub glyph: GlyphId,
+    pub advance: f32,
+    pub x_offset: f32,
+    pub y_offset: f32,
+}
+
+/// Keep discretionary substitutions consistent with the inline editor.
+pub const FONT_FEATURES: &str = "kern=1,liga=0,clig=0,calt=0";
+
+#[must_use]
+pub fn shape_text(text: &str, font_size: f32) -> Vec<ShapedGlyph> {
+    let face = SHAPING_FACE.get_or_init(|| {
+        rustybuzz::Face::from_slice(FONT_BYTES, 0).expect("embedded Excalifont is valid")
+    });
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let features: Vec<_> = FONT_FEATURES
+        .split(',')
+        .map(|feature| feature.parse().expect("valid font feature"))
+        .collect();
+    let shaped = rustybuzz::shape(face, &features, buffer);
+    let scale = font_size / units_per_em();
+    shaped
+        .glyph_infos()
+        .iter()
+        .zip(shaped.glyph_positions())
+        .map(|(info, position)| ShapedGlyph {
+            glyph: GlyphId(info.glyph_id as u16),
+            advance: position.x_advance as f32 * scale,
+            x_offset: position.x_offset as f32 * scale,
+            y_offset: position.y_offset as f32 * scale,
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutlineCommand {
@@ -44,6 +82,7 @@ pub fn face() -> &'static Face<'static> {
     FACE.get_or_init(|| Face::parse(FONT_BYTES, 0).expect("embedded Excalifont is valid"))
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn glyph_id(character: char) -> GlyphId {
     face().glyph_index(character).unwrap_or(GlyphId(0))
@@ -54,6 +93,7 @@ pub fn units_per_em() -> f32 {
     f32::from(face().units_per_em())
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn glyph_advance(glyph: GlyphId, font_size: f32) -> f32 {
     f32::from(face().glyph_hor_advance(glyph).unwrap_or(0)) * font_size / units_per_em()
@@ -61,8 +101,9 @@ pub fn glyph_advance(glyph: GlyphId, font_size: f32) -> f32 {
 
 #[must_use]
 pub fn text_advance(text: &str, font_size: f32) -> f32 {
-    text.chars()
-        .map(|character| glyph_advance(glyph_id(character), font_size))
+    shape_text(text, font_size)
+        .iter()
+        .map(|glyph| glyph.advance)
         .sum()
 }
 
@@ -90,5 +131,22 @@ mod tests {
         }
         assert!(text_advance("hello", 24.0) > text_advance("hell", 24.0));
         assert!(text_advance("x", 48.0) > text_advance("x", 24.0));
+    }
+
+    #[test]
+    fn shaping_applies_excalifont_pair_kerning() {
+        // Excalifont does not adjust every conventional kerning pair (e.g. AV).
+        let has_adjusted_pair = ('A'..='z').any(|left| {
+            ('A'..='z').any(|right| {
+                let unkerned =
+                    glyph_advance(glyph_id(left), 24.0) + glyph_advance(glyph_id(right), 24.0);
+                (text_advance(&format!("{left}{right}"), 24.0) - unkerned).abs() > 0.01
+            })
+        });
+        assert!(
+            has_adjusted_pair,
+            "font pair positioning must affect advances"
+        );
+        assert!(text_advance("A  V", 24.0) > text_advance("A V", 24.0));
     }
 }

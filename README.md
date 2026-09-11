@@ -156,6 +156,8 @@ operations and are composited into the exported image.
   annotations after placing them.
 - Keep labels visually consistent with the bundled Excalifont, independent of
   fonts installed on the system.
+- Curved text uses font kerning and scales proportionally between its endpoints,
+  with bending limited to a 90° change in direction.
 
 ### Export with control
 
