@@ -1,4 +1,8 @@
 /target/
 /build/
+/build-local*/
+/build-property-fix/
+/build-release*/
+/build-repo/
 /.flatpak-builder/
 /.rust-repo-intelligence/index.sqlite3
