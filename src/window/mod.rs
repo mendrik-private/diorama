@@ -266,8 +266,32 @@ struct ZoomGestureAnchor {
     start_zoom: f64,
     content_x: f64,
     content_y: f64,
-    horizontal_value: f64,
-    vertical_value: f64,
+    viewport_x: f64,
+    viewport_y: f64,
+    image_width: f64,
+    image_height: f64,
+}
+
+impl ZoomGestureAnchor {
+    fn scaled_to(self, zoom: f64) -> Self {
+        let factor = zoom / self.start_zoom;
+        Self {
+            start_zoom: zoom,
+            content_x: self.content_x * factor,
+            content_y: self.content_y * factor,
+            image_width: self.image_width * factor,
+            image_height: self.image_height * factor,
+            ..self
+        }
+    }
+
+    fn horizontal_target(self, page_size: f64) -> f64 {
+        (page_size - self.image_width).max(0.0) / 2.0 + self.content_x - self.viewport_x
+    }
+
+    fn vertical_target(self, page_size: f64) -> f64 {
+        (page_size - self.image_height).max(0.0) / 2.0 + self.content_y - self.viewport_y
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6019,20 +6043,20 @@ impl ViewerWindow {
     fn install_gestures(&self) {
         let zoom = gtk::GestureZoom::new();
         let zoom_anchor = Rc::new(Cell::new(None::<ZoomGestureAnchor>));
-        let zoom_adjustment_target = Rc::new(Cell::new(None::<(f64, f64)>));
+        let zoom_adjustment_target = Rc::new(Cell::new(None::<ZoomGestureAnchor>));
         self.0.scrolled.hadjustment().connect_changed({
             let zoom_adjustment_target = zoom_adjustment_target.clone();
             move |adjustment| {
-                if let Some((target, _)) = zoom_adjustment_target.get() {
-                    adjustment.set_value(target);
+                if let Some(target) = zoom_adjustment_target.get() {
+                    adjustment.set_value(target.horizontal_target(adjustment.page_size()));
                 }
             }
         });
         self.0.scrolled.vadjustment().connect_changed({
             let zoom_adjustment_target = zoom_adjustment_target.clone();
             move |adjustment| {
-                if let Some((_, target)) = zoom_adjustment_target.get() {
-                    adjustment.set_value(target);
+                if let Some(target) = zoom_adjustment_target.get() {
+                    adjustment.set_value(target.vertical_target(adjustment.page_size()));
                 }
             }
         });
@@ -6042,16 +6066,36 @@ impl ViewerWindow {
             move |gesture, _| {
                 let horizontal = this.0.scrolled.hadjustment();
                 let vertical = this.0.scrolled.vadjustment();
+                let canvas_offset_x =
+                    (horizontal.page_size() - f64::from(this.0.canvas.width())).max(0.0) / 2.0;
+                let canvas_offset_y =
+                    (vertical.page_size() - f64::from(this.0.canvas.height())).max(0.0) / 2.0;
                 let (content_x, content_y) = gesture.bounding_box_center().unwrap_or((
-                    horizontal.value() + horizontal.page_size() / 2.0,
-                    vertical.value() + vertical.page_size() / 2.0,
+                    horizontal.value() + horizontal.page_size() / 2.0 - canvas_offset_x,
+                    vertical.value() + vertical.page_size() / 2.0 - canvas_offset_y,
                 ));
+                let Some(texture) = this.0.canvas.texture() else {
+                    return;
+                };
+                let Some(bounds) = this.0.canvas.crop_display_bounds(CropOverlay {
+                    x: 0,
+                    y: 0,
+                    width: texture.width() as u32,
+                    height: texture.height() as u32,
+                    image_width: texture.width() as u32,
+                    image_height: texture.height() as u32,
+                }) else {
+                    return;
+                };
                 zoom_anchor.set(Some(ZoomGestureAnchor {
                     start_zoom: this.0.canvas.zoom(),
-                    content_x,
-                    content_y,
-                    horizontal_value: horizontal.value(),
-                    vertical_value: vertical.value(),
+                    // The anchor belongs to the image, excluding centered margins.
+                    content_x: content_x - f64::from(bounds.x()),
+                    content_y: content_y - f64::from(bounds.y()),
+                    viewport_x: content_x + canvas_offset_x - horizontal.value(),
+                    viewport_y: content_y + canvas_offset_y - vertical.value(),
+                    image_width: f64::from(bounds.width()),
+                    image_height: f64::from(bounds.height()),
                 }));
             }
         });
@@ -6064,23 +6108,13 @@ impl ViewerWindow {
                     return;
                 };
                 let target_zoom = (anchor.start_zoom * scale).clamp(0.01, 64.0);
-                let applied_factor = target_zoom / anchor.start_zoom;
-                let horizontal_target = anchored_adjustment_value(
-                    anchor.horizontal_value,
-                    anchor.content_x,
-                    applied_factor,
-                );
-                let vertical_target = anchored_adjustment_value(
-                    anchor.vertical_value,
-                    anchor.content_y,
-                    applied_factor,
-                );
-                zoom_adjustment_target.set(Some((horizontal_target, vertical_target)));
+                let target = anchor.scaled_to(target_zoom);
+                zoom_adjustment_target.set(Some(target));
                 this.set_zoom_with_alignment(target_zoom, false);
                 let horizontal = this.0.scrolled.hadjustment();
                 let vertical = this.0.scrolled.vadjustment();
-                horizontal.set_value(horizontal_target);
-                vertical.set_value(vertical_target);
+                horizontal.set_value(target.horizontal_target(horizontal.page_size()));
+                vertical.set_value(target.vertical_target(vertical.page_size()));
             }
         });
         zoom.connect_end({
@@ -6088,28 +6122,21 @@ impl ViewerWindow {
             let zoom_anchor = zoom_anchor.clone();
             let zoom_adjustment_target = zoom_adjustment_target.clone();
             move |_, _| {
-                if let Some(anchor) = zoom_anchor.take() {
-                    let target_zoom = if this.0.canvas.filter() == ZoomFilter::Hard {
-                        aligned_hard_zoom(this.0.canvas.zoom(), this.0.render_scale.get())
-                    } else {
-                        this.0.canvas.zoom()
-                    };
-                    let applied_factor = target_zoom / anchor.start_zoom;
-                    let horizontal_target = anchored_adjustment_value(
-                        anchor.horizontal_value,
-                        anchor.content_x,
-                        applied_factor,
-                    );
-                    let vertical_target = anchored_adjustment_value(
-                        anchor.vertical_value,
-                        anchor.content_y,
-                        applied_factor,
-                    );
-                    this.set_zoom(target_zoom);
-                    this.0.scrolled.hadjustment().set_value(horizontal_target);
-                    this.0.scrolled.vadjustment().set_value(vertical_target);
-                }
-                zoom_adjustment_target.set(None);
+                zoom_anchor.set(None);
+                // Preserve the continuous pinch scale, including in hard rendering mode.
+                // Keep the anchor through the pending layout; tick callbacks run before layout.
+                let zoom_anchor = zoom_anchor.clone();
+                let zoom_adjustment_target = zoom_adjustment_target.clone();
+                let layout_pending = Cell::new(true);
+                this.0.canvas.add_tick_callback(move |_, _| {
+                    if layout_pending.replace(false) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if zoom_anchor.get().is_none() {
+                        zoom_adjustment_target.set(None);
+                    }
+                    glib::ControlFlow::Break
+                });
             }
         });
         zoom.connect_cancel({
@@ -7543,6 +7570,76 @@ mod tests {
             source_zoom * f64::from(source_width),
             preview_zoom * f64::from(target_width)
         );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pinch_keeps_its_final_scale_when_released() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PinchZoomTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let texture = texture_from_rgba(&image::RgbaImage::new(1_600, 1_200)).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
+        let controllers = window.0.canvas.observe_controllers();
+        let gesture = (0..controllers.n_items())
+            .find_map(|index| controllers.item(index)?.downcast::<gtk::GestureZoom>().ok())
+            .expect("installed pinch gesture");
+        let sequence = None::<gtk::gdk::EventSequence>;
+
+        for filter in [ZoomFilter::Soft, ZoomFilter::Hard] {
+            window.0.canvas.set_filter(filter);
+            window.set_zoom_with_alignment(0.5, false);
+            window.0.scrolled.allocate(800, 600, -1, None);
+            gesture.emit_by_name::<()>("begin", &[&sequence]);
+            gesture.emit_by_name::<()>("scale-changed", &[&0.8_f64]);
+            assert!((window.0.canvas.zoom() - 0.4).abs() < 1e-9);
+            gesture.emit_by_name::<()>("end", &[&sequence]);
+            assert!(
+                (window.0.canvas.zoom() - 0.4).abs() < 1e-9,
+                "{filter:?}: releasing a pinch must preserve its final scale, got {}",
+                window.0.canvas.zoom()
+            );
+            for release_before_layout in [false, true] {
+                for (width, height) in [(1_600, 400), (400, 1_600)] {
+                    let texture = texture_from_rgba(&image::RgbaImage::new(width, height)).unwrap();
+                    window.0.canvas.set_texture(Some(&texture));
+                    window.set_zoom_with_alignment(0.5, false);
+                    window.0.scrolled.allocate(800, 600, -1, None);
+                    // Start at the center even when the preceding scenario was panned.
+                    window.0.scrolled.hadjustment().set_value(0.0);
+                    window.0.scrolled.vadjustment().set_value(0.0);
+                    let horizontal = window.0.scrolled.hadjustment();
+                    let vertical = window.0.scrolled.vadjustment();
+                    let anchor_x = horizontal.page_size() / 2.0;
+                    let anchor_y = vertical.page_size() / 2.0;
+                    let image_x = (anchor_x
+                        - (horizontal.page_size() - f64::from(width) * 0.5).max(0.0) / 2.0)
+                        * 4.0;
+                    let image_y = (anchor_y
+                        - (vertical.page_size() - f64::from(height) * 0.5).max(0.0) / 2.0)
+                        * 4.0;
+                    gesture.emit_by_name::<()>("begin", &[&sequence]);
+                    gesture.emit_by_name::<()>("scale-changed", &[&4.0_f64]);
+                    if release_before_layout {
+                        gesture.emit_by_name::<()>("end", &[&sequence]);
+                    }
+                    window.0.scrolled.allocate(800, 600, -1, None);
+                    assert!(
+                        (image_x - horizontal.value() - anchor_x).abs() < 1.0
+                            && (image_y - vertical.value() - anchor_y).abs() < 1.0,
+                        "{filter:?}, {width}x{height}, release before layout={release_before_layout}: pinch anchor moved"
+                    );
+                    if !release_before_layout {
+                        gesture.emit_by_name::<()>("end", &[&sequence]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
