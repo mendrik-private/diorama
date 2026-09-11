@@ -42,6 +42,11 @@ pub struct ProtectedColor(pub [u8; 4]);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
+    ResizeCanvas {
+        width: u32,
+        height: u32,
+        background: [u8; 4],
+    },
     Crop {
         x: u32,
         y: u32,

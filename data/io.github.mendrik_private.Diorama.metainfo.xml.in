@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.11" date="2026-09-12">
+      <description>
+        <p>Adds Crop to Content, Square Up, and Canvas Resize with automatic solid or transparent background detection. Also lets number keys enter values in focused text fields instead of triggering global zoom shortcuts.</p>
+      </description>
+    </release>
     <release version="0.3.10" date="2026-09-11">
       <description>
         <p>Fixes pinch zoom jumping to another scale on release and keeps the image anchored while zooming through centered margins and pending layout changes.</p>

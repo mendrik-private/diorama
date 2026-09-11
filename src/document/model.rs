@@ -264,6 +264,19 @@ fn apply_operation(
 ) -> Result<RgbaImage> {
     let dynamic = DynamicImage::ImageRgba8(pixels);
     let rendered = match operation {
+        Operation::ResizeCanvas {
+            width,
+            height,
+            background,
+        } => {
+            return tools::canvas_resize::resize(
+                &dynamic.into_rgba8(),
+                *width,
+                *height,
+                *background,
+                cancellation,
+            );
+        }
         Operation::Crop {
             x,
             y,
@@ -386,6 +399,43 @@ mod tests {
                 .pixels
                 .dimensions(),
             (2, 1)
+        );
+    }
+
+    #[test]
+    fn canvas_resize_is_undoable_and_keeps_original_pixels() {
+        let mut document = document();
+        let original = document
+            .render(&CancellationToken::default())
+            .unwrap()
+            .pixels;
+        document.apply(Operation::ResizeCanvas {
+            width: 4,
+            height: 3,
+            background: [10, 20, 30, 255],
+        });
+        let resized = document
+            .render(&CancellationToken::default())
+            .unwrap()
+            .pixels;
+        assert_eq!(resized.dimensions(), (4, 3));
+        assert_eq!(resized.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(resized.get_pixel(1, 1), original.get_pixel(0, 0));
+        assert!(document.undo());
+        assert_eq!(
+            document
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            original
+        );
+        assert!(document.redo());
+        assert_eq!(
+            document
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            resized
         );
     }
 

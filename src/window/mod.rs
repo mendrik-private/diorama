@@ -34,6 +34,7 @@ use gtk::prelude::*;
 use libadwaita as adw;
 
 mod annotation;
+mod canvas_resize;
 mod color;
 mod file_state;
 mod fullscreen_preview;
@@ -448,6 +449,12 @@ fn pencil_zoom_key(
     }
 }
 
+fn text_input_has_focus(window: &impl IsA<gtk::Window>) -> bool {
+    window
+        .focus()
+        .is_some_and(|focus| focus.is::<gtk::Editable>() || focus.is::<gtk::TextView>())
+}
+
 fn compare_metadata_label(file: &gio::File, width: u32, height: u32, xalign: f32) -> gtk::Label {
     let details = compare_metadata(file, width, height);
     gtk::Label::builder()
@@ -514,6 +521,7 @@ struct WindowState {
     annotation_preview: RefCell<Option<Annotation>>,
     annotation_preview_queue: RefCell<annotation::PreviewQueue<Annotation>>,
     text_editor: RefCell<Option<InlineTextEditor>>,
+    focus_accelerator_suppression: RefCell<Option<crate::application::AcceleratorSuppression>>,
     pencil_points: RefCell<Vec<BrushPoint>>,
     pencil_path: Cell<StrokePath>,
     pencil_drag: RefCell<Option<PencilDrag>>,
@@ -977,6 +985,7 @@ impl ViewerWindow {
             annotation_preview: RefCell::new(None),
             annotation_preview_queue: RefCell::new(annotation::PreviewQueue::default()),
             text_editor: RefCell::new(None),
+            focus_accelerator_suppression: RefCell::new(None),
             pencil_points: RefCell::new(Vec::new()),
             pencil_path: Cell::new(StrokePath::Smooth),
             pencil_drag: RefCell::new(None),
@@ -1071,6 +1080,7 @@ impl ViewerWindow {
         }));
         this.install_actions();
         this.update_action_states();
+        this.install_text_input_shortcut_guard();
         this.install_navigation_keys();
         this.install_tool_controls();
         this.install_scale_controls();
@@ -1579,6 +1589,14 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.crop_to_content()
         });
+        self.add_action("square-up", {
+            let this = self.clone();
+            move || this.square_up()
+        });
+        self.add_action("canvas-resize", {
+            let this = self.clone();
+            move || this.show_canvas_resize()
+        });
         self.add_action("scale", {
             let this = self.clone();
             move || this.set_tool(Tool::Scale)
@@ -1718,6 +1736,9 @@ impl ViewerWindow {
                 if this.0.fullscreen_preview.borrow().is_some() {
                     return glib::Propagation::Proceed;
                 }
+                if text_input_has_focus(&this.0.window) {
+                    return glib::Propagation::Proceed;
+                }
                 let Some(direction) =
                     pencil_zoom_key(key, modifiers, this.0.tool.get() == Tool::Pencil)
                 else {
@@ -1743,12 +1764,8 @@ impl ViewerWindow {
                         | gtk::gdk::ModifierType::SUPER_MASK
                         | gtk::gdk::ModifierType::HYPER_MASK
                         | gtk::gdk::ModifierType::META_MASK,
-                ) || gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|focus| {
-                    focus.is::<gtk::Text>()
-                        || focus.is::<gtk::Entry>()
-                        || focus.is::<gtk::TextView>()
-                        || focus.is::<gtk::SpinButton>()
-                }) {
+                ) || text_input_has_focus(&this.0.window)
+                {
                     return glib::Propagation::Proceed;
                 }
                 if this.handle_annotation_key(key, modifiers)
@@ -1822,12 +1839,7 @@ impl ViewerWindow {
                 if this.0.fullscreen_preview.borrow().is_some() {
                     return glib::Propagation::Proceed;
                 }
-                if gtk::prelude::GtkWindowExt::focus(&this.0.window).is_some_and(|focus| {
-                    focus.is::<gtk::Text>()
-                        || focus.is::<gtk::Entry>()
-                        || focus.is::<gtk::TextView>()
-                        || focus.is::<gtk::SpinButton>()
-                }) {
+                if text_input_has_focus(&this.0.window) {
                     return glib::Propagation::Proceed;
                 }
                 let Some(forward) = image_navigation_direction(key, modifiers) else {
@@ -1846,6 +1858,48 @@ impl ViewerWindow {
             move |_, key, _, modifiers| this.fullscreen_preview_key(key, modifiers)
         });
         self.0.window.add_controller(preview);
+    }
+
+    fn install_text_input_shortcut_guard(&self) {
+        self.0.window.connect_focus_widget_notify({
+            let state = Rc::downgrade(&self.0);
+            move |_| {
+                if let Some(state) = state.upgrade() {
+                    ViewerWindow(state).update_text_input_shortcut_guard();
+                }
+            }
+        });
+        if let Some(application) = self.0.window.application() {
+            application.connect_active_window_notify({
+                let state = Rc::downgrade(&self.0);
+                move |_| {
+                    if let Some(state) = state.upgrade() {
+                        ViewerWindow(state).update_text_input_shortcut_guard();
+                    }
+                }
+            });
+        }
+        self.update_text_input_shortcut_guard();
+    }
+
+    fn update_text_input_shortcut_guard(&self) {
+        let is_active_window = self
+            .0
+            .window
+            .application()
+            .and_then(|application| application.active_window())
+            .is_some_and(|active| active == self.0.window);
+        let should_suppress = is_active_window && text_input_has_focus(&self.0.window);
+        let mut suppression = self.0.focus_accelerator_suppression.borrow_mut();
+        if should_suppress && suppression.is_none() {
+            *suppression = self
+                .0
+                .window
+                .application()
+                .map(|application| crate::application::suppress_accelerators(&application));
+        } else if !should_suppress {
+            suppression.take();
+        }
     }
 
     fn active_keyboard_tool(&self) -> Option<KeyboardTool> {
@@ -2262,6 +2316,8 @@ impl ViewerWindow {
             "flip-vertical",
             "scale-preview",
             "crop-content",
+            "square-up",
+            "canvas-resize",
             "scale",
             "palette",
             "pencil",
@@ -3891,6 +3947,7 @@ impl ViewerWindow {
     }
 
     fn crop_to_content(&self) {
+        self.set_tool(Tool::None);
         let Some(image) = self.0.rendered.borrow().clone() else {
             self.0
                 .toasts
@@ -3898,6 +3955,8 @@ impl ViewerWindow {
             return;
         };
         let weak = Rc::downgrade(&self.0);
+        let load_generation = self.0.load_generation.get();
+        let render_generation = self.0.render_generation.get();
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || {
                 if image.pixels().any(|pixel| pixel.0[3] < 255) {
@@ -3910,6 +3969,11 @@ impl ViewerWindow {
             let Some(state) = weak.upgrade() else {
                 return;
             };
+            if state.load_generation.get() != load_generation
+                || state.render_generation.get() != render_generation
+            {
+                return;
+            }
             let bounds = match result {
                 Ok(Ok(Some(bounds))) => bounds,
                 Ok(Ok(None)) => {
@@ -3948,6 +4012,8 @@ impl ViewerWindow {
             dialog.connect_response(None, move |_, response| {
                 if response == "apply"
                     && let Some(state) = weak.upgrade()
+                    && state.load_generation.get() == load_generation
+                    && state.render_generation.get() == render_generation
                 {
                     let this = ViewerWindow(state);
                     this.apply(Operation::Crop {
@@ -6741,6 +6807,9 @@ fn main_menu() -> gio::Menu {
     menu_item(&edit_menu, "Flip Horizontally", "win.flip-horizontal");
     menu_item(&edit_menu, "Flip Vertically", "win.flip-vertical");
     menu_item(&edit_menu, "Scale", "win.scale-preview");
+    menu_item(&edit_menu, "Crop to Content", "win.crop-content");
+    menu_item(&edit_menu, "Square Up", "win.square-up");
+    menu_item(&edit_menu, "Canvas Resize…", "win.canvas-resize");
     menu_submenu(&menu, "Edit", &edit_menu);
     menu_item(&menu, "Magnifying Lens", "win.lens");
     menu_item(&menu, "Fullscreen Image Preview", "win.image-preview");
@@ -7390,6 +7459,9 @@ mod tests {
                 "Flip Horizontally".to_owned(),
                 "Flip Vertically".to_owned(),
                 "Scale".to_owned(),
+                "Crop to Content".to_owned(),
+                "Square Up".to_owned(),
+                "Canvas Resize…".to_owned(),
             ]
         );
         for (index, action) in [
@@ -9052,6 +9124,61 @@ mod tests {
         assert_eq!(window.0.scale_controls.width(), 948);
         assert!(scale_slider_row.width() >= 900);
         assert!(window.0.scale_slider.width() > 700);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn focused_scale_dimension_suppresses_global_shortcuts() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ScaleFocusTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        application.set_accels_for_action("win.zoom-100", &["1"]);
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        window.0.scale_button.set_active(true);
+        window.present();
+
+        window.0.scale_width.grab_focus();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert!(
+            application.accels_for_action("win.zoom-100").is_empty(),
+            "number-key zoom shortcuts must be disabled while a scale field has focus",
+        );
+
+        window.0.scale_slider.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert_eq!(application.accels_for_action("win.zoom-100"), ["1"]);
+
+        window.0.scale_width.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(application.accels_for_action("win.zoom-100").is_empty());
+
+        let other_window = ViewerWindow::new(&application, None);
+        other_window.present();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert_eq!(application.accels_for_action("win.zoom-100"), ["1"]);
     }
 
     #[test]

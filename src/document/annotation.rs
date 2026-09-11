@@ -192,6 +192,12 @@ pub fn fold_annotations(
                 transform_all(&mut annotations, TransformKind::Scale(sx, sy));
                 dimensions = (*width as f32, *height as f32);
             }
+            Operation::ResizeCanvas { width, height, .. } => {
+                let x = crate::tools::canvas_resize::center_offset(dimensions.0 as u32, *width);
+                let y = crate::tools::canvas_resize::center_offset(dimensions.1 as u32, *height);
+                transform_all(&mut annotations, TransformKind::Crop(-x as f32, -y as f32));
+                dimensions = (*width as f32, *height as f32);
+            }
             Operation::Palette { .. } => {}
         }
     }
@@ -467,6 +473,25 @@ mod tests {
             unreachable!()
         };
         assert_eq!((rect.x, rect.y), (-10.0, -10.0));
+    }
+
+    #[test]
+    fn canvas_resize_translates_annotations_without_scaling() {
+        let original = highlight();
+        let operations = [
+            Operation::Annotate(AnnotationEdit::Create(original.clone())),
+            Operation::ResizeCanvas {
+                width: 105,
+                height: 110,
+                background: [0; 4],
+            },
+        ];
+        let mut expected = original;
+        if let Shape::Highlight { rect, .. } = &mut expected.shape {
+            rect.x += 2.0;
+            rect.y += 5.0;
+        }
+        assert_eq!(fold_annotations((100, 100), &operations), vec![expected]);
     }
 
     #[test]

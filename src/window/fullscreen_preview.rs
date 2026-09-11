@@ -110,12 +110,7 @@ impl ViewerWindow {
                     | gtk::gdk::ModifierType::SHIFT_MASK,
             )
             || self.0.window.visible_dialog().is_some()
-            || gtk::prelude::GtkWindowExt::focus(&self.0.window).is_some_and(|focus| {
-                focus.is::<gtk::Text>()
-                    || focus.is::<gtk::Entry>()
-                    || focus.is::<gtk::TextView>()
-                    || focus.is::<gtk::SpinButton>()
-            })
+            || super::text_input_has_focus(&self.0.window)
         {
             return glib::Propagation::Proceed;
         }

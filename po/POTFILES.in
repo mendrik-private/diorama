@@ -17,3 +17,4 @@ src/tools/annotation/render.rs
 src/tools/annotation/text.rs
 src/settings.rs
 src/window/fullscreen_preview.rs
+src/window/canvas_resize.rs
