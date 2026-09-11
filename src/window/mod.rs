@@ -612,12 +612,16 @@ impl ViewerWindow {
         canvas.set_halign(gtk::Align::Center);
         canvas.set_valign(gtk::Align::Center);
 
+        let canvas_viewport = gtk::Viewport::builder()
+            .scroll_to_focus(false)
+            .child(&canvas)
+            .build();
         let scrolled = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
             .hexpand(true)
             .vexpand(true)
-            .child(&canvas)
+            .child(&canvas_viewport)
             .build();
         scrolled.set_margin_top(10);
         scrolled.set_margin_bottom(10);

@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.9" date="2026-09-11">
+      <description>
+        <p>Adds rotation for Pencil rectangles and ellipses, improves curved text with kerning and proportional scaling, makes highlights and circles grow from their center while drawing, and prevents tool focus from shifting a zoomed canvas.</p>
+      </description>
+    </release>
     <release version="0.3.8" date="2026-09-10">
       <description>
         <p>Fixes single-pixel Pencil dots so they never capture a subsequent draw action or expose drag and resize controls.</p>
