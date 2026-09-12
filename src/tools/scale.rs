@@ -14,6 +14,9 @@ mod reference;
 #[cfg(test)]
 mod benchmark;
 
+#[cfg(test)]
+mod halving_experiment;
+
 pub fn resize(
     image: &RgbaImage,
     target_width: u32,
