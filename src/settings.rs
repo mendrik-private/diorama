@@ -129,6 +129,7 @@ impl Settings {
             Some("nearest") => Resampling::Nearest,
             Some("linear") => Resampling::Linear,
             Some("seam-carving") => Resampling::SeamCarving,
+            Some("game-asset") => Resampling::GameAsset,
             _ => Resampling::Bicubic,
         }
     }
@@ -141,6 +142,7 @@ impl Settings {
                 Resampling::Linear => "linear",
                 Resampling::Bicubic => "bicubic",
                 Resampling::SeamCarving => "seam-carving",
+                Resampling::GameAsset => "game-asset",
             },
         );
     }

@@ -1,7 +1,18 @@
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 
 use crate::document::{CancellationToken, Resampling};
 use crate::error::{AppError, Result};
+
+pub mod game_asset;
+mod gpu;
+
+pub use gpu::GpuScaler;
+
+#[cfg(test)]
+mod reference;
+
+#[cfg(test)]
+mod benchmark;
 
 pub fn resize(
     image: &RgbaImage,
@@ -16,11 +27,34 @@ pub fn resize(
     if resampling == Resampling::SeamCarving {
         return seam_carve(image, target_width, target_height, cancellation);
     }
+    if resampling == Resampling::GameAsset {
+        // Operation dimensions are explicit; the scaling tool's Aspect control
+        // supplies the user's choice of uniform versus non-uniform geometry.
+        let options = game_asset::Options {
+            allow_non_uniform: true,
+            ..Default::default()
+        };
+        let result =
+            game_asset::resize(image, target_width, target_height, &options, cancellation)?;
+        tracing::info!(
+            retained = result.diagnostics.retained.len(),
+            dropped = result.diagnostics.dropped.len(),
+            unresolved = result.diagnostics.unresolved.len(),
+            samples = result.provenance.len(),
+            gpu_wavelets = result.gpu_wavelets,
+            "Game Asset scaling complete"
+        );
+        tracing::debug!(diagnostics=?result.diagnostics, options=?result.options, "Game Asset scaling report");
+        return Ok(result.image);
+    }
     cancellation.check()?;
-    let source = fast_image_resize::images::Image::from_vec_u8(
+    if image.dimensions() == (target_width, target_height) {
+        return Ok(image.clone());
+    }
+    let source = fast_image_resize::images::ImageRef::new(
         image.width(),
         image.height(),
-        image.as_raw().clone(),
+        image.as_raw(),
         fast_image_resize::PixelType::U8x4,
     )
     .map_err(|_| AppError::InvalidDimensions)?;
@@ -37,7 +71,7 @@ pub fn resize(
         Resampling::Bicubic => {
             fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::CatmullRom)
         }
-        Resampling::SeamCarving => unreachable!(),
+        Resampling::SeamCarving | Resampling::GameAsset => unreachable!(),
     };
     let options = fast_image_resize::ResizeOptions::new().resize_alg(algorithm);
     fast_image_resize::Resizer::new()
@@ -61,102 +95,152 @@ pub fn seam_carve(
     {
         return Err(AppError::InvalidDimensions);
     }
-    let mut output = image.clone();
-    while output.width() > target_width {
-        cancellation.check()?;
-        output = remove_vertical_seam(&output)?;
-    }
+    cancellation.check()?;
+    let mut output = carve_width(image.clone(), target_width, cancellation)?;
     if output.height() > target_height {
+        cancellation.check()?;
         output = image::imageops::rotate90(&output);
-        while output.width() > target_height {
-            cancellation.check()?;
-            output = remove_vertical_seam(&output)?;
-        }
+        output = carve_width(output, target_height, cancellation)?;
         output = image::imageops::rotate270(&output);
     }
+    cancellation.check()?;
     Ok(output)
 }
 
-fn remove_vertical_seam(image: &RgbaImage) -> Result<RgbaImage> {
-    let (width, height) = image.dimensions();
-    if width <= 1 {
-        return Err(AppError::InvalidDimensions);
+/// Keep rows at their original stride while carving. Pixels, energy and parent
+/// buffers are allocated once per axis; only the final image is packed tightly.
+fn carve_width(
+    image: RgbaImage,
+    target_width: u32,
+    cancellation: &CancellationToken,
+) -> Result<RgbaImage> {
+    if image.width() == target_width {
+        return Ok(image);
     }
-    let len = usize::try_from(u64::from(width) * u64::from(height))
-        .map_err(|_| AppError::InvalidDimensions)?;
-    let mut costs = vec![0_u64; len];
+    let mut width = image.width() as usize;
+    let height = image.height() as usize;
+    let stride = width;
+    let mut pixels = image.into_raw();
+    let len = pixels.len() / 4;
+    let mut energies = vec![0_u32; len];
     let mut parents = vec![0_i8; len];
+    // A seam only depends on costs in the preceding row.
+    let mut previous = vec![0_u64; stride];
+    let mut current = vec![0_u64; stride];
+    let mut seam = vec![0_usize; height];
 
     for y in 0..height {
+        cancellation.check()?;
         for x in 0..width {
-            let pixel_index = index(width, x, y)?;
-            let energy = u64::from(energy(image, x, y));
-            if y == 0 {
-                costs[pixel_index] = energy;
-                continue;
-            }
-            let mut best = (costs[index(width, x, y - 1)?], 0_i8);
-            if x > 0 {
-                let candidate = (costs[index(width, x - 1, y - 1)?], -1);
-                if candidate.0 < best.0 {
-                    best = candidate;
-                }
-            }
-            if x + 1 < width {
-                let candidate = (costs[index(width, x + 1, y - 1)?], 1);
-                if candidate.0 < best.0 {
-                    best = candidate;
-                }
-            }
-            costs[pixel_index] = best.0.saturating_add(energy);
-            parents[pixel_index] = best.1;
+            energies[y * stride + x] = pixel_energy(&pixels, stride, width, height, x, y);
         }
     }
 
-    let last_y = height - 1;
-    let mut seam_x = (0..width)
-        .min_by_key(|x| costs[index(width, *x, last_y).unwrap_or(0)])
-        .unwrap_or(0);
-    let mut seam = vec![0_u32; usize::try_from(height).map_err(|_| AppError::InvalidDimensions)?];
-    for y in (0..height).rev() {
-        seam[usize::try_from(y).map_err(|_| AppError::InvalidDimensions)?] = seam_x;
-        if y > 0 {
-            let parent = parents[index(width, seam_x, y)?];
-            seam_x = seam_x.saturating_add_signed(i32::from(parent));
+    while width > target_width as usize {
+        cancellation.check()?;
+        for (cost, energy) in previous[..width].iter_mut().zip(&energies[..width]) {
+            *cost = u64::from(*energy);
+        }
+        for y in 1..height {
+            cancellation.check()?;
+            let row = y * stride;
+            let energy_row = &energies[row..row + width];
+            let parent_row = &mut parents[row..row + width];
+            let right_is_lower = previous[1] < previous[0];
+            current[0] = previous[usize::from(right_is_lower)] + u64::from(energy_row[0]);
+            parent_row[0] = i8::from(right_is_lower);
+            for (((cost, parent), energy), neighbors) in current[1..width - 1]
+                .iter_mut()
+                .zip(&mut parent_row[1..width - 1])
+                .zip(&energy_row[1..width - 1])
+                .zip(previous[..width].windows(3))
+            {
+                // Preserve the original tie order: straight, left, then right.
+                let (mut best, mut direction) = (neighbors[1], 0);
+                if neighbors[0] < best {
+                    best = neighbors[0];
+                    direction = -1;
+                }
+                if neighbors[2] < best {
+                    best = neighbors[2];
+                    direction = 1;
+                }
+                *cost = best + u64::from(*energy);
+                *parent = direction;
+            }
+            let last = width - 1;
+            let left_is_lower = previous[last - 1] < previous[last];
+            current[last] =
+                previous[last - usize::from(left_is_lower)] + u64::from(energy_row[last]);
+            parent_row[last] = -i8::from(left_is_lower);
+            std::mem::swap(&mut previous, &mut current);
+        }
+        let mut x = previous[..width]
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cost)| *cost)
+            .map_or(0, |(x, _)| x);
+        for y in (0..height).rev() {
+            seam[y] = x;
+            if y > 0 {
+                x = x.saturating_add_signed(isize::from(parents[y * stride + x]));
+            }
+        }
+
+        for (y, &removed_x) in seam.iter().enumerate() {
+            cancellation.check()?;
+            let row = y * stride;
+            pixels.copy_within(
+                (row + removed_x + 1) * 4..(row + width) * 4,
+                (row + removed_x) * 4,
+            );
+            energies.copy_within(row + removed_x + 1..row + width, row + removed_x);
+        }
+        width -= 1;
+        if width == target_width as usize {
+            break;
+        }
+        for y in 0..height {
+            cancellation.check()?;
+            // Only neighbors of the removed seam can have a changed gradient.
+            // Include adjacent rows: their seams may shift a vertical neighbor.
+            let above = seam[y.saturating_sub(1)];
+            let below = seam[(y + 1).min(height - 1)];
+            let first = seam[y].min(above).min(below).saturating_sub(1);
+            let last = seam[y].max(above).max(below).min(width - 1);
+            for x in first..=last {
+                energies[y * stride + x] = pixel_energy(&pixels, stride, width, height, x, y);
+            }
         }
     }
 
-    let mut output = RgbaImage::new(width - 1, height);
     for y in 0..height {
-        let skip = seam[usize::try_from(y).map_err(|_| AppError::InvalidDimensions)?];
-        for x in 0..width - 1 {
-            let source_x = if x < skip { x } else { x + 1 };
-            output.put_pixel(x, y, *image.get_pixel(source_x, y));
-        }
+        cancellation.check()?;
+        pixels.copy_within(y * stride * 4..(y * stride + width) * 4, y * width * 4);
     }
-    Ok(output)
+    pixels.truncate(width * height * 4);
+    RgbaImage::from_raw(target_width, height as u32, pixels).ok_or(AppError::InvalidDimensions)
 }
 
-fn index(width: u32, x: u32, y: u32) -> Result<usize> {
-    usize::try_from(u64::from(y) * u64::from(width) + u64::from(x))
-        .map_err(|_| AppError::InvalidDimensions)
-}
-
-fn energy(image: &RgbaImage, x: u32, y: u32) -> u32 {
-    let left = image.get_pixel(x.saturating_sub(1), y);
-    let right = image.get_pixel((x + 1).min(image.width() - 1), y);
-    let above = image.get_pixel(x, y.saturating_sub(1));
-    let below = image.get_pixel(x, (y + 1).min(image.height() - 1));
-    gradient(left, right) + gradient(above, below)
-}
-
-fn gradient(left: &Rgba<u8>, right: &Rgba<u8>) -> u32 {
-    left.0[..3]
-        .iter()
-        .zip(&right.0[..3])
-        .map(|(a, b)| i32::from(*a) - i32::from(*b))
-        .map(|value| value.unsigned_abs().pow(2))
-        .sum()
+fn pixel_energy(
+    pixels: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> u32 {
+    let left = (y * stride + x.saturating_sub(1)) * 4;
+    let right = (y * stride + (x + 1).min(width - 1)) * 4;
+    let above = (y.saturating_sub(1) * stride + x) * 4;
+    let below = ((y + 1).min(height - 1) * stride + x) * 4;
+    let mut energy = 0;
+    for channel in 0..3 {
+        let horizontal = i32::from(pixels[left + channel]) - i32::from(pixels[right + channel]);
+        let vertical = i32::from(pixels[above + channel]) - i32::from(pixels[below + channel]);
+        energy += (horizontal * horizontal + vertical * vertical) as u32;
+    }
+    energy
 }
 
 #[cfg(test)]
@@ -165,6 +249,79 @@ mod tests {
 
     use super::{resize, seam_carve};
     use crate::document::{CancellationToken, Resampling};
+
+    #[test]
+    fn cancelled_resizes_do_not_start_even_when_dimensions_are_unchanged() {
+        let image = RgbaImage::new(8, 6);
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        for method in [
+            Resampling::Nearest,
+            Resampling::Linear,
+            Resampling::Bicubic,
+            Resampling::SeamCarving,
+            Resampling::GameAsset,
+        ] {
+            for (width, height) in [(8, 6), (8, 3), (4, 6), (4, 3)] {
+                assert!(matches!(
+                    resize(&image, width, height, method, &cancellation),
+                    Err(crate::error::AppError::Cancelled)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn seam_carving_rejects_empty_or_enlarged_outputs() {
+        let image = RgbaImage::new(8, 6);
+        for (width, height) in [(0, 6), (8, 0), (9, 6), (8, 7)] {
+            assert!(matches!(
+                seam_carve(&image, width, height, &CancellationToken::default()),
+                Err(crate::error::AppError::InvalidDimensions)
+            ));
+        }
+    }
+
+    #[test]
+    fn seam_carving_matches_reference_pixels_and_ties() {
+        let mut seed = 17_u32;
+        for width in 1..=12 {
+            for height in 1..=10 {
+                for palette_size in [1, 3, 256] {
+                    let image = RgbaImage::from_fn(width, height, |_, _| {
+                        let mut channels = [0; 4];
+                        for channel in &mut channels {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            *channel = ((seed >> 16) % palette_size) as u8;
+                        }
+                        Rgba(channels)
+                    });
+                    for (target_width, target_height) in [
+                        (1, 1),
+                        (width, 1),
+                        (1, height),
+                        (width, height),
+                        ((width / 2).max(1), (height / 2).max(1)),
+                    ] {
+                        let cancellation = CancellationToken::default();
+                        let expected = super::reference::seam_carve(
+                            &image,
+                            target_width,
+                            target_height,
+                            &cancellation,
+                        )
+                        .unwrap();
+                        let actual =
+                            seam_carve(&image, target_width, target_height, &cancellation).unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "{width}x{height} -> {target_width}x{target_height}, palette {palette_size}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn shrinks_both_axes() {

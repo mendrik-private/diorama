@@ -19,6 +19,7 @@ crc32fast = "1.5.0"
 libadwaita = { version = "0.9.2", features = ["v1_9", "gtk_v4_20"] }
 lru = "0.16.2"
 palette = "0.7.6"
+pollster = "0.4.0"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tracing = "0.1.41"
@@ -26,6 +27,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
 rustybuzz = "0.20.1"
+rustfft = "6.4.1"
+wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 
 [dev-dependencies]
 base64 = "0.22.1"

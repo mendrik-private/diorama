@@ -46,11 +46,22 @@ pub(super) fn scale_unit(index: u32) -> ScaleUnit {
     }
 }
 
-pub(super) fn resampling_label(resampling: Resampling) -> &'static str {
+pub(super) fn resampling_index(resampling: Resampling) -> u32 {
     match resampling {
-        Resampling::Nearest => "Nearest",
-        Resampling::Linear => "Linear",
-        Resampling::Bicubic => "Bicubic",
-        Resampling::SeamCarving => "Seam carving",
+        Resampling::Nearest => 0,
+        Resampling::Linear => 1,
+        Resampling::Bicubic => 2,
+        Resampling::SeamCarving => 3,
+        Resampling::GameAsset => 4,
+    }
+}
+
+pub(super) fn resampling_at(index: u32) -> Resampling {
+    match index {
+        0 => Resampling::Nearest,
+        1 => Resampling::Linear,
+        3 => Resampling::SeamCarving,
+        4 => Resampling::GameAsset,
+        _ => Resampling::Bicubic,
     }
 }

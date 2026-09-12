@@ -10,6 +10,13 @@ pub enum Resampling {
     Linear,
     Bicubic,
     SeamCarving,
+    GameAsset,
+}
+
+impl Resampling {
+    pub fn downscale_only(self) -> bool {
+        matches!(self, Self::SeamCarving | Self::GameAsset)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

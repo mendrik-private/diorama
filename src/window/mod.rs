@@ -54,8 +54,8 @@ use file_state::{
 use presentation::relative_modified_time;
 use presentation::{compare_metadata, folder_path, image_subtitle};
 use scale::{
-    ScaleUnit, dimensions_from_percent, resampling_label, scale_unit, scaled_dimensions,
-    scaled_width_for_height,
+    ScaleUnit, dimensions_from_percent, resampling_at, resampling_index, scale_unit,
+    scaled_dimensions, scaled_width_for_height,
 };
 use tool::{Tool, palette_visible, pencil_drag_available, resting_tool};
 use zoom::{
@@ -597,9 +597,12 @@ struct WindowState {
     scale_height: gtk::SpinButton,
     scale_lock: gtk::ToggleButton,
     scale_unit: gtk::DropDown,
-    scale_algorithm_label: gtk::Label,
+    scale_method: gtk::DropDown,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
+    scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
+    scale_game_asset: RefCell<Option<Arc<crate::tools::scale::game_asset::Session>>>,
+    scale_diagnostics: gtk::Label,
     scale_preview: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_source_view: Cell<Option<ScaleViewState>>,
     scale_preview_view: Cell<ScalePreviewView>,
@@ -764,25 +767,34 @@ impl ViewerWindow {
             &scale_units.iter().map(String::as_str).collect::<Vec<_>>(),
         );
         scale_unit.set_tooltip_text(Some(&gettext("Slider unit")));
-        let scale_algorithm_label = gtk::Label::new(Some(
-            &gettext("{method} · Properties")
-                .replace("{method}", &gettext(resampling_label(scale_resampling))),
-        ));
-        scale_algorithm_label.add_css_class("dim-label");
-        scale_algorithm_label.set_tooltip_text(Some(&gettext("Scaling method from Properties")));
+        let scale_method_labels = [
+            gettext("Nearest"),
+            gettext("Linear"),
+            gettext("Bicubic"),
+            gettext("Seam carving"),
+            gettext("Game Asset"),
+        ];
+        let scale_method = gtk::DropDown::from_strings(
+            &scale_method_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        scale_method.set_selected(resampling_index(scale_resampling));
+        scale_method.set_tooltip_text(Some(&gettext("Scaling method")));
+        scale_method
+            .update_property(&[gtk::accessible::Property::Label(&gettext("Scaling method"))]);
         let scale_original_button = gtk::Button::with_label(&gettext("Hold Original"));
         scale_original_button.set_tooltip_text(Some(&gettext(
             "Press and hold to show the unscaled source image",
         )));
-        let scale_actual_button = gtk::Button::builder()
-            .label(gettext("Actual Pixels"))
-            .tooltip_text(gettext("Show each scaled output pixel at its actual size"))
-            .action_name("win.scale-actual-size")
-            .build();
-        let scale_fit_button = gtk::Button::builder()
-            .label(gettext("Fit Preview"))
-            .tooltip_text(gettext("Fit the complete scaled preview in the window"))
-            .action_name("win.scale-fit")
+        let scale_view_menu = gio::Menu::new();
+        menu_item(&scale_view_menu, "Actual Pixels", "win.scale-actual-size");
+        menu_item(&scale_view_menu, "Fit Pixels", "win.scale-fit");
+        let scale_view_button = gtk::MenuButton::builder()
+            .label(gettext("Preview"))
+            .tooltip_text(gettext("Choose how scaled pixels are displayed"))
+            .menu_model(&scale_view_menu)
             .build();
         let scale_dimensions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let scale_width_label = gtk::Label::new(Some("W"));
@@ -791,21 +803,13 @@ impl ViewerWindow {
         scale_dimensions.append(&gtk::Label::new(Some("× H")));
         scale_dimensions.append(&scale_height);
         scale_dimensions.append(&scale_lock);
-        scale_algorithm_label.set_margin_start(8);
-        scale_algorithm_label.set_margin_end(8);
-        scale_algorithm_label.set_margin_top(6);
-        scale_algorithm_label.set_margin_bottom(6);
         let scale_view_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         scale_view_controls.add_css_class("linked");
         scale_view_controls.append(&scale_original_button);
-        scale_view_controls.append(&scale_actual_button);
-        scale_view_controls.append(&scale_fit_button);
-        let scale_cancel_button =
-            button("window-close-symbolic", "Cancel Scale", "win.cancel-scale");
-        scale_control_row.append(&scale_cancel_button);
+        scale_view_controls.append(&scale_view_button);
         scale_control_row.append(&scale_dimensions);
         scale_control_row.append(&scale_unit);
-        scale_control_row.append(&scale_algorithm_label);
+        scale_control_row.append(&scale_method);
         scale_control_row.append(&scale_view_controls);
         let scale_apply_button =
             button("object-select-symbolic", "Apply Scale", "win.confirm-scale");
@@ -822,9 +826,14 @@ impl ViewerWindow {
         scale_slider.set_tooltip_text(Some(&gettext("Scaled width in pixels")));
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
+        let scale_diagnostics = gtk::Label::new(None);
+        scale_diagnostics.add_css_class("dim-label");
+        scale_diagnostics.set_wrap(true);
+        scale_diagnostics.set_visible(false);
         scale_slider_row.append(&scale_slider);
         scale_content.append(&scale_control_row);
         scale_content.append(&scale_slider_row);
+        scale_content.append(&scale_diagnostics);
         scale_surface.append(&scale_content);
         scale_controls.append(&scale_surface);
         canvas_overlay.add_overlay(&scale_controls);
@@ -1059,9 +1068,12 @@ impl ViewerWindow {
             scale_height,
             scale_lock,
             scale_unit,
-            scale_algorithm_label,
+            scale_method,
             scale_original_button,
             scale_source: RefCell::new(None),
+            scale_gpu: RefCell::new(None),
+            scale_game_asset: RefCell::new(None),
+            scale_diagnostics,
             scale_preview: RefCell::new(None),
             scale_source_view: Cell::new(None),
             scale_preview_view: Cell::new(ScalePreviewView::Footprint),
@@ -2622,6 +2634,15 @@ impl ViewerWindow {
             let this = self.clone();
             move |_| this.refresh_scale_controls()
         });
+        self.0.scale_method.connect_selected_notify({
+            let this = self.clone();
+            move |dropdown| {
+                let resampling = resampling_at(dropdown.selected());
+                this.0.scale_resampling.set(resampling);
+                this.0.settings.set_scale_resampling(resampling);
+                this.refresh_scale_method();
+            }
+        });
         self.0.scale_slider.connect_value_changed({
             let this = self.clone();
             move |slider| this.scale_slider_changed(slider.value())
@@ -2683,7 +2704,14 @@ impl ViewerWindow {
             let (width, height) = image.dimensions();
             let horizontal = self.0.scrolled.hadjustment();
             let vertical = self.0.scrolled.vadjustment();
-            self.0.scale_source.replace(Some(Arc::new(image)));
+            let source = Arc::new(image);
+            self.0
+                .scale_gpu
+                .replace(Some(Arc::new(crate::tools::scale::GpuScaler::new(
+                    source.clone(),
+                ))));
+            self.0.scale_source.replace(Some(source));
+            self.0.scale_game_asset.replace(None);
             self.0.scale_preview.borrow_mut().take();
             self.0.scale_source_view.set(Some(ScaleViewState {
                 zoom: self.0.canvas.zoom(),
@@ -2716,6 +2744,10 @@ impl ViewerWindow {
         self.0.zoom_controls.set_visible(true);
         self.0.scale_showing_original.set(false);
         self.0.scale_preview.borrow_mut().take();
+        self.0.scale_gpu.borrow_mut().take();
+        self.0.scale_game_asset.borrow_mut().take();
+        self.0.scale_diagnostics.set_visible(false);
+        self.0.canvas.set_filter(self.0.settings.zoom_filter());
         let source = self.0.scale_source.borrow_mut().take();
         let source_view = self.0.scale_source_view.take();
         if !self.0.scale_committing.replace(false)
@@ -2738,7 +2770,7 @@ impl ViewerWindow {
     }
 
     fn configure_scale_ranges(&self, source_width: u32, source_height: u32) {
-        let factor = if self.0.scale_resampling.get() == Resampling::SeamCarving {
+        let factor = if self.0.scale_resampling.get().downscale_only() {
             1
         } else {
             2
@@ -2749,12 +2781,6 @@ impl ViewerWindow {
         self.0
             .scale_height
             .set_range(1.0, f64::from(source_height.saturating_mul(factor)));
-        self.0
-            .scale_algorithm_label
-            .set_label(&gettext("{method} · Properties").replace(
-                "{method}",
-                &gettext(resampling_label(self.0.scale_resampling.get())),
-            ));
     }
 
     fn scale_dimension_changed(&self, width_changed: bool) {
@@ -2833,7 +2859,7 @@ impl ViewerWindow {
                     .set_tooltip_text(Some(&gettext("Output width in pixels")));
             }
             ScaleUnit::Percent => {
-                let maximum = if self.0.scale_resampling.get() == Resampling::SeamCarving {
+                let maximum = if self.0.scale_resampling.get().downscale_only() {
                     100.0
                 } else {
                     200.0
@@ -2862,11 +2888,8 @@ impl ViewerWindow {
 
     fn refresh_scale_method(&self) {
         self.0
-            .scale_algorithm_label
-            .set_label(&gettext("{method} · Properties").replace(
-                "{method}",
-                &gettext(resampling_label(self.0.scale_resampling.get())),
-            ));
+            .scale_method
+            .set_selected(resampling_index(self.0.scale_resampling.get()));
         let Some(source) = self.0.scale_source.borrow().clone() else {
             return;
         };
@@ -2882,6 +2905,7 @@ impl ViewerWindow {
             return;
         };
         let generation = self.0.scale_preview_generation.get().wrapping_add(1);
+        self.0.scale_diagnostics.set_visible(false);
         self.0.scale_preview_generation.set(generation);
         if let Some(cancellation) = self.0.scale_preview_cancellation.borrow_mut().take() {
             cancellation.cancel();
@@ -2894,6 +2918,22 @@ impl ViewerWindow {
         self.0.scale_spinner.set_visible(true);
         self.0.scale_original_button.set_sensitive(false);
         let resampling = self.0.scale_resampling.get();
+        let gpu = self.0.scale_gpu.borrow().clone();
+        let game_asset = if resampling == Resampling::GameAsset {
+            let mut session = self.0.scale_game_asset.borrow_mut();
+            Some(
+                session
+                    .get_or_insert_with(|| {
+                        Arc::new(crate::tools::scale::game_asset::Session::new(
+                            source.clone(),
+                        ))
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let allow_non_uniform = !self.0.scale_lock.is_active();
         let cancellation = CancellationToken::default();
         self.0
             .scale_preview_cancellation
@@ -2911,6 +2951,21 @@ impl ViewerWindow {
             let weak = Rc::downgrade(&state);
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
+                    if let Some(session) = game_asset {
+                        let options = crate::tools::scale::game_asset::Options {
+                            allow_non_uniform,
+                            ..Default::default()
+                        };
+                        let result =
+                            session.resize(target_width, target_height, &options, &cancellation)?;
+                        return Ok((result.image, Some(result.diagnostics)));
+                    }
+                    if let Some(gpu) = gpu
+                        && let Some(preview) =
+                            gpu.resize(target_width, target_height, resampling, &cancellation)?
+                    {
+                        return Ok((preview, None));
+                    }
                     crate::tools::scale::resize(
                         source.as_ref(),
                         target_width,
@@ -2918,6 +2973,7 @@ impl ViewerWindow {
                         resampling,
                         &cancellation,
                     )
+                    .map(|image| (image, None))
                 })
                 .await;
                 let Some(state) = weak.upgrade() else {
@@ -2929,7 +2985,29 @@ impl ViewerWindow {
                 state.scale_preview_cancellation.borrow_mut().take();
                 state.scale_spinner.set_visible(false);
                 match preview {
-                    Ok(Ok(preview)) => {
+                    Ok(Ok((preview, diagnostics))) => {
+                        if let Some(diagnostics) = diagnostics {
+                            let summary = gettext("Game Asset: {retained} retained · {dropped} dropped · {unresolved} unresolved")
+                                .replace("{retained}", &diagnostics.retained.len().to_string())
+                                .replace("{dropped}", &diagnostics.dropped.len().to_string())
+                                .replace("{unresolved}", &diagnostics.unresolved.len().to_string());
+                            state.scale_diagnostics.set_label(&summary);
+                            let mut details = gettext("Unsupported gaps: {gaps}\nConflicts: {conflicts}\nUnrelated joins: {joins}\nConnectivity losses: {connections}\nComponent losses: {components}\nHole losses: {holes}")
+                                .replace("{gaps}", &diagnostics.unsupported_gaps.to_string())
+                                .replace("{conflicts}", &diagnostics.collisions.to_string())
+                                .replace("{joins}", &diagnostics.joins.to_string())
+                                .replace("{connections}", &diagnostics.connectivity_failures.to_string())
+                                .replace("{components}", &diagnostics.component_losses.to_string())
+                                .replace("{holes}", &diagnostics.hole_losses.to_string());
+                            if diagnostics.search_budget_exhausted {
+                                details.push('\n');
+                                details.push_str(&gettext(
+                                    "Search limit reached; some features could not be resolved.",
+                                ));
+                            }
+                            state.scale_diagnostics.set_tooltip_text(Some(&details));
+                            state.scale_diagnostics.set_visible(true);
+                        }
                         ViewerWindow(state).display_scale_preview(Arc::new(preview));
                     }
                     Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
@@ -2948,6 +3026,13 @@ impl ViewerWindow {
         if self.0.scale_showing_original.get() {
             return;
         }
+        self.0
+            .canvas
+            .set_filter(if self.0.scale_resampling.get() == Resampling::GameAsset {
+                ZoomFilter::Hard
+            } else {
+                self.0.settings.zoom_filter()
+            });
         match texture_from_rgba(&preview) {
             Ok(texture) => {
                 self.0.canvas.set_texture(Some(&texture));
@@ -2984,6 +3069,7 @@ impl ViewerWindow {
             return;
         }
         if visible {
+            self.0.canvas.set_filter(self.0.settings.zoom_filter());
             let Some(source) = self.0.scale_source.borrow().clone() else {
                 return;
             };
@@ -3006,6 +3092,13 @@ impl ViewerWindow {
             self.0.scale_width.value().round() as u32,
             self.0.scale_height.value().round() as u32,
         );
+        self.0
+            .canvas
+            .set_filter(if self.0.scale_resampling.get() == Resampling::GameAsset {
+                ZoomFilter::Hard
+            } else {
+                self.0.settings.zoom_filter()
+            });
         let preview = self
             .0
             .scale_preview
@@ -3034,11 +3127,9 @@ impl ViewerWindow {
         let width = self.0.scale_width.value().round() as u32;
         let height = self.0.scale_height.value().round() as u32;
         let resampling = self.0.scale_resampling.get();
-        if resampling == Resampling::SeamCarving
-            && (width > source.width() || height > source.height())
-        {
+        if resampling.downscale_only() && (width > source.width() || height > source.height()) {
             self.0.toasts.add_toast(adw::Toast::new(&gettext(
-                "Seam carving currently supports shrinking only",
+                "This scaling method supports shrinking only",
             )));
             return;
         }
@@ -4156,29 +4247,6 @@ impl ViewerWindow {
             .selected(lens_size_index(self.0.lens_diameter.get()))
             .build();
         viewing_group.add(&lens_size);
-        let resampling_labels = [
-            gettext("Nearest"),
-            gettext("Linear"),
-            gettext("Bicubic"),
-            gettext("Seam carving"),
-        ];
-        let resampling_model = gtk::StringList::new(
-            &resampling_labels
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        );
-        let resampling = adw::ComboRow::builder()
-            .title(gettext("Scaling method"))
-            .model(&resampling_model)
-            .selected(match self.0.scale_resampling.get() {
-                Resampling::Nearest => 0,
-                Resampling::Linear => 1,
-                Resampling::Bicubic => 2,
-                Resampling::SeamCarving => 3,
-            })
-            .build();
-        viewing_group.add(&resampling);
         let anti_aliasing = adw::SwitchRow::builder()
             .title(gettext("Anti-aliasing"))
             .subtitle(gettext("Smooth the edges of pencil strokes and circles"))
@@ -4255,20 +4323,6 @@ impl ViewerWindow {
                 };
                 this.0.lens_diameter.set(diameter);
                 this.0.settings.set_compare_lens_size(diameter);
-            }
-        });
-        resampling.connect_selected_notify({
-            let this = self.clone();
-            move |row| {
-                let resampling = match row.selected() {
-                    0 => Resampling::Nearest,
-                    1 => Resampling::Linear,
-                    3 => Resampling::SeamCarving,
-                    _ => Resampling::Bicubic,
-                };
-                this.0.scale_resampling.set(resampling);
-                this.0.settings.set_scale_resampling(resampling);
-                this.refresh_scale_method();
             }
         });
         anti_aliasing.connect_active_notify({
@@ -7628,6 +7682,15 @@ mod tests {
         assert_eq!(scaled_dimensions(8, 6, 2), (2, 2));
         assert_eq!(dimensions_from_percent(800, 600, 50.0), (400, 300));
         assert_eq!(dimensions_from_percent(1, 1, 1.0), (1, 1));
+        for resampling in [
+            Resampling::Nearest,
+            Resampling::Linear,
+            Resampling::Bicubic,
+            Resampling::SeamCarving,
+            Resampling::GameAsset,
+        ] {
+            assert_eq!(resampling_at(resampling_index(resampling)), resampling);
+        }
     }
 
     #[test]
@@ -8728,6 +8791,7 @@ mod tests {
             .expect("anti-aliasing switch");
         assert!(row_with_title(&dialog_widget, "Hard zoom").is_some());
         assert!(row_with_title(&dialog_widget, "Copied color format").is_some());
+        assert!(row_with_title(&dialog_widget, "Scaling method").is_none());
         assert!(row_with_title(&dialog_widget, "Dimensions").is_none());
         let initial = anti_aliasing.is_active();
 
@@ -9027,6 +9091,22 @@ mod tests {
             None
         }
 
+        fn menu_button_with_label(widget: &gtk::Widget, label: &str) -> Option<gtk::MenuButton> {
+            if let Ok(button) = widget.clone().downcast::<gtk::MenuButton>()
+                && button.label().as_deref() == Some(label)
+            {
+                return Some(button);
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(button) = menu_button_with_label(&current, label) {
+                    return Some(button);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+
         fn css_class_count(widget: &gtk::Widget, class: &str) -> usize {
             let mut count = usize::from(widget.has_css_class(class));
             let mut child = widget.first_child();
@@ -9077,7 +9157,7 @@ mod tests {
             window.0.scale_height.clone().upcast(),
             window.0.scale_lock.clone().upcast(),
             window.0.scale_unit.clone().upcast(),
-            window.0.scale_algorithm_label.clone().upcast(),
+            window.0.scale_method.clone().upcast(),
             window.0.scale_original_button.clone().upcast(),
         ] {
             assert!(
@@ -9090,16 +9170,31 @@ mod tests {
         }
         let scale_controls: gtk::Widget = window.0.scale_controls.clone().upcast();
         assert_eq!(css_class_count(&scale_controls, "osd"), 1);
-        for action in ["win.cancel-scale", "win.confirm-scale"] {
-            let button = button_with_action(&scale_controls, action).expect("scale action button");
-            assert!(!button.has_css_class("osd"));
-        }
+        assert!(button_with_action(&scale_controls, "win.cancel-scale").is_none());
+        let apply =
+            button_with_action(&scale_controls, "win.confirm-scale").expect("scale apply button");
+        assert!(!apply.has_css_class("osd"));
         assert_eq!(
             window.0.scale_original_button.label().as_deref(),
             Some("Hold Original")
         );
-        assert!(button_with_label(&scale_controls, "Actual Pixels").is_some());
-        assert!(button_with_label(&scale_controls, "Fit Preview").is_some());
+        assert!(button_with_label(&scale_controls, "Actual Pixels").is_none());
+        assert!(button_with_label(&scale_controls, "Fit Pixels").is_none());
+        let preview_menu = menu_button_with_label(&scale_controls, "Preview")
+            .expect("preview display menu")
+            .menu_model()
+            .expect("preview display menu model");
+        let menu_attribute = |index, name| {
+            preview_menu
+                .item_attribute_value(index, name, None)
+                .and_then(|value| value.get::<String>())
+                .expect("string menu attribute")
+        };
+        assert_eq!(preview_menu.n_items(), 2);
+        assert_eq!(menu_attribute(0, "label"), "Actual Pixels");
+        assert_eq!(menu_attribute(0, "action"), "win.scale-actual-size");
+        assert_eq!(menu_attribute(1, "label"), "Fit Pixels");
+        assert_eq!(menu_attribute(1, "action"), "win.scale-fit");
         assert!(window.0.scale_slider.hexpands());
         assert_eq!(window.0.scale_slider.width_request(), -1);
         let scale_slider_row = window
@@ -9118,6 +9213,16 @@ mod tests {
             .downcast::<adw::WrapBox>()
             .expect("responsive scale control row");
         assert_eq!(scale_control_row.align(), 0.5);
+        let first_label = scale_control_row
+            .first_child()
+            .expect("dimensions are the first scale controls")
+            .downcast::<gtk::Box>()
+            .expect("scale dimensions")
+            .first_child()
+            .expect("width label")
+            .downcast::<gtk::Label>()
+            .expect("width label widget");
+        assert_eq!(first_label.text(), "W");
 
         window.0.scale_controls.set_visible(true);
         window.0.canvas_overlay.allocate(1000, 600, -1, None);
@@ -9308,7 +9413,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn scale_controls_keep_dimensions_units_and_properties_method_in_sync() {
+    fn scale_controls_keep_dimensions_units_and_method_in_sync() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik_private.Diorama.ScaleDraftTest")
@@ -9318,20 +9423,19 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
+        let original_resampling = window.0.settings.scale_resampling();
         let image = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window.0.rendered.replace(Some(image));
-        window.0.scale_resampling.set(Resampling::Nearest);
 
         window.0.scale_button.set_active(true);
+        window.0.scale_method.set_selected(0);
 
         assert_eq!(window.0.scale_width.value(), 8.0);
         assert_eq!(window.0.scale_height.value(), 6.0);
-        assert_eq!(
-            window.0.scale_algorithm_label.label(),
-            "Nearest · Properties"
-        );
+        assert_eq!(window.0.scale_method.selected(), 0);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::Nearest);
         assert_eq!(window.0.scale_value_label.label(), "8 × 6 → 8 × 6 (100%)");
         assert!(window.0.scale_original_button.is_sensitive());
         assert!(!window.0.scale_spinner.get_visible());
@@ -9370,12 +9474,34 @@ mod tests {
         );
         assert!(!window.0.scale_spinner.get_visible());
 
-        window.0.scale_resampling.set(Resampling::Linear);
-        window.refresh_scale_method();
+        window.0.scale_method.set_selected(1);
+        assert_eq!(window.0.scale_method.selected(), 1);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::Linear);
+
+        window.0.scale_method.set_selected(4);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset);
+        if gio::SettingsSchemaSource::default()
+            .is_some_and(|source| source.lookup(crate::APP_ID, true).is_some())
+        {
+            assert_eq!(window.0.settings.scale_resampling(), Resampling::GameAsset);
+        }
+        assert_eq!(window.0.scale_width.adjustment().upper(), 8.0);
+        assert_eq!(window.0.scale_height.adjustment().upper(), 6.0);
+        assert_eq!(window.0.scale_slider.adjustment().upper(), 100.0);
+        window.0.scale_slider.set_value(200.0);
         assert_eq!(
-            window.0.scale_algorithm_label.label(),
-            "Linear · Properties"
+            (window.0.scale_width.value(), window.0.scale_height.value()),
+            (8.0, 6.0)
         );
+        window.0.scale_slider.set_value(25.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while window.0.scale_spinner.get_visible() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(window.0.scale_diagnostics.get_visible());
+        assert_eq!(window.0.canvas.filter(), ZoomFilter::Hard);
+        window.0.scale_method.set_selected(1);
 
         let preview = Arc::new(image::RgbaImage::from_pixel(
             2,
@@ -9392,6 +9518,7 @@ mod tests {
         window.0.scale_button.set_active(false);
         assert_eq!(window.0.canvas.texture().unwrap().width(), 8);
         assert_eq!(window.0.canvas.texture().unwrap().height(), 6);
+        window.0.settings.set_scale_resampling(original_resampling);
     }
 
     #[test]

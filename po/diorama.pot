@@ -109,14 +109,6 @@ msgstr ""
 msgid "Slider unit"
 msgstr ""
 
-#: src/window/mod.rs:727 src/window/mod.rs:2638 src/window/mod.rs:2750
-msgid "{method} · Properties"
-msgstr ""
-
-#: src/window/mod.rs:731
-msgid "Scaling method from Properties"
-msgstr ""
-
 #: src/window/mod.rs:732
 msgid "Hold Original"
 msgstr ""
@@ -130,19 +122,15 @@ msgid "Actual Pixels"
 msgstr ""
 
 #: src/window/mod.rs:738
-msgid "Show each scaled output pixel at its actual size"
+msgid "Fit Pixels"
 msgstr ""
 
 #: src/window/mod.rs:742
-msgid "Fit Preview"
+msgid "Preview"
 msgstr ""
 
 #: src/window/mod.rs:743
-msgid "Fit the complete scaled preview in the window"
-msgstr ""
-
-#: src/window/mod.rs:763
-msgid "Cancel Scale"
+msgid "Choose how scaled pixels are displayed"
 msgstr ""
 
 #: src/window/mod.rs:770
@@ -285,7 +273,7 @@ msgid "Scale preview worker failed"
 msgstr ""
 
 #: src/window/mod.rs:2923
-msgid "Seam carving currently supports shrinking only"
+msgid "This scaling method supports shrinking only"
 msgstr ""
 
 #: src/window/mod.rs:2929
@@ -504,6 +492,18 @@ msgstr ""
 
 #: src/window/mod.rs:4084
 msgid "Scaling method"
+msgstr ""
+
+msgid "Game Asset"
+msgstr ""
+
+msgid "Game Asset: {retained} retained · {dropped} dropped · {unresolved} unresolved"
+msgstr ""
+
+msgid "Unsupported gaps: {gaps}\nConflicts: {conflicts}\nUnrelated joins: {joins}\nConnectivity losses: {connections}\nComponent losses: {components}\nHole losses: {holes}"
+msgstr ""
+
+msgid "Search limit reached; some features could not be resolved."
 msgstr ""
 
 #: src/window/mod.rs:4095
