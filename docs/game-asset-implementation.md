@@ -1,6 +1,11 @@
-# Game Asset scaling
+# Historical Game Asset wavelet scaling
 
-The **Game Asset** entry in the scaling toolbar implements the accompanying
+The runtime Game Asset renderer has been replaced by
+[bicubic interiors with pixel-art contours](game-asset-hybrid.md).
+The implementation below is retained only for historical tests and on the
+`experiment/game-asset-ridge-cleanup` branch; it is not called by the app.
+
+The previous **Game Asset** entry in the scaling toolbar implemented the accompanying
 [v0.1 specification](game-asset-scaling.md). It is available only at or below
 the source dimensions. The existing Aspect control supplies the explicit
 choice to allow non-uniform scaling; aspect preservation is otherwise the

@@ -27,10 +27,10 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
 rustybuzz = "0.20.1"
-rustfft = "6.4.1"
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 
 [dev-dependencies]
+rustfft = "6.4.1"
 base64 = "0.22.1"
 
 [profile.dev.package."*"]

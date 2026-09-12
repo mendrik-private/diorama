@@ -601,7 +601,7 @@ struct WindowState {
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
-    scale_game_asset: RefCell<Option<Arc<crate::tools::scale::game_asset::Session>>>,
+    scale_game_asset: RefCell<Option<Arc<crate::tools::scale::palette_halving::Session>>>,
     scale_diagnostics: gtk::Label,
     scale_preview: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_source_view: Cell<Option<ScaleViewState>>,
@@ -769,10 +769,11 @@ impl ViewerWindow {
         scale_unit.set_tooltip_text(Some(&gettext("Slider unit")));
         let scale_method_labels = [
             gettext("Nearest"),
-            gettext("Linear"),
+            gettext("Bilinear"),
             gettext("Bicubic"),
             gettext("Seam carving"),
             gettext("Game Asset"),
+            gettext("Lanczos"),
         ];
         let scale_method = gtk::DropDown::from_strings(
             &scale_method_labels
@@ -2924,7 +2925,7 @@ impl ViewerWindow {
             Some(
                 session
                     .get_or_insert_with(|| {
-                        Arc::new(crate::tools::scale::game_asset::Session::new(
+                        Arc::new(crate::tools::scale::palette_halving::Session::new(
                             source.clone(),
                         ))
                     })
@@ -2933,7 +2934,6 @@ impl ViewerWindow {
         } else {
             None
         };
-        let allow_non_uniform = !self.0.scale_lock.is_active();
         let cancellation = CancellationToken::default();
         self.0
             .scale_preview_cancellation
@@ -2952,13 +2952,9 @@ impl ViewerWindow {
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
                     if let Some(session) = game_asset {
-                        let options = crate::tools::scale::game_asset::Options {
-                            allow_non_uniform,
-                            ..Default::default()
-                        };
                         let result =
-                            session.resize(target_width, target_height, &options, &cancellation)?;
-                        return Ok((result.image, Some(result.diagnostics)));
+                            session.resize(target_width, target_height, false, &cancellation)?;
+                        return Ok((result.image, Some(result.report)));
                     }
                     if let Some(gpu) = gpu
                         && let Some(preview) =
@@ -2987,24 +2983,17 @@ impl ViewerWindow {
                 match preview {
                     Ok(Ok((preview, diagnostics))) => {
                         if let Some(diagnostics) = diagnostics {
-                            let summary = gettext("Game Asset: {retained} retained · {dropped} dropped · {unresolved} unresolved")
-                                .replace("{retained}", &diagnostics.retained.len().to_string())
-                                .replace("{dropped}", &diagnostics.dropped.len().to_string())
-                                .replace("{unresolved}", &diagnostics.unresolved.len().to_string());
+                            let summary = gettext(
+                                "Game Asset: Bicubic + contours · {colours} ink palette colours",
+                            )
+                            .replace("{colours}", &diagnostics.colours.to_string());
                             state.scale_diagnostics.set_label(&summary);
-                            let mut details = gettext("Unsupported gaps: {gaps}\nConflicts: {conflicts}\nUnrelated joins: {joins}\nConnectivity losses: {connections}\nComponent losses: {components}\nHole losses: {holes}")
-                                .replace("{gaps}", &diagnostics.unsupported_gaps.to_string())
-                                .replace("{conflicts}", &diagnostics.collisions.to_string())
-                                .replace("{joins}", &diagnostics.joins.to_string())
-                                .replace("{connections}", &diagnostics.connectivity_failures.to_string())
-                                .replace("{components}", &diagnostics.component_losses.to_string())
-                                .replace("{holes}", &diagnostics.hole_losses.to_string());
-                            if diagnostics.search_budget_exhausted {
-                                details.push('\n');
-                                details.push_str(&gettext(
-                                    "Search limit reached; some features could not be resolved.",
-                                ));
-                            }
+                            let details = diagnostics
+                                .stages
+                                .iter()
+                                .map(|(w, h)| format!("{w}×{h}"))
+                                .collect::<Vec<_>>()
+                                .join(" → ");
                             state.scale_diagnostics.set_tooltip_text(Some(&details));
                             state.scale_diagnostics.set_visible(true);
                         }
@@ -7688,6 +7677,7 @@ mod tests {
             Resampling::Bicubic,
             Resampling::SeamCarving,
             Resampling::GameAsset,
+            Resampling::Lanczos,
         ] {
             assert_eq!(resampling_at(resampling_index(resampling)), resampling);
         }
@@ -9478,6 +9468,15 @@ mod tests {
         assert_eq!(window.0.scale_method.selected(), 1);
         assert_eq!(window.0.scale_resampling.get(), Resampling::Linear);
 
+        window.0.scale_method.set_selected(5);
+        assert_eq!(window.0.scale_method.selected(), 5);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::Lanczos);
+        if gio::SettingsSchemaSource::default()
+            .is_some_and(|source| source.lookup(crate::APP_ID, true).is_some())
+        {
+            assert_eq!(window.0.settings.scale_resampling(), Resampling::Lanczos);
+        }
+
         window.0.scale_method.set_selected(4);
         assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset);
         if gio::SettingsSchemaSource::default()
@@ -9500,6 +9499,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(window.0.scale_diagnostics.get_visible());
+        assert_eq!(
+            window.0.scale_diagnostics.label(),
+            gettext("Game Asset: Bicubic + contours · {colours} ink palette colours")
+                .replace("{colours}", "1")
+        );
+        let source = window.0.scale_source.borrow().as_ref().unwrap().clone();
+        let expected = crate::tools::scale::resize(
+            &source,
+            2,
+            2,
+            Resampling::GameAsset,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            &expected
+        );
         assert_eq!(window.0.canvas.filter(), ZoomFilter::Hard);
         window.0.scale_method.set_selected(1);
 

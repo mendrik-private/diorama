@@ -53,6 +53,7 @@ pub(super) fn resampling_index(resampling: Resampling) -> u32 {
         Resampling::Bicubic => 2,
         Resampling::SeamCarving => 3,
         Resampling::GameAsset => 4,
+        Resampling::Lanczos => 5,
     }
 }
 
@@ -62,6 +63,7 @@ pub(super) fn resampling_at(index: u32) -> Resampling {
         1 => Resampling::Linear,
         3 => Resampling::SeamCarving,
         4 => Resampling::GameAsset,
+        5 => Resampling::Lanczos,
         _ => Resampling::Bicubic,
     }
 }

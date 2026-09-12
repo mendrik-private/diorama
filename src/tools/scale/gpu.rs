@@ -37,7 +37,10 @@ impl GpuScaler {
     ) -> Result<Option<RgbaImage>> {
         if matches!(
             resampling,
-            Resampling::Nearest | Resampling::SeamCarving | Resampling::GameAsset
+            Resampling::Nearest
+                | Resampling::SeamCarving
+                | Resampling::GameAsset
+                | Resampling::Lanczos
         ) || u64::from(target_width) * u64::from(target_height) < MIN_GPU_PIXELS
             || u64::from(self.source.width()) > u64::from(target_width) * 2
             || u64::from(self.source.height()) > u64::from(target_height) * 2
@@ -221,7 +224,10 @@ impl Backend {
             match resampling {
                 Resampling::Linear => 0,
                 Resampling::Bicubic => 1,
-                Resampling::Nearest | Resampling::SeamCarving | Resampling::GameAsset => {
+                Resampling::Nearest
+                | Resampling::SeamCarving
+                | Resampling::GameAsset
+                | Resampling::Lanczos => {
                     return Err(GpuError::Unavailable("unsupported method".into()));
                 }
             },
@@ -472,6 +478,11 @@ mod tests {
         );
         assert!(
             gpu.resize(590, 470, Resampling::SeamCarving, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            gpu.resize(590, 470, Resampling::Lanczos, &cancellation)
                 .unwrap()
                 .is_none()
         );

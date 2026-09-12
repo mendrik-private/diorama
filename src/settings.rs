@@ -128,6 +128,7 @@ impl Settings {
         match self.string("scale-resampling").as_deref() {
             Some("nearest") => Resampling::Nearest,
             Some("linear") => Resampling::Linear,
+            Some("lanczos") => Resampling::Lanczos,
             Some("seam-carving") => Resampling::SeamCarving,
             Some("game-asset") => Resampling::GameAsset,
             _ => Resampling::Bicubic,
@@ -143,6 +144,7 @@ impl Settings {
                 Resampling::Bicubic => "bicubic",
                 Resampling::SeamCarving => "seam-carving",
                 Resampling::GameAsset => "game-asset",
+                Resampling::Lanczos => "lanczos",
             },
         );
     }

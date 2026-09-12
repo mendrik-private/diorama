@@ -11,6 +11,7 @@ pub enum Resampling {
     Bicubic,
     SeamCarving,
     GameAsset,
+    Lanczos,
 }
 
 impl Resampling {

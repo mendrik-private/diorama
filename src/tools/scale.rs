@@ -3,8 +3,11 @@ use image::RgbaImage;
 use crate::document::{CancellationToken, Resampling};
 use crate::error::{AppError, Result};
 
+#[cfg(test)]
 pub mod game_asset;
 mod gpu;
+pub mod palette_halving;
+mod source_palette;
 
 pub use gpu::GpuScaler;
 
@@ -31,24 +34,9 @@ pub fn resize(
         return seam_carve(image, target_width, target_height, cancellation);
     }
     if resampling == Resampling::GameAsset {
-        // Operation dimensions are explicit; the scaling tool's Aspect control
-        // supplies the user's choice of uniform versus non-uniform geometry.
-        let options = game_asset::Options {
-            allow_non_uniform: true,
-            ..Default::default()
-        };
-        let result =
-            game_asset::resize(image, target_width, target_height, &options, cancellation)?;
-        tracing::info!(
-            retained = result.diagnostics.retained.len(),
-            dropped = result.diagnostics.dropped.len(),
-            unresolved = result.diagnostics.unresolved.len(),
-            samples = result.provenance.len(),
-            gpu_wavelets = result.gpu_wavelets,
-            "Game Asset scaling complete"
-        );
-        tracing::debug!(diagnostics=?result.diagnostics, options=?result.options, "Game Asset scaling report");
-        return Ok(result.image);
+        return palette_halving::Session::new(std::sync::Arc::new(image.clone()))
+            .resize(target_width, target_height, false, cancellation)
+            .map(|result| result.image);
     }
     cancellation.check()?;
     if image.dimensions() == (target_width, target_height) {
@@ -73,6 +61,9 @@ pub fn resize(
         }
         Resampling::Bicubic => {
             fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::CatmullRom)
+        }
+        Resampling::Lanczos => {
+            fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3)
         }
         Resampling::SeamCarving | Resampling::GameAsset => unreachable!(),
     };
@@ -254,6 +245,39 @@ mod tests {
     use crate::document::{CancellationToken, Resampling};
 
     #[test]
+    fn lanczos_uses_lanczos3_for_downscaling_and_upscaling() {
+        let image = RgbaImage::from_fn(16, 12, |x, y| {
+            image::Rgba([(x * 13) as u8, (y * 17) as u8, ((x + y) * 9) as u8, 200])
+        });
+        let cancellation = CancellationToken::default();
+        assert!(!Resampling::Lanczos.downscale_only());
+        for (w, h) in [(6, 5), (32, 24)] {
+            let input = fast_image_resize::images::ImageRef::new(
+                16,
+                12,
+                image.as_raw(),
+                fast_image_resize::PixelType::U8x4,
+            )
+            .unwrap();
+            let mut expected =
+                fast_image_resize::images::Image::new(w, h, fast_image_resize::PixelType::U8x4);
+            let options = fast_image_resize::ResizeOptions::new().resize_alg(
+                fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
+            );
+            fast_image_resize::Resizer::new()
+                .resize(&input, &mut expected, &options)
+                .unwrap();
+            let actual = resize(&image, w, h, Resampling::Lanczos, &cancellation).unwrap();
+            assert_eq!(actual.as_raw().as_slice(), expected.buffer());
+        }
+        assert_eq!(
+            resize(&image, 16, 12, Resampling::Lanczos, &cancellation).unwrap(),
+            image
+        );
+        assert!(resize(&image, 0, 5, Resampling::Lanczos, &cancellation).is_err());
+    }
+
+    #[test]
     fn cancelled_resizes_do_not_start_even_when_dimensions_are_unchanged() {
         let image = RgbaImage::new(8, 6);
         let cancellation = CancellationToken::default();
@@ -264,6 +288,7 @@ mod tests {
             Resampling::Bicubic,
             Resampling::SeamCarving,
             Resampling::GameAsset,
+            Resampling::Lanczos,
         ] {
             for (width, height) in [(8, 6), (8, 3), (4, 6), (4, 3)] {
                 assert!(matches!(

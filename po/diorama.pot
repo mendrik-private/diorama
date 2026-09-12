@@ -482,6 +482,12 @@ msgstr ""
 msgid "Linear"
 msgstr ""
 
+msgid "Bilinear"
+msgstr ""
+
+msgid "Lanczos"
+msgstr ""
+
 #: src/window/mod.rs:4074
 msgid "Bicubic"
 msgstr ""
@@ -497,13 +503,7 @@ msgstr ""
 msgid "Game Asset"
 msgstr ""
 
-msgid "Game Asset: {retained} retained · {dropped} dropped · {unresolved} unresolved"
-msgstr ""
-
-msgid "Unsupported gaps: {gaps}\nConflicts: {conflicts}\nUnrelated joins: {joins}\nConnectivity losses: {connections}\nComponent losses: {components}\nHole losses: {holes}"
-msgstr ""
-
-msgid "Search limit reached; some features could not be resolved."
+msgid "Game Asset: Bicubic + contours · {colours} ink palette colours"
 msgstr ""
 
 #: src/window/mod.rs:4095
