@@ -4,6 +4,8 @@ use crate::document::{CancellationToken, Resampling};
 use crate::error::{AppError, Result};
 
 #[cfg(test)]
+pub mod contour_lanczos;
+#[cfg(test)]
 pub mod game_asset;
 mod gpu;
 pub mod palette_halving;
