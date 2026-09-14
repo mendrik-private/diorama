@@ -1,6 +1,6 @@
 [package]
 name = "diorama"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, native GNOME image viewer"
@@ -30,7 +30,6 @@ rustybuzz = "0.20.1"
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
 
 [dev-dependencies]
-rustfft = "6.4.1"
 base64 = "0.22.1"
 
 [profile.dev.package."*"]

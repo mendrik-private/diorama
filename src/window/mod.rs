@@ -601,8 +601,7 @@ struct WindowState {
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
-    scale_game_asset: RefCell<Option<Arc<crate::tools::scale::palette_halving::Session>>>,
-    scale_diagnostics: gtk::Label,
+    scale_game_asset: RefCell<Option<Arc<crate::tools::scale::game_asset::Session>>>,
     scale_preview: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_source_view: Cell<Option<ScaleViewState>>,
     scale_preview_view: Cell<ScalePreviewView>,
@@ -769,9 +768,7 @@ impl ViewerWindow {
         scale_unit.set_tooltip_text(Some(&gettext("Slider unit")));
         let scale_method_labels = [
             gettext("Nearest"),
-            gettext("Bilinear"),
             gettext("Bicubic"),
-            gettext("Seam carving"),
             gettext("Game Asset"),
             gettext("Lanczos"),
         ];
@@ -827,14 +824,9 @@ impl ViewerWindow {
         scale_slider.set_tooltip_text(Some(&gettext("Scaled width in pixels")));
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
-        let scale_diagnostics = gtk::Label::new(None);
-        scale_diagnostics.add_css_class("dim-label");
-        scale_diagnostics.set_wrap(true);
-        scale_diagnostics.set_visible(false);
         scale_slider_row.append(&scale_slider);
         scale_content.append(&scale_control_row);
         scale_content.append(&scale_slider_row);
-        scale_content.append(&scale_diagnostics);
         scale_surface.append(&scale_content);
         scale_controls.append(&scale_surface);
         canvas_overlay.add_overlay(&scale_controls);
@@ -863,13 +855,6 @@ impl ViewerWindow {
             .description(gettext("Choose an image to view, compare, or edit."))
             .child(&open_button)
             .build();
-        let loading_spinner = adw::Spinner::new();
-        loading_spinner.set_halign(gtk::Align::Center);
-        let loading_page = adw::StatusPage::builder()
-            .title(gettext("Loading Image"))
-            .description(gettext("Preparing the image for viewing."))
-            .child(&loading_spinner)
-            .build();
         let retry_button = gtk::Button::builder()
             .label(gettext("Open Another Image"))
             .action_name("win.open")
@@ -883,13 +868,8 @@ impl ViewerWindow {
             .description(gettext("The image could not be loaded."))
             .child(&retry_button)
             .build();
-        let content_stack = gtk::Stack::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .transition_type(gtk::StackTransitionType::Crossfade)
-            .build();
+        let content_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         content_stack.add_named(&empty_page, Some("empty"));
-        content_stack.add_named(&loading_page, Some("loading"));
         content_stack.add_named(&error_page, Some("error"));
         content_stack.add_named(&toasts, Some("viewer"));
         content_stack.set_visible_child_name("empty");
@@ -1074,7 +1054,6 @@ impl ViewerWindow {
             scale_source: RefCell::new(None),
             scale_gpu: RefCell::new(None),
             scale_game_asset: RefCell::new(None),
-            scale_diagnostics,
             scale_preview: RefCell::new(None),
             scale_source_view: Cell::new(None),
             scale_preview_view: Cell::new(ScalePreviewView::Footprint),
@@ -1234,7 +1213,8 @@ impl ViewerWindow {
         self.0.pending_scale_activation.set(false);
         self.0.external_source_conflict.set(false);
         self.0.canvas.clear_annotation_previews();
-        self.0.canvas.set_texture(None);
+        // Keep the previous preview visible until the next one is ready.
+        // Document actions remain disabled while subtitle_ready is false.
         self.0.subtitle_ready.set(false);
         self.0.source_modified.replace(
             file.path()
@@ -1247,7 +1227,7 @@ impl ViewerWindow {
         ));
         self.0.title.set_subtitle(&gettext("Loading…"));
         self.0.view_only_banner.set_revealed(false);
-        self.0.content_stack.set_visible_child_name("loading");
+        self.0.content_stack.set_visible_child_name("viewer");
         self.update_action_states();
 
         let decode = file.path().map(|path| {
@@ -1334,6 +1314,7 @@ impl ViewerWindow {
                     ViewerWindow(state).rebuild_navigation(file);
                 }
                 Err(error) => {
+                    state.canvas.set_texture(None);
                     ViewerWindow(state.clone()).finish_editable_decode(false);
                     state.pending_comparison.borrow_mut().take();
                     state.title.set_subtitle(&gettext("Could not open image"));
@@ -1764,7 +1745,7 @@ impl ViewerWindow {
         self.0.window.add_controller(pencil_zoom);
 
         let annotation_keys = gtk::EventControllerKey::new();
-        annotation_keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        annotation_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         annotation_keys.connect_key_pressed({
             let this = self.clone();
             move |_, key, _, modifiers| {
@@ -1854,6 +1835,22 @@ impl ViewerWindow {
                 }
                 if text_input_has_focus(&this.0.window) {
                     return glib::Propagation::Proceed;
+                }
+                if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    && !modifiers.intersects(
+                        gtk::gdk::ModifierType::ALT_MASK
+                            | gtk::gdk::ModifierType::SUPER_MASK
+                            | gtk::gdk::ModifierType::META_MASK,
+                    )
+                    && matches!(key, gtk::gdk::Key::z | gtk::gdk::Key::Z)
+                {
+                    let action = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                        "redo"
+                    } else {
+                        "undo"
+                    };
+                    gio::prelude::ActionGroupExt::activate_action(&this.0.window, action, None);
+                    return glib::Propagation::Stop;
                 }
                 let Some(forward) = image_navigation_direction(key, modifiers) else {
                     return glib::Propagation::Proceed;
@@ -1977,8 +1974,6 @@ impl ViewerWindow {
             1
         };
         match key {
-            gtk::gdk::Key::Left => self.move_keyboard_tool_cursor(-step, 0),
-            gtk::gdk::Key::Right => self.move_keyboard_tool_cursor(step, 0),
             gtk::gdk::Key::Up => self.move_keyboard_tool_cursor(0, -step),
             gtk::gdk::Key::Down => self.move_keyboard_tool_cursor(0, step),
             _ => false,
@@ -2277,7 +2272,8 @@ impl ViewerWindow {
     }
 
     fn update_action_states(&self) {
-        let has_image = self.0.canvas.texture().is_some();
+        let has_image = self.0.canvas.texture().is_some()
+            && (!self.0.editable_decode_pending.get() || self.0.subtitle_ready.get());
         let has_file = self.0.current_file.borrow().is_some();
         let document = self.0.document.borrow();
         let editable = document.is_some() && self.0.rendered.borrow().is_some();
@@ -2747,7 +2743,6 @@ impl ViewerWindow {
         self.0.scale_preview.borrow_mut().take();
         self.0.scale_gpu.borrow_mut().take();
         self.0.scale_game_asset.borrow_mut().take();
-        self.0.scale_diagnostics.set_visible(false);
         self.0.canvas.set_filter(self.0.settings.zoom_filter());
         let source = self.0.scale_source.borrow_mut().take();
         let source_view = self.0.scale_source_view.take();
@@ -2906,7 +2901,6 @@ impl ViewerWindow {
             return;
         };
         let generation = self.0.scale_preview_generation.get().wrapping_add(1);
-        self.0.scale_diagnostics.set_visible(false);
         self.0.scale_preview_generation.set(generation);
         if let Some(cancellation) = self.0.scale_preview_cancellation.borrow_mut().take() {
             cancellation.cancel();
@@ -2925,7 +2919,7 @@ impl ViewerWindow {
             Some(
                 session
                     .get_or_insert_with(|| {
-                        Arc::new(crate::tools::scale::palette_halving::Session::new(
+                        Arc::new(crate::tools::scale::game_asset::Session::new(
                             source.clone(),
                         ))
                     })
@@ -2952,15 +2946,13 @@ impl ViewerWindow {
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
                     if let Some(session) = game_asset {
-                        let result =
-                            session.resize(target_width, target_height, false, &cancellation)?;
-                        return Ok((result.image, Some(result.report)));
+                        return session.resize(target_width, target_height, &cancellation);
                     }
                     if let Some(gpu) = gpu
                         && let Some(preview) =
                             gpu.resize(target_width, target_height, resampling, &cancellation)?
                     {
-                        return Ok((preview, None));
+                        return Ok(preview);
                     }
                     crate::tools::scale::resize(
                         source.as_ref(),
@@ -2969,7 +2961,6 @@ impl ViewerWindow {
                         resampling,
                         &cancellation,
                     )
-                    .map(|image| (image, None))
                 })
                 .await;
                 let Some(state) = weak.upgrade() else {
@@ -2981,22 +2972,7 @@ impl ViewerWindow {
                 state.scale_preview_cancellation.borrow_mut().take();
                 state.scale_spinner.set_visible(false);
                 match preview {
-                    Ok(Ok((preview, diagnostics))) => {
-                        if let Some(diagnostics) = diagnostics {
-                            let summary = gettext(
-                                "Game Asset: Bicubic + contours · {colours} ink palette colours",
-                            )
-                            .replace("{colours}", &diagnostics.colours.to_string());
-                            state.scale_diagnostics.set_label(&summary);
-                            let details = diagnostics
-                                .stages
-                                .iter()
-                                .map(|(w, h)| format!("{w}×{h}"))
-                                .collect::<Vec<_>>()
-                                .join(" → ");
-                            state.scale_diagnostics.set_tooltip_text(Some(&details));
-                            state.scale_diagnostics.set_visible(true);
-                        }
+                    Ok(Ok(preview)) => {
                         ViewerWindow(state).display_scale_preview(Arc::new(preview));
                     }
                     Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
@@ -7673,9 +7649,7 @@ mod tests {
         assert_eq!(dimensions_from_percent(1, 1, 1.0), (1, 1));
         for resampling in [
             Resampling::Nearest,
-            Resampling::Linear,
             Resampling::Bicubic,
-            Resampling::SeamCarving,
             Resampling::GameAsset,
             Resampling::Lanczos,
         ] {
@@ -8190,11 +8164,14 @@ mod tests {
         window.select_annotation(Some(id));
 
         assert!(
-            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
+            !window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
         );
-        assert!(
-            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
-        );
+        assert!(!window.move_keyboard_tool_cursor_for_key(
+            gtk::gdk::Key::Left,
+            gtk::gdk::ModifierType::empty()
+        ));
+        assert!(window.handle_annotation_key(gtk::gdk::Key::Down, gtk::gdk::ModifierType::empty()));
+        assert!(window.handle_annotation_key(gtk::gdk::Key::Down, gtk::gdk::ModifierType::empty()));
         assert_eq!(
             window
                 .0
@@ -8219,9 +8196,7 @@ mod tests {
                 .len(),
             3
         );
-        assert!(
-            window.handle_annotation_key(gtk::gdk::Key::Right, gtk::gdk::ModifierType::empty())
-        );
+        assert!(window.handle_annotation_key(gtk::gdk::Key::Down, gtk::gdk::ModifierType::empty()));
         assert_eq!(
             window
                 .0
@@ -8232,6 +8207,56 @@ mod tests {
                 .operations()
                 .len(),
             4
+        );
+        window.set_tool(Tool::None);
+        window.0.region_selection.set(Some(CropOverlay {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32,
+            image_width: 32,
+            image_height: 32,
+        }));
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .is_empty()
+        );
+        window.set_tool(Tool::Pencil);
+        let controllers = window.0.window.observe_controllers();
+        let handled = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .filter_map(|c| c.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|c| c.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|c| {
+                c.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::z,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::CONTROL_MASK,
+                    ],
+                )
+            });
+        assert!(handled, "pen mode must handle Ctrl+Z");
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .len(),
+            1
         );
     }
 
@@ -8920,6 +8945,67 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn navigation_keeps_the_previous_image_visible_without_a_loading_page() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.NoLoadingFlashTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let enabled = |name: &str| {
+            window
+                .0
+                .window
+                .lookup_action(name)
+                .expect("window action")
+                .is_enabled()
+        };
+        let pixels = image::RgbaImage::from_pixel(8, 6, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&pixels).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
+        let directory = tempfile::tempdir().expect("temporary image directory");
+        let missing = gio::File::for_path(directory.path().join("missing.png"));
+
+        window.load_preserving_zoom(missing);
+
+        assert_eq!(
+            window.0.content_stack.visible_child_name().as_deref(),
+            Some("viewer"),
+            "Navigation must not flash an intermediate loading page"
+        );
+        assert_eq!(window.0.canvas.texture(), Some(texture));
+        assert!(window.0.content_stack.child_by_name("loading").is_none());
+        assert_eq!(
+            window.0.content_stack.transition_type(),
+            gtk::StackTransitionType::None
+        );
+        assert!(!enabled("copy-image"));
+        assert!(!enabled("delete-file"));
+
+        // Keeping the old preview must not conceal a failure or enable actions
+        // on stale pixels after the new file fails to load.
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while window.0.content_stack.visible_child_name().as_deref() != Some("error")
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            window.0.content_stack.visible_child_name().as_deref(),
+            Some("error")
+        );
+        assert!(window.0.canvas.texture().is_none());
+        assert!(!enabled("copy-image"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn empty_and_loaded_states_drive_content_and_action_availability() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -9466,10 +9552,10 @@ mod tests {
 
         window.0.scale_method.set_selected(1);
         assert_eq!(window.0.scale_method.selected(), 1);
-        assert_eq!(window.0.scale_resampling.get(), Resampling::Linear);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::Bicubic);
 
-        window.0.scale_method.set_selected(5);
-        assert_eq!(window.0.scale_method.selected(), 5);
+        window.0.scale_method.set_selected(3);
+        assert_eq!(window.0.scale_method.selected(), 3);
         assert_eq!(window.0.scale_resampling.get(), Resampling::Lanczos);
         if gio::SettingsSchemaSource::default()
             .is_some_and(|source| source.lookup(crate::APP_ID, true).is_some())
@@ -9477,7 +9563,7 @@ mod tests {
             assert_eq!(window.0.settings.scale_resampling(), Resampling::Lanczos);
         }
 
-        window.0.scale_method.set_selected(4);
+        window.0.scale_method.set_selected(2);
         assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset);
         if gio::SettingsSchemaSource::default()
             .is_some_and(|source| source.lookup(crate::APP_ID, true).is_some())
@@ -9498,12 +9584,6 @@ mod tests {
             context.iteration(false);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(window.0.scale_diagnostics.get_visible());
-        assert_eq!(
-            window.0.scale_diagnostics.label(),
-            gettext("Game Asset: Bicubic + contours · {colours} ink palette colours")
-                .replace("{colours}", "1")
-        );
         let source = window.0.scale_source.borrow().as_ref().unwrap().clone();
         let expected = crate::tools::scale::resize(
             &source,

@@ -35,13 +35,8 @@ impl GpuScaler {
         resampling: Resampling,
         cancellation: &CancellationToken,
     ) -> Result<Option<RgbaImage>> {
-        if matches!(
-            resampling,
-            Resampling::Nearest
-                | Resampling::SeamCarving
-                | Resampling::GameAsset
-                | Resampling::Lanczos
-        ) || u64::from(target_width) * u64::from(target_height) < MIN_GPU_PIXELS
+        if resampling != Resampling::Bicubic
+            || u64::from(target_width) * u64::from(target_height) < MIN_GPU_PIXELS
             || u64::from(self.source.width()) > u64::from(target_width) * 2
             || u64::from(self.source.height()) > u64::from(target_height) * 2
         {
@@ -62,7 +57,7 @@ impl GpuScaler {
             tracing::warn!("GPU scaling session was poisoned; using CPU");
             return Ok(None);
         };
-        let result = backend.resize(target_width, target_height, resampling, cancellation);
+        let result = backend.resize(target_width, target_height, cancellation);
         match result {
             Ok(image) => Ok(Some(image)),
             Err(GpuError::Cancelled) => Err(AppError::Cancelled),
@@ -180,7 +175,6 @@ impl Backend {
         &mut self,
         width: u32,
         height: u32,
-        resampling: Resampling,
         cancellation: &CancellationToken,
     ) -> std::result::Result<RgbaImage, GpuError> {
         cancellation.check().map_err(|_| GpuError::Cancelled)?;
@@ -216,25 +210,7 @@ impl Backend {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let params = [
-            self.source_width,
-            self.source_height,
-            width,
-            height,
-            match resampling {
-                Resampling::Linear => 0,
-                Resampling::Bicubic => 1,
-                Resampling::Nearest
-                | Resampling::SeamCarving
-                | Resampling::GameAsset
-                | Resampling::Lanczos => {
-                    return Err(GpuError::Unavailable("unsupported method".into()));
-                }
-            },
-            0,
-            0,
-            0,
-        ];
+        let params = [self.source_width, self.source_height, width, height];
         let param_bytes: Vec<u8> = params
             .iter()
             .flat_map(|value| value.to_ne_bytes())
@@ -357,10 +333,6 @@ struct Params {
     source_height: u32,
     target_width: u32,
     target_height: u32,
-    method: u32,
-    _padding0: u32,
-    _padding1: u32,
-    _padding2: u32,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
@@ -402,13 +374,7 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
                     f32(params.source_height) / f32(params.target_height))
         - vec2<f32>(0.5);
     var color: vec4<f32>;
-    if params.method == 0u {
-        let base = vec2<i32>(floor(source_position));
-        let fraction = fract(source_position);
-        let top = mix(sample_pixel(base), sample_pixel(base + vec2<i32>(1, 0)), fraction.x);
-        let bottom = mix(sample_pixel(base + vec2<i32>(0, 1)), sample_pixel(base + vec2<i32>(1, 1)), fraction.x);
-        color = mix(top, bottom, fraction.y);
-    } else {
+
         let base = vec2<i32>(floor(source_position));
         color = vec4<f32>(0.0);
         var total_weight = 0.0;
@@ -421,7 +387,6 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
         color /= total_weight;
-    }
     textureStore(output_texture, vec2<i32>(id.xy), finish_color(color));
 }
 "#;
@@ -446,24 +411,23 @@ mod tests {
         let source = test_image(640, 512);
         let cancellation = CancellationToken::default();
         let gpu = GpuScaler::new(source.clone());
-        for method in [Resampling::Linear, Resampling::Bicubic] {
-            let Some(actual) = gpu
-                .resize(590, 470, method, &cancellation)
-                .expect("GPU scaling should not fail")
-            else {
-                eprintln!("hardware GPU unavailable; skipping comparison");
-                return;
-            };
-            let expected = super::super::resize(&source, 590, 470, method, &cancellation).unwrap();
-            let absolute_error: u64 = actual
-                .as_raw()
-                .iter()
-                .zip(expected.as_raw())
-                .map(|(actual, expected)| u64::from(actual.abs_diff(*expected)))
-                .sum();
-            let mean_error = absolute_error as f64 / actual.as_raw().len() as f64;
-            assert!(mean_error < 5.0, "{method:?} mean error was {mean_error}");
-        }
+        let method = Resampling::Bicubic;
+        let Some(actual) = gpu
+            .resize(590, 470, method, &cancellation)
+            .expect("GPU scaling should not fail")
+        else {
+            eprintln!("hardware GPU unavailable; skipping comparison");
+            return;
+        };
+        let expected = super::super::resize(&source, 590, 470, method, &cancellation).unwrap();
+        let absolute_error: u64 = actual
+            .as_raw()
+            .iter()
+            .zip(expected.as_raw())
+            .map(|(actual, expected)| u64::from(actual.abs_diff(*expected)))
+            .sum();
+        let mean_error = absolute_error as f64 / actual.as_raw().len() as f64;
+        assert!(mean_error < 5.0, "{method:?} mean error was {mean_error}");
     }
 
     #[test]
@@ -476,45 +440,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            gpu.resize(590, 470, Resampling::SeamCarving, &cancellation)
-                .unwrap()
-                .is_none()
-        );
+
         assert!(
             gpu.resize(590, 470, Resampling::Lanczos, &cancellation)
                 .unwrap()
                 .is_none()
         );
+
         assert!(
-            gpu.resize(256, 200, Resampling::Linear, &cancellation)
+            gpu.resize(256, 200, Resampling::Bicubic, &cancellation)
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    #[ignore = "performance benchmark"]
-    fn benchmark_gpu_previews() {
-        use std::time::Instant;
-
-        let source = test_image(3840, 2160);
-        let gpu = GpuScaler::new(source.clone());
-        let cancellation = CancellationToken::default();
-        for method in [Resampling::Linear, Resampling::Bicubic] {
-            let started = Instant::now();
-            let Some(_) = gpu.resize(2560, 1440, method, &cancellation).unwrap() else {
-                eprintln!("hardware GPU unavailable; benchmark skipped");
-                return;
-            };
-            let cold = started.elapsed();
-            let started = Instant::now();
-            let _ = gpu.resize(2560, 1440, method, &cancellation).unwrap();
-            let warm = started.elapsed();
-            let started = Instant::now();
-            let _ = super::super::resize(&source, 2560, 1440, method, &cancellation).unwrap();
-            let cpu = started.elapsed();
-            eprintln!("{method:?}: GPU cold {cold:?}, GPU warm {warm:?}, CPU {cpu:?}");
-        }
     }
 }

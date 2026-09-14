@@ -127,6 +127,7 @@ pub enum AnnotationEdit {
     Create(Annotation),
     Set(Annotation),
     Delete(AnnotationId),
+    DeleteMany(Vec<AnnotationId>),
 }
 
 #[must_use]
@@ -159,6 +160,9 @@ pub fn fold_annotations(
             }
             Operation::Annotate(AnnotationEdit::Delete(id)) => {
                 annotations.retain(|annotation| annotation.id != *id);
+            }
+            Operation::Annotate(AnnotationEdit::DeleteMany(ids)) => {
+                annotations.retain(|annotation| !ids.contains(&annotation.id));
             }
             Operation::Crop {
                 x,

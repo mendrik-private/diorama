@@ -7,16 +7,14 @@ pub enum Rotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resampling {
     Nearest,
-    Linear,
     Bicubic,
-    SeamCarving,
     GameAsset,
     Lanczos,
 }
 
 impl Resampling {
     pub fn downscale_only(self) -> bool {
-        matches!(self, Self::SeamCarving | Self::GameAsset)
+        matches!(self, Self::GameAsset)
     }
 }
 

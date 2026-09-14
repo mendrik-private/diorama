@@ -482,9 +482,6 @@ msgstr ""
 msgid "Linear"
 msgstr ""
 
-msgid "Bilinear"
-msgstr ""
-
 msgid "Lanczos"
 msgstr ""
 
@@ -492,18 +489,11 @@ msgstr ""
 msgid "Bicubic"
 msgstr ""
 
-#: src/window/mod.rs:4075
-msgid "Seam carving"
-msgstr ""
-
 #: src/window/mod.rs:4084
 msgid "Scaling method"
 msgstr ""
 
 msgid "Game Asset"
-msgstr ""
-
-msgid "Game Asset: Bicubic + contours · {colours} ink palette colours"
 msgstr ""
 
 #: src/window/mod.rs:4095

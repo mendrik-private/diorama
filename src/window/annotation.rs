@@ -961,6 +961,40 @@ impl ViewerWindow {
         key: gtk::gdk::Key,
         modifiers: gtk::gdk::ModifierType,
     ) -> bool {
+        if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete)
+            && matches!(self.0.tool.get(), Tool::None | Tool::Select)
+            && let Some(selection) = self.0.region_selection.get()
+        {
+            let rect = Rect {
+                x: selection.x as f32,
+                y: selection.y as f32,
+                width: selection.width as f32,
+                height: selection.height as f32,
+            };
+            let ids: Vec<_> = self
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .map(|document| document.annotations())
+                .unwrap_or_default()
+                .iter()
+                .filter(|annotation| {
+                    crate::tools::annotation::render::contained_in(
+                        annotation,
+                        (selection.image_width, selection.image_height),
+                        rect,
+                    )
+                })
+                .map(|annotation| annotation.id)
+                .collect();
+            if !ids.is_empty() {
+                self.apply(Operation::Annotate(AnnotationEdit::DeleteMany(ids)));
+                self.select_annotation(None);
+            }
+            // Even an empty rectangle must not fall through to deleting the file.
+            return true;
+        }
         if matches!(
             key,
             gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete | gtk::gdk::Key::BackSpace
@@ -978,8 +1012,6 @@ impl ViewerWindow {
             return true;
         }
         let delta = match key {
-            gtk::gdk::Key::Left => Some(Point { x: -1.0, y: 0.0 }),
-            gtk::gdk::Key::Right => Some(Point { x: 1.0, y: 0.0 }),
             gtk::gdk::Key::Up => Some(Point { x: 0.0, y: -1.0 }),
             gtk::gdk::Key::Down => Some(Point { x: 0.0, y: 1.0 }),
             _ => None,

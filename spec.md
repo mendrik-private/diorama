@@ -54,7 +54,7 @@ Glycin supports sandboxed, modular image loading and exposes a native Rust API. 
 
 ### 4.2 Processing model
 
-The GTK main thread must only perform UI state updates and lightweight rendering submission. Decoding, resizing, palette reduction, seam carving, AI inference and file export must run in cancellable worker tasks. GTK-rs documentation explicitly demonstrates moving blocking work off the main loop and returning results through asynchronous channels. ([gtk-rs.org][3])
+The GTK main thread must only perform UI state updates and lightweight rendering submission. Decoding, resizing, palette reduction, AI inference and file export must run in cancellable worker tasks. GTK-rs documentation explicitly demonstrates moving blocking work off the main loop and returning results through asynchronous channels. ([gtk-rs.org][3])
 
 Recommended worker groups:
 
@@ -494,28 +494,20 @@ Resampling modes:
 * Pixel replication.
 * Intended for pixel art and masks.
 
-**Linear**
-
-* Fast bilinear interpolation.
-* Intended for previews and low-cost resizing.
-
 **Bicubic**
 
 * Default final-quality mode for photographs and general images.
 
-**None**
+**Lanczos**
 
-* Available only when no pixel resampling is required, such as crop, flip and rotations in 90° increments.
-* Disabled for arbitrary resizing.
+* High-quality resampling for both enlargement and reduction.
 
-**Seam Carving**
+**Game Asset**
 
-* Content-aware resizing.
-* Initial implementation supports shrinking.
-* Runs as a cancellable background operation.
-* Provides a quick preview followed by a full-quality result.
-* Warns when the requested reduction is likely to create severe distortion.
-* May later support user-painted protect and remove masks.
+* Reduction only, with continuous directional contours and source-derived opacity.
+* Tight antialiasing over median-projected source color.
+* Remove retained contour ink only in a one-pixel fill halo of painted contours.
+* Preview and document rendering share a cancellable source-analysis session.
 
 ## 15. Region Selection and Crop to Content
 
@@ -752,7 +744,7 @@ The document and processing layers should not depend directly on GTK widgets. Th
 * Flip and rotate.
 * Manual crop.
 * Crop to content.
-* Scale with nearest, linear and bicubic modes.
+* Scale with nearest, bicubic, Lanczos and Game Asset modes.
 * Metadata and color-profile preservation.
 
 ### Phase 3: Advanced interactive tools
@@ -767,7 +759,6 @@ The document and processing layers should not depend directly on GTK widgets. Th
 ### Phase 4: Computational features
 
 * Annotation layer (see `docs/annotations-spec.md`).
-* Seam carving.
 * Additional export formats.
 
 ## 25. Release Acceptance Criteria
@@ -787,7 +778,7 @@ The first stable release is acceptable when:
 11. Crop to content previews its result before applying.
 12. Pencil right-click sampling returns the displayed source color.
 13. No network access is performed by any editing tool.
-14. Cancelling a long-running scale, palette or seam-carving operation restores the previous document state.
+14. Cancelling a long-running scale or palette operation restores the previous document state.
 15. Corrupt and adversarial test images cannot allocate memory beyond configured limits.
 16. The GTK main thread remains responsive during decoding and export.
 17. The application passes keyboard, screen-reader and high-contrast smoke tests.

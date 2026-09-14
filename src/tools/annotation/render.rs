@@ -9,7 +9,7 @@ use crate::tools::pencil::{blend, paint_stroke};
 
 use super::arrow::{arrow_head, curve_points};
 use super::font::{OutlineCommand, glyph_outline, units_per_em};
-use super::highlight::{highlight_stroke_width, sloppy_ellipse};
+use super::highlight::{draw_crayon, highlight_stroke_width, sloppy_ellipse};
 use super::measure::{gap_markers, length_label};
 use super::pencil::{geometry_bounds, stroke_for};
 use super::pixel_font::{CELL_HEIGHT as PIXEL_LABEL_HEIGHT, for_each_ink_pixel, text_width};
@@ -200,14 +200,15 @@ fn draw_annotation(
             }
         }
         Shape::Highlight { rect, seed, style } => {
-            stroke_polyline(
+            draw_crayon(
                 pixmap,
-                &sloppy_ellipse(*rect, *seed),
-                style.color,
+                *rect,
+                *seed,
                 highlight_stroke_width(dimensions),
+                style.color,
                 transform,
-                true,
-            );
+                cancellation,
+            )?;
         }
         Shape::Arrow {
             start,
@@ -748,6 +749,15 @@ fn rendered_bounds(
     })
 }
 
+pub(crate) fn contained_in(annotation: &Annotation, dimensions: (u32, u32), rect: Rect) -> bool {
+    annotation_bounds(annotation, dimensions).is_some_and(|bounds| {
+        bounds.min_x >= rect.x
+            && bounds.min_y >= rect.y
+            && bounds.max_x <= rect.x + rect.width
+            && bounds.max_y <= rect.y + rect.height
+    })
+}
+
 fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<Bounds> {
     match &annotation.shape {
         Shape::Pencil {
@@ -839,6 +849,56 @@ fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<
 mod tests {
     use super::*;
     use crate::document::{AnnotationId, PencilGeometry, Rect, StrokeStyle};
+
+    #[test]
+    fn rectangle_deletion_requires_full_annotation_containment() {
+        let annotation = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Highlight {
+                rect: Rect {
+                    x: 30.0,
+                    y: 30.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                seed: 5,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        assert!(contained_in(
+            &annotation,
+            (100, 100),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0
+            }
+        ));
+        assert!(!contained_in(
+            &annotation,
+            (100, 100),
+            Rect {
+                x: 40.0,
+                y: 0.0,
+                width: 60.0,
+                height: 100.0
+            }
+        ));
+        assert!(!contained_in(
+            &annotation,
+            (100, 100),
+            Rect {
+                x: 70.0,
+                y: 70.0,
+                width: 30.0,
+                height: 30.0
+            }
+        ));
+    }
 
     #[test]
     fn render_changes_pixels_only_near_the_annotation() {
@@ -1009,12 +1069,12 @@ mod tests {
             .sum::<u64>()
         };
 
-        let one_pixel = render((1023, 300), 1.0);
-        assert_eq!(one_pixel, render((1023, 300), 12.0));
-        let two_pixels = render((1024, 300), 1.0);
+        let normal = render((1024, 300), 1.0);
+        assert_eq!(normal, render((1024, 300), 12.0));
+        let doubled = render((2048, 300), 1.0);
         assert!(
-            two_pixels > one_pixel * 3 / 2,
-            "two-pixel highlight coverage {two_pixels} was not greater than one-pixel coverage {one_pixel}"
+            doubled > normal * 3 / 2,
+            "doubling resolution should increase crayon coverage: {normal} -> {doubled}"
         );
     }
 

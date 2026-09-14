@@ -12,9 +12,8 @@
     "--socket=wayland",
     "--socket=fallback-x11",
     "--device=dri",
-    "--filesystem=xdg-pictures",
-    "--filesystem=/media",
-    "--filesystem=/run/media"
+    "--filesystem=host",
+    "--filesystem=/tmp"
   ],
   "modules": [
     {

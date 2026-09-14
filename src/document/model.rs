@@ -536,6 +536,27 @@ mod tests {
     }
 
     #[test]
+    fn deleting_multiple_annotations_is_one_undo_step() {
+        let mut document = annotation_document();
+        for id in 1..=3 {
+            document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
+                id,
+                id as f32 * 20.0,
+            ))));
+        }
+        let original = document.annotations();
+        document.apply(Operation::Annotate(AnnotationEdit::DeleteMany(vec![
+            AnnotationId(1),
+            AnnotationId(3),
+        ])));
+        assert_eq!(document.annotations(), vec![original[1].clone()]);
+        assert!(document.undo());
+        assert_eq!(document.annotations(), original);
+        assert!(document.redo());
+        assert_eq!(document.annotations(), vec![original[1].clone()]);
+    }
+
+    #[test]
     fn undoing_set_restores_annotation_geometry_and_dirty_state() {
         let mut document = annotation_document();
         let original = highlight(1, 8.0);

@@ -130,7 +130,7 @@ window responsive while larger edits render.
   aspect ratio.
 - Preview scaling fitted to the window or at actual output-pixel size, and hold
   a control to compare against the original.
-- Choose nearest-neighbor, linear, bicubic, or content-aware seam-carving
+- Choose nearest-neighbor, bicubic, Lanczos, or contour-preserving Game Asset
   scaling.
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
@@ -247,10 +247,14 @@ The Flatpak build is the recommended development environment because it
 provides the expected GNOME SDK and Rust toolchain:
 
 ```sh
-flatpak remote-add --user --if-not-exists flathub \
-  https://flathub.org/repo/flathub.flatpakrepo
-flatpak-builder --user --install-deps-from=flathub --install --force-clean \
-  build build-aux/io.github.mendrik_private.Diorama.Devel.json
+./install.sh
+```
+
+The script builds the current checkout into `.flatpak-builder/local`, installs
+or updates the user-local `master` build, and adds Flathub as a user remote only
+when it is needed for the runtime. Run the installed application with:
+
+```sh
 flatpak run io.github.mendrik_private.Diorama
 ```
 

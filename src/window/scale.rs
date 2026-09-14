@@ -49,21 +49,16 @@ pub(super) fn scale_unit(index: u32) -> ScaleUnit {
 pub(super) fn resampling_index(resampling: Resampling) -> u32 {
     match resampling {
         Resampling::Nearest => 0,
-        Resampling::Linear => 1,
-        Resampling::Bicubic => 2,
-        Resampling::SeamCarving => 3,
-        Resampling::GameAsset => 4,
-        Resampling::Lanczos => 5,
+        Resampling::Bicubic => 1,
+        Resampling::GameAsset => 2,
+        Resampling::Lanczos => 3,
     }
 }
-
 pub(super) fn resampling_at(index: u32) -> Resampling {
     match index {
         0 => Resampling::Nearest,
-        1 => Resampling::Linear,
-        3 => Resampling::SeamCarving,
-        4 => Resampling::GameAsset,
-        5 => Resampling::Lanczos,
+        2 => Resampling::GameAsset,
+        3 => Resampling::Lanczos,
         _ => Resampling::Bicubic,
     }
 }
