@@ -1,5 +1,5 @@
 //! Game Asset reduction: direction-merged contours, source-width opacity,
-//! tight antialiasing, and median color with a one-pixel retained-ink halo.
+//! tight antialiasing, and biharmonic texture repair with area projection.
 use crate::{
     document::CancellationToken,
     error::{AppError, Result},
@@ -7,6 +7,7 @@ use crate::{
 use image::RgbaImage;
 use std::sync::{Arc, Mutex};
 mod antialias;
+mod biharmonic;
 mod cleanup;
 mod color;
 mod contours;
@@ -14,9 +15,9 @@ mod coverage;
 mod detect;
 mod field;
 mod ink;
-mod median;
 mod opacity;
 mod paint;
+mod project;
 mod raster;
 mod smoothing;
 mod source;
@@ -98,7 +99,8 @@ impl Prepared {
         let paint = opacity::apply(&aa, &ink.owners, &strength);
         let retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
         cancel.check()?;
-        let base = median::project(&self.linear, &retained_mask, &paint, cancel)?;
+        let repaired = biharmonic::repair(&self.linear, &retained_mask, cancel)?;
+        let base = project::area(&repaired, w as usize, h as usize, cancel)?;
         let result = paint::composite(&base, &ink.colors, &paint);
         cancel.check()?;
         Ok(result)

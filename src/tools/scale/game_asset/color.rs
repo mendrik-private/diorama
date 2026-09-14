@@ -1,4 +1,4 @@
-//! Source-resolution nearest and harmonic fill, following the supplied reference.
+//! Straight linear-light RGBA at the analysis and composition boundaries.
 use image::{Rgba, RgbaImage};
 
 #[derive(Clone)]

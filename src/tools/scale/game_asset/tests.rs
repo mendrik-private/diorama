@@ -1,7 +1,7 @@
 use super::*;
 use crate::document::{Document, ImageSource, Metadata, Operation, Resampling};
 #[test]
-fn selected_recipe_matches_reviewed_pixels_at_all_sizes() {
+fn biharmonic_matches_independent_reviewed_pixels_at_all_sizes() {
     let source = Arc::new(
         image::load_from_memory(include_bytes!("fixtures/elf.png"))
             .unwrap()
@@ -11,16 +11,28 @@ fn selected_recipe_matches_reviewed_pixels_at_all_sizes() {
     for (size, bytes) in [
         (128, include_bytes!("fixtures/elf-128.png").as_slice()),
         (160, include_bytes!("fixtures/elf-160.png").as_slice()),
-        (256, include_bytes!("fixtures/elf-256.png").as_slice()),
+        (200, include_bytes!("fixtures/elf-200.png").as_slice()),
     ] {
         let expected = image::load_from_memory(bytes).unwrap().into_rgba8();
         let result = session
             .resize(size, size, &CancellationToken::default())
             .unwrap();
-        assert_eq!(
-            result.as_raw(),
-            expected.as_raw(),
-            "reviewed output changed at {size}px"
+        if let Ok(directory) = std::env::var("DIORAMA_SCALING_ARTIFACTS") {
+            std::fs::create_dir_all(&directory).unwrap();
+            result.save(format!("{directory}/elf-{size}.png")).unwrap();
+        }
+        let differences: Vec<_> = result
+            .as_raw()
+            .iter()
+            .zip(expected.as_raw())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .collect();
+        assert!(
+            differences.is_empty(),
+            "{size}px: {} changed channels; first {:?}",
+            differences.len(),
+            differences.first()
         );
     }
 }
@@ -112,7 +124,7 @@ fn transparent_rgb_does_not_bleed_and_empty_sources_remain_empty() {
 }
 
 #[test]
-fn retained_ink_excludes_short_neighbors_and_correction_stays_in_the_halo() {
+fn retained_ink_excludes_short_neighbors() {
     let mut trace = raster::Mask::new(24, 12);
     for x in 2..20 {
         trace.data[5 * 24 + x] = true;
@@ -127,34 +139,6 @@ fn retained_ink_excludes_short_neighbors_and_correction_stays_in_the_halo() {
         .unwrap();
     assert!(retained.data[5 * 24 + 8]);
     assert!(!retained.data[7 * 24 + 8]);
-    let source = RgbaImage::from_fn(24, 12, |x, y| {
-        image::Rgba([(x * 10) as u8, (y * 20) as u8, 120, 255])
-    });
-    let linear = color::LinearImage::from_rgba(&source);
-    let mut paint = image::GrayImage::new(12, 6);
-    paint.put_pixel(2, 2, image::Luma([153]));
-    let all_ink = raster::Mask {
-        w: 24,
-        h: 12,
-        data: vec![true; 24 * 12],
-    };
-    let empty_ink = raster::Mask::new(24, 12);
-    let base = median::project(&linear, &empty_ink, &paint, &cancel).unwrap();
-    let no_support = median::project(&linear, &all_ink, &paint, &cancel).unwrap();
-    assert_eq!(
-        base.pixels, no_support.pixels,
-        "no donor information preserves the original lookup"
-    );
-    let corrected = median::project(&linear, &retained, &paint, &cancel).unwrap();
-    for y in 0..6 {
-        for x in 0..12 {
-            let i = y * 12 + x;
-            assert_eq!(base.pixels[i][3], corrected.pixels[i][3]);
-            if !(1..=3).contains(&x) || !(1..=3).contains(&y) {
-                assert_eq!(base.pixels[i], corrected.pixels[i]);
-            }
-        }
-    }
 }
 
 #[test]

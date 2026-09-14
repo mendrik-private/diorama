@@ -43,33 +43,56 @@ source pixels of average thickness. Without width measurements the contour uses 
 Intrinsic opacity multiplies tight-AA coverage; the AA transition has a 65% minimum
 core and a 35% maximum fringe before this multiplication.
 
-## Median fill and composition
+## Biharmonic fill and composition
 
-RGB is decoded to linear light once. The destination footprint uses scale-widened,
-separable Catmull-Rom taps. Source alpha supplies color weights; median RGB is selected
-independently per channel from the positive lobes. Alpha is the signed bicubic projection.
+The source ink footprint is assigned to its nearest traces. Only ink belonging to
+contours retained at the target size is removed. Discarded traces and ownership
+ties involving a discarded trace keep their source samples. All retained ink is
+removed before shrinking, including the color beneath partially opaque contours.
 
-Only fill pixels within a one-pixel, eight-connected neighborhood of actual nonzero
-paint coverage can remove ink samples. Fully opaque painted pixels need no correction;
-partially painted cores may receive corrected fill beneath the contour. Source-mask
-ownership is assigned to nearest traces. Discarded traces never subtract from lookup;
-ownership ties involving a discarded trace preserve the source sample.
+Repair solves the biharmonic equation on the masked source pixels in premultiplied
+linear RGBA. Its operator is the square of the four-neighbor graph Laplacian, with
+reflecting image boundaries. Known samples form fixed boundary conditions; known
+transparent pixels contribute transparent RGBA, never their hidden RGB. The
+original values of masked pixels are unavailable to the solver.
 
-Outside that halo each pixel retains its original median projection exactly. If ink
-removal leaves no positive fill support, use the original median. Fill alpha is never
-changed by correction. Composition uses linear-light premultiplied source-over and
-encodes fully transparent pixels as transparent black.
+A sparse system with at most thirteen coefficients per row is solved by
+Jacobi-preconditioned conjugate gradients. The Euclidean residual must be at most
+`max(1e-12, 1e-12 * ||rhs||)` for each channel, checked with an explicit matrix
+product before accepting convergence. Work is limited to 4,096 iterations per
+channel. Missing boundary data or a failed solve produces an application error;
+no alternative fill is silently substituted.
+
+Repaired channels are clipped to the known source range, then into valid
+premultiplied RGBA. All unmasked source samples remain unchanged. This follows
+[scikit-image's biharmonic reference](https://scikit-image.org/docs/stable/api/skimage.restoration.html#skimage.restoration.inpaint_biharmonic),
+including its channel-range clipping, with an additional premultiplied-alpha
+constraint. Python and scikit-image are not application dependencies.
+
+Two separable passes perform exact fractional rectangular area integration before
+linear-light source-over composition with the unchanged opacity contours. Alpha
+is repaired and projected together with color. Fully transparent output pixels
+encode as transparent black. Game Asset has one fixed recipe and no settings
+panel, persisted tuning keys, palette quantization or contour-halo alternative.
 
 ## Bounds and validation
 
 Source analysis and target work check cancellation throughout Gaussian rows, curve
-fitting, tracing, merging, thinning, footprint construction and sampling. Cancelled
+fitting, tracing, merging, thinning, sparse-system construction, solver iterations and area sampling. Cancelled
 work is never committed as a target result. Heavy work stays outside the session lock.
 A conservative one-GiB working-set envelope and a 500,000 detector-candidate limit reject
 unbounded inputs with application errors instead of silently selecting another method.
 The renderer processes one quadratic's flattened segments at a time.
 
-The reviewed 800×800 source and 128/160/256 target images in `game_asset/fixtures/` are
-production regression fixtures. Tests require exact RGBA parity with the selected
-median/halo/tight-AA/opacity recipe, cover rectangular preview/document equivalence,
-cache reuse, cancellation, transparency, dimensions and contour continuity.
+The reviewed 800×800 source and 128/160/200 target images in `game_asset/fixtures/`
+are production regression fixtures. The expected targets are the selected
+biharmonic outputs of the independent Python comparison, preserved before this
+Rust implementation was written. Tests require exact RGBA parity at all three
+sizes. Separate numerical tests cover source/image boundary behavior against
+scikit-image, cubic texture continuation, masked-source poisoning, transparency,
+fractional area conservation, rectangular preview/document equivalence, cache
+reuse, cancellation and dimensions.
+
+Historical fill methods, settings UI, and comparison artifacts are preserved on
+the `experiment` branch and its sibling `diorama-experiment` worktree. They are
+not part of the application or this branch's source tree.

@@ -131,7 +131,7 @@ window responsive while larger edits render.
 - Preview scaling fitted to the window or at actual output-pixel size, and hold
   a control to compare against the original.
 - Choose nearest-neighbor, bicubic, Lanczos, or contour-preserving Game Asset
-  scaling.
+  scaling with biharmonic texture filling.
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
 

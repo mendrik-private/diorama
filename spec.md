@@ -505,8 +505,9 @@ Resampling modes:
 **Game Asset**
 
 * Reduction only, with continuous directional contours and source-derived opacity.
-* Tight antialiasing over median-projected source color.
-* Remove retained contour ink only in a one-pixel fill halo of painted contours.
+* Tight antialiasing over biharmonic-repaired texture with exact area shrinking.
+* Remove retained source contours before repair; reconstruct color and transparency together.
+* One fixed recipe, without an algorithm settings panel.
 * Preview and document rendering share a cancellable source-analysis session.
 
 ## 15. Region Selection and Crop to Content
