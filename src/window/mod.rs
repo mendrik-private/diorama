@@ -2858,6 +2858,14 @@ impl ViewerWindow {
     }
 
     fn scale_dimension_changed(&self, width_changed: bool) {
+        self.scale_dimension_changed_with_preserved_zoom(width_changed, None);
+    }
+
+    fn scale_dimension_changed_with_preserved_zoom(
+        &self,
+        width_changed: bool,
+        preserved_zoom: Option<f64>,
+    ) {
         if self.0.scale_updating_controls.get() {
             return;
         }
@@ -2883,7 +2891,7 @@ impl ViewerWindow {
             }
         }
         self.0.scale_updating_controls.set(false);
-        self.refresh_scale_controls();
+        self.refresh_scale_controls_with_preserved_zoom(preserved_zoom);
     }
 
     fn scale_slider_changed(&self, value: f64) {
@@ -2915,6 +2923,10 @@ impl ViewerWindow {
     }
 
     fn refresh_scale_controls(&self) {
+        self.refresh_scale_controls_with_preserved_zoom(None);
+    }
+
+    fn refresh_scale_controls_with_preserved_zoom(&self, preserved_zoom: Option<f64>) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
             return;
         };
@@ -2957,7 +2969,7 @@ impl ViewerWindow {
             source.width(),
             source.height()
         ));
-        self.schedule_scale_preview(width, height);
+        self.schedule_scale_preview(width, height, preserved_zoom);
     }
 
     fn refresh_scale_method(&self) {
@@ -2974,10 +2986,16 @@ impl ViewerWindow {
         self.0.scale_updating_controls.set(true);
         self.configure_scale_ranges(source.width(), source.height());
         self.0.scale_updating_controls.set(false);
-        self.scale_dimension_changed(true);
+        let preserved_zoom = self.0.canvas.zoom();
+        self.scale_dimension_changed_with_preserved_zoom(true, Some(preserved_zoom));
     }
 
-    fn schedule_scale_preview(&self, target_width: u32, target_height: u32) {
+    fn schedule_scale_preview(
+        &self,
+        target_width: u32,
+        target_height: u32,
+        preserved_zoom: Option<f64>,
+    ) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
             self.0.scale_spinner.set_visible(false);
             return;
@@ -2989,7 +3007,7 @@ impl ViewerWindow {
         }
         if (target_width, target_height) == source.dimensions() {
             self.0.scale_spinner.set_visible(false);
-            self.display_scale_preview(source);
+            self.display_scale_preview(source, preserved_zoom);
             return;
         }
         self.0.scale_spinner.set_visible(true);
@@ -3056,7 +3074,8 @@ impl ViewerWindow {
                 state.scale_spinner.set_visible(false);
                 match preview {
                     Ok(Ok(preview)) => {
-                        ViewerWindow(state).display_scale_preview(Arc::new(preview));
+                        ViewerWindow(state)
+                            .display_scale_preview(Arc::new(preview), preserved_zoom);
                     }
                     Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                     Err(_) => state
@@ -3067,7 +3086,7 @@ impl ViewerWindow {
         });
     }
 
-    fn display_scale_preview(&self, preview: Arc<image::RgbaImage>) {
+    fn display_scale_preview(&self, preview: Arc<image::RgbaImage>, preserved_zoom: Option<f64>) {
         self.0.scale_spinner.set_visible(false);
         self.0.scale_preview.replace(Some(preview.clone()));
         self.0.scale_original_button.set_sensitive(true);
@@ -3084,7 +3103,11 @@ impl ViewerWindow {
         match texture_from_rgba(&preview) {
             Ok(texture) => {
                 self.0.canvas.set_texture(Some(&texture));
-                self.apply_scale_preview_view(preview.width());
+                if let Some(zoom) = preserved_zoom {
+                    self.set_scale_preview_zoom(zoom);
+                } else {
+                    self.apply_scale_preview_view(preview.width());
+                }
             }
             Err(error) => self.0.toasts.add_toast(adw::Toast::new(&error)),
         }
@@ -3164,7 +3187,7 @@ impl ViewerWindow {
                 self.set_scale_preview_zoom(self.0.scale_preview_zoom_before_original.get());
             }
         } else {
-            self.schedule_scale_preview(dimensions.0, dimensions.1);
+            self.schedule_scale_preview(dimensions.0, dimensions.1, None);
         }
     }
 
@@ -9658,7 +9681,7 @@ mod tests {
             3,
             image::Rgba([4, 5, 6, 255]),
         ));
-        window.display_scale_preview(preview);
+        window.display_scale_preview(preview, None);
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
         assert!(window.0.canvas.zoom() > 64.0);
@@ -9694,6 +9717,22 @@ mod tests {
         assert!(window.0.scale_original_button.is_sensitive());
         assert!(!window.0.scale_spinner.get_visible());
 
+        let configured_filter = window.0.settings.zoom_filter();
+        let preserved_zoom = 1.375;
+        window.set_scale_preview_zoom(preserved_zoom);
+        window.0.scale_method.set_selected(2);
+        assert_eq!(
+            window.0.scale_resampling.get(),
+            Resampling::GameAsset(Default::default())
+        );
+        assert_eq!(window.0.canvas.filter(), ZoomFilter::Hard);
+        assert_eq!(window.0.canvas.zoom(), preserved_zoom);
+
+        window.0.scale_method.set_selected(0);
+        assert_eq!(window.0.scale_resampling.get(), Resampling::Nearest);
+        assert_eq!(window.0.canvas.filter(), configured_filter);
+        assert_eq!(window.0.canvas.zoom(), preserved_zoom);
+
         window.0.scale_width.set_value(4.0);
         assert_eq!(window.0.scale_height.value(), 3.0);
         assert!(window.0.scale_spinner.get_visible());
@@ -9727,6 +9766,50 @@ mod tests {
             (2, 2)
         );
         assert!(!window.0.scale_spinner.get_visible());
+
+        let previous_preview = window
+            .0
+            .scale_preview
+            .borrow()
+            .as_ref()
+            .expect("ordinary 2 × 2 preview")
+            .clone();
+        let previous_generation = window.0.scale_preview_generation.get();
+        let async_preserved_zoom = 1.625;
+        window.set_scale_preview_zoom(async_preserved_zoom);
+        window.0.scale_method.set_selected(2);
+        assert_eq!(
+            window.0.scale_resampling.get(),
+            Resampling::GameAsset(Default::default())
+        );
+        assert_eq!(
+            window.0.scale_preview_generation.get(),
+            previous_generation.wrapping_add(1)
+        );
+        assert!(window.0.scale_spinner.get_visible());
+        assert!(window.0.scale_preview_cancellation.borrow().is_some());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while (window.0.scale_spinner.get_visible()
+            || window.0.scale_preview_cancellation.borrow().is_some())
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let replacement_preview = window
+            .0
+            .scale_preview
+            .borrow()
+            .as_ref()
+            .expect("replacement 2 × 2 preview")
+            .clone();
+        assert_eq!(replacement_preview.dimensions(), (2, 2));
+        assert!(!Arc::ptr_eq(&replacement_preview, &previous_preview));
+        assert!(!window.0.scale_spinner.get_visible());
+        assert!(window.0.scale_preview_cancellation.borrow().is_none());
+        assert_eq!(window.0.canvas.filter(), ZoomFilter::Hard);
+        assert_eq!(window.0.canvas.zoom(), async_preserved_zoom);
 
         window.0.scale_method.set_selected(1);
         assert_eq!(window.0.scale_method.selected(), 1);
@@ -9789,7 +9872,7 @@ mod tests {
             2,
             image::Rgba([4, 5, 6, 255]),
         ));
-        window.display_scale_preview(preview);
+        window.display_scale_preview(preview, None);
         assert_eq!(window.0.canvas.texture().unwrap().width(), 2);
         window.set_scale_original_visible(true);
         assert_eq!(window.0.canvas.texture().unwrap().width(), 8);
