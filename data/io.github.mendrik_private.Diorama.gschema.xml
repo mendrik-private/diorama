@@ -10,6 +10,11 @@
     <key name="last-zoom" type="d"><default>1.0</default></key>
     <key name="last-open-folder-uri" type="s"><default>''</default></key>
     <key name="scale-resampling" type="s"><default>'bicubic'</default></key>
+    <key name="game-asset-aa" type="i">
+      <range min="0" max="100"/>
+      <default>50</default>
+      <summary>Game Asset antialiasing intensity</summary>
+    </key>
     <key name="color-picker-format" type="s"><default>'hex'</default></key>
     <key name="pencil-size" type="i"><default>1</default></key>
     <key name="pencil-antialiasing" type="b"><default>false</default></key>

@@ -12,10 +12,13 @@ pub fn smooth(original: &[Model], scale: f64, cancel: &CancellationToken) -> Res
         return Ok(original.to_vec());
     }
     let centers: Vec<_> = original.iter().map(|m| curve_point(m, 0.)).collect();
-    let tree = Spatial::new(centers.clone(), 5.);
     // The selected 6.4-pixel sigma shrinks continuously to zero at source scale.
     let sigma = strength * (1. - scale * scale).sqrt();
     let radius = (2.5 * sigma / scale).max(2.);
+    // Match bins to this query's support instead of scanning thousands of
+    // mostly empty 5-pixel cells when reducing strongly. Radius membership and
+    // sorted model IDs are unchanged, including distance ties.
+    let tree = Spatial::new(centers.clone(), radius);
     let mut result = original.to_vec();
     for (id, m) in original.iter().enumerate() {
         cancel.check()?;

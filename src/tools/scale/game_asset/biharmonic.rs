@@ -11,15 +11,25 @@ use crate::{
     error::{AppError, Result},
 };
 
+#[cfg(test)]
+mod reference;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod simd;
+
 #[derive(Default)]
 struct Row {
-    columns: [usize; 13],
+    // The one-GiB working-set gate limits sources to fewer than 2^21 pixels.
+    // On 64-bit hosts this saves 48 bytes per row, offsetting the extra batched
+    // solver workspace without reducing the accepted image dimensions.
+    columns: [u32; 13],
     coefficients: [i8; 13],
     len: usize,
 }
 
 impl Row {
     fn add(&mut self, column: usize, value: i8) {
+        let column = u32::try_from(column).expect("bounded Game Asset pixel index");
         if let Some(i) = self.columns[..self.len].iter().position(|&c| c == column) {
             self.coefficients[i] += value;
         } else {
@@ -33,7 +43,7 @@ impl Row {
         self.columns[..self.len]
             .iter()
             .zip(&self.coefficients[..self.len])
-            .map(|(&c, &v)| (c, f64::from(v)))
+            .map(|(&c, &v)| (c as usize, f64::from(v)))
     }
 }
 
@@ -60,81 +70,150 @@ fn stencil(pixel: usize, w: usize, h: usize) -> Row {
     squared
 }
 
-fn product(rows: &[Row], x: &[f64], out: &mut [f64], cancel: &CancellationToken) -> Result<()> {
+#[inline(always)]
+fn product(
+    rows: &[Row],
+    x: &[[f64; 4]],
+    out: &mut [[f64; 4]],
+    cancel: &CancellationToken,
+) -> Result<()> {
     for (i, (row, value)) in rows.iter().zip(out).enumerate() {
         if i % 4096 == 0 {
             cancel.check()?;
         }
-        *value = row
-            .entries()
-            .map(|(column, coefficient)| coefficient * x[column])
-            .sum();
+        let mut sum = [-0.; 4];
+        for (column, coefficient) in row.entries() {
+            for (s, v) in sum.iter_mut().zip(x[column]) {
+                *s += coefficient * v;
+            }
+        }
+        *value = sum;
     }
     Ok(())
 }
 
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(a, b)| a * b).sum()
+#[inline(always)]
+fn dot(a: &[[f64; 4]], b: &[[f64; 4]]) -> [f64; 4] {
+    let mut sum = [-0.; 4];
+    for (a, b) in a.iter().zip(b) {
+        for c in 0..4 {
+            sum[c] += a[c] * b[c];
+        }
+    }
+    sum
 }
 
 /// Jacobi-preconditioned conjugate gradients with an independently recomputed
 /// stopping residual. A bounded failed solve reports an error, never old ink.
+/// Channels share matrix reads and use SIMD-friendly contiguous lanes, but keep
+/// their original summation order, step sizes, restarts and convergence tests.
 fn solve(
     rows: &[Row],
-    rhs: &[f64],
+    rhs: &[[f64; 4]],
     diagonal: &[f64],
     cancel: &CancellationToken,
-) -> Result<Vec<f64>> {
+) -> Result<Vec<[f64; 4]>> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        simd::solve(rows, rhs, diagonal, cancel)
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        solve_portable(rows, rhs, diagonal, cancel)
+    }
+}
+
+// Inline the same bounds-checked implementation into the AVX entry point.
+// No reassociation or fused multiply/add: each lane keeps the scalar order.
+#[inline(always)]
+fn solve_portable(
+    rows: &[Row],
+    rhs: &[[f64; 4]],
+    diagonal: &[f64],
+    cancel: &CancellationToken,
+) -> Result<Vec<[f64; 4]>> {
     let n = rhs.len();
-    let mut x = vec![0.; n];
-    let tolerance = (dot(rhs, rhs).sqrt() * 1e-12).max(1e-12);
+    let mut x = vec![[0.; 4]; n];
+    let norms = dot(rhs, rhs).map(f64::sqrt);
+    let tolerance = norms.map(|norm| (norm * 1e-12).max(1e-12));
+    let mut active: [bool; 4] = std::array::from_fn(|c| norms[c] > tolerance[c]);
     let mut residual = rhs.to_vec();
-    if dot(&residual, &residual).sqrt() <= tolerance {
+    if !active.iter().any(|&a| a) {
         return Ok(x);
     }
-    let mut z: Vec<_> = residual.iter().zip(diagonal).map(|(r, d)| r / d).collect();
-    let mut direction = z.clone();
-    let mut product_buffer = vec![0.; n];
-    let mut rz = dot(&residual, &z);
+    let mut direction: Vec<_> = residual
+        .iter()
+        .zip(diagonal)
+        .map(|(r, d)| r.map(|v| v / d))
+        .collect();
+    let mut product_buffer = vec![[0.; 4]; n];
+    let mut rz = dot(&residual, &direction);
     for iteration in 0..(2 * n + 32).min(4096) {
         cancel.check()?;
         product(rows, &direction, &mut product_buffer, cancel)?;
         let denominator = dot(&direction, &product_buffer);
-        if denominator <= 0. || !denominator.is_finite() {
-            return Err(AppError::Scaling(
-                "Biharmonic system lost positive definiteness".into(),
-            ));
+        let mut alpha = [0.; 4];
+        for c in 0..4 {
+            if active[c] {
+                if denominator[c] <= 0. || !denominator[c].is_finite() {
+                    return Err(AppError::Scaling(
+                        "Biharmonic system lost positive definiteness".into(),
+                    ));
+                }
+                alpha[c] = rz[c] / denominator[c];
+            }
         }
-        let alpha = rz / denominator;
         for i in 0..n {
-            x[i] += alpha * direction[i];
-            residual[i] -= alpha * product_buffer[i];
+            for c in 0..4 {
+                x[i][c] += alpha[c] * direction[i][c];
+                residual[i][c] -= alpha[c] * product_buffer[i][c];
+            }
         }
-        let mut restart = false;
-        if dot(&residual, &residual).sqrt() <= tolerance {
+        let norms = dot(&residual, &residual).map(f64::sqrt);
+        let restart: [bool; 4] = std::array::from_fn(|c| active[c] && norms[c] <= tolerance[c]);
+        if restart.iter().any(|&r| r) {
             product(rows, &x, &mut product_buffer, cancel)?;
             for i in 0..n {
-                residual[i] = rhs[i] - product_buffer[i];
+                for c in 0..4 {
+                    if restart[c] {
+                        residual[i][c] = rhs[i][c] - product_buffer[i][c];
+                    }
+                }
             }
-            let norm = dot(&residual, &residual).sqrt();
-            if norm <= tolerance {
-                tracing::debug!(
-                    unknowns = n,
-                    iterations = iteration + 1,
-                    residual = norm,
-                    "Biharmonic fill converged"
-                );
+            let norms = dot(&residual, &residual).map(f64::sqrt);
+            for c in 0..4 {
+                if restart[c] && norms[c] <= tolerance[c] {
+                    active[c] = false;
+                    tracing::debug!(
+                        unknowns = n,
+                        channel = c,
+                        iterations = iteration + 1,
+                        residual = norms[c],
+                        "Biharmonic fill converged"
+                    );
+                }
+            }
+            if !active.iter().any(|&a| a) {
                 return Ok(x);
             }
-            restart = true;
         }
         for i in 0..n {
-            z[i] = residual[i] / diagonal[i];
+            // The matrix product is dead here; reuse its storage for the
+            // preconditioned residual instead of retaining another RGBA vector.
+            product_buffer[i] = residual[i].map(|r| r / diagonal[i]);
         }
-        let next_rz = dot(&residual, &z);
-        let beta = if restart { 0. } else { next_rz / rz };
+        let next_rz = dot(&residual, &product_buffer);
+        let beta: [f64; 4] = std::array::from_fn(|c| {
+            if restart[c] || !active[c] {
+                0.
+            } else {
+                next_rz[c] / rz[c]
+            }
+        });
         for i in 0..n {
-            direction[i] = z[i] + beta * direction[i];
+            for c in 0..4 {
+                direction[i][c] = product_buffer[i][c] + beta[c] * direction[i][c];
+            }
         }
         rz = next_rz;
     }
@@ -200,12 +279,10 @@ pub fn repair(
         }
         rows.push(row);
     }
-    let mut repaired = vec![[0.; 4]; pixels.len()];
-    for c in 0..4 {
-        let channel: Vec<_> = rhs.iter().map(|p| p[c]).collect();
-        let values = solve(&rows, &channel, &diagonal, cancel)?;
-        for (p, value) in repaired.iter_mut().zip(values) {
-            p[c] = value.clamp(lower[c], upper[c]);
+    let mut repaired = solve(&rows, &rhs, &diagonal, cancel)?;
+    for p in &mut repaired {
+        for c in 0..4 {
+            p[c] = p[c].clamp(lower[c], upper[c]);
         }
     }
     let mut output = source.clone();
@@ -233,6 +310,86 @@ fn premultiplied(p: [f64; 4]) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_and_portable_solvers_preserve_boundary_cases() {
+        for solver in [solve, solve_portable] {
+            let cancel = CancellationToken::default();
+            assert!(solver(&[], &[], &[], &cancel).unwrap().is_empty());
+            let mut row = Row::default();
+            row.add(0, 1);
+            let rows = [row];
+            let zero = solver(&rows, &[[-0., 0., -0., 0.]], &[1.], &cancel).unwrap();
+            assert_eq!(zero[0].map(f64::to_bits), [0; 4]);
+            cancel.cancel();
+            assert!(matches!(
+                solver(&rows, &[[1.; 4]], &[1.], &cancel),
+                Err(AppError::Cancelled)
+            ));
+            let mut invalid = Row::default();
+            invalid.add(0, -1);
+            assert!(matches!(
+                solver(&[invalid], &[[1.; 4]], &[1.], &CancellationToken::default()),
+                Err(AppError::Scaling(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn batched_channels_match_scalar_iterations_exactly() {
+        let cancel = CancellationToken::default();
+        for (w, h) in [(1, 31), (31, 1), (9, 7), (17, 19)] {
+            for pattern in 0..3 {
+                let pixels: Vec<_> = (1..w * h)
+                    .filter(|&i| match pattern {
+                        0 => i % 3 != 0,
+                        1 => i % w > w / 4 && i % w < 3 * w / 4,
+                        _ => i % 7 < 2,
+                    })
+                    .collect();
+                let mut indices = vec![usize::MAX; w * h];
+                for (row, &pixel) in pixels.iter().enumerate() {
+                    indices[pixel] = row;
+                }
+                let mut rows = Vec::new();
+                let mut diagonal = Vec::new();
+                for &pixel in &pixels {
+                    let mut row = Row::default();
+                    for (j, value) in stencil(pixel, w, h).entries() {
+                        if indices[j] != usize::MAX {
+                            row.add(indices[j], value as i8);
+                        }
+                        if j == pixel {
+                            diagonal.push(value);
+                        }
+                    }
+                    rows.push(row);
+                }
+                // Zero RHS, different signs/magnitudes, and channels converging
+                // at different iterations exercise independent stopping/restart.
+                let rhs: Vec<_> = pixels
+                    .iter()
+                    .map(|&i| [0., (i as f64).sin(), 1., 1e-7 * (i as f64).cos()])
+                    .collect();
+                let actual = solve(&rows, &rhs, &diagonal, &cancel).unwrap();
+                let portable = solve_portable(&rows, &rhs, &diagonal, &cancel).unwrap();
+                for (a, b) in actual.iter().zip(&portable) {
+                    assert_eq!(a.map(f64::to_bits), b.map(f64::to_bits));
+                }
+                for c in 0..4 {
+                    let channel: Vec<_> = rhs.iter().map(|p| p[c]).collect();
+                    let expected = reference::solve(&rows, &channel, &diagonal, &cancel).unwrap();
+                    for (p, value) in actual.iter().zip(expected) {
+                        assert_eq!(
+                            p[c].to_bits(),
+                            value.to_bits(),
+                            "{w}x{h} pattern {pattern}, channel {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn corners_edges_and_disconnected_holes_match_scipy_reference() {

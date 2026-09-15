@@ -1,12 +1,14 @@
 //! Game Asset reduction: direction-merged contours, source-width opacity,
 //! tight antialiasing, and biharmonic texture repair with area projection.
 use crate::{
-    document::CancellationToken,
+    document::{CancellationToken, GameAssetAa},
     error::{AppError, Result},
 };
 use image::RgbaImage;
 use std::sync::{Arc, Mutex};
 mod antialias;
+#[cfg(test)]
+mod benchmarks;
 mod biharmonic;
 mod cleanup;
 mod color;
@@ -21,6 +23,7 @@ mod project;
 mod raster;
 mod smoothing;
 mod source;
+mod strokes;
 #[cfg(test)]
 mod tests;
 const MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
@@ -30,6 +33,10 @@ struct Prepared {
     contours: contours::Contours,
     mask: raster::Mask,
     linear: color::LinearImage,
+}
+struct TargetContours {
+    strokes: strokes::Strokes,
+    colors: Vec<[f64; 3]>,
 }
 impl Prepared {
     fn new(image: &RgbaImage, cancel: &CancellationToken) -> Result<Self> {
@@ -57,13 +64,14 @@ impl Prepared {
             linear: color::LinearImage::from_rgba(image),
         })
     }
-    fn resize(
+    fn target_contours(
         &self,
         image: &RgbaImage,
         w: u32,
         h: u32,
+        aa: GameAssetAa,
         cancel: &CancellationToken,
-    ) -> Result<RgbaImage> {
+    ) -> Result<TargetContours> {
         let scale = [
             w as f64 / image.width() as f64,
             h as f64 / image.height() as f64,
@@ -80,28 +88,38 @@ impl Prepared {
             })
             .collect();
         cancel.check()?;
-        let (raw, distances) = coverage::render_digital(&curves, w as usize, h as usize, cancel)?;
-        let core = cleanup::thin(&raw, &distances, cancel)?;
-        let aa = antialias::coverage_map(&core, &distances);
-        let ink = paint::ink_colors(
+        let strokes = strokes::render(&curves, &owners, &self.widths, w, h, aa, cancel)?;
+        let colors = paint::ink_colors(
             &self.linear,
             &retained,
             &smoothed,
             &owners,
-            &aa,
+            &strokes,
             scale,
             cancel,
         )?;
-        let core_image = image::GrayImage::from_fn(w, h, |x, y| {
-            image::Luma([u8::from(core.data[y as usize * w as usize + x as usize]) * 255])
-        });
-        let strength = opacity::calculate(&self.widths, &core_image, &ink.owners);
-        let paint = opacity::apply(&aa, &ink.owners, &strength);
+        Ok(TargetContours { strokes, colors })
+    }
+    fn resize(
+        &self,
+        image: &RgbaImage,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &CancellationToken,
+    ) -> Result<RgbaImage> {
+        let TargetContours { strokes, colors } = self.target_contours(image, w, h, aa, cancel)?;
+        let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
+        let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+        let scale = [
+            w as f64 / image.width() as f64,
+            h as f64 / image.height() as f64,
+        ];
         let retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
         cancel.check()?;
         let repaired = biharmonic::repair(&self.linear, &retained_mask, cancel)?;
         let base = project::area(&repaired, w as usize, h as usize, cancel)?;
-        let result = paint::composite(&base, &ink.colors, &paint);
+        let result = paint::composite(&base, &colors, &paint);
         cancel.check()?;
         Ok(result)
     }
@@ -109,7 +127,7 @@ impl Prepared {
 #[derive(Default)]
 struct Cache {
     prepared: Option<Arc<Prepared>>,
-    target: Option<((u32, u32), Arc<RgbaImage>)>,
+    target: Option<((u32, u32, GameAssetAa), Arc<RgbaImage>)>,
 }
 /// One source analysis and one target result per preview session. Heavy work
 /// stays outside the lock so an obsolete preview can be cancelled promptly.
@@ -124,7 +142,13 @@ impl Session {
             cache: Mutex::new(Cache::default()),
         }
     }
-    pub fn resize(&self, w: u32, h: u32, cancel: &CancellationToken) -> Result<RgbaImage> {
+    pub fn resize(
+        &self,
+        w: u32,
+        h: u32,
+        aa: GameAssetAa,
+        cancel: &CancellationToken,
+    ) -> Result<RgbaImage> {
         cancel.check()?;
         let (sw, sh) = self.source.dimensions();
         if w == 0 || h == 0 || sw == 0 || sh == 0 || w > sw || h > sh {
@@ -141,8 +165,8 @@ impl Session {
         }
         let prepared = {
             let cache = self.cache.lock().expect("Game Asset cache poisoned");
-            if let Some((dimensions, result)) = &cache.target
-                && *dimensions == (w, h)
+            if let Some((key, result)) = &cache.target
+                && *key == (w, h, aa)
             {
                 return Ok((**result).clone());
             }
@@ -160,10 +184,10 @@ impl Session {
                 p
             }
         };
-        let result = prepared.resize(&self.source, w, h, cancel)?;
+        let result = prepared.resize(&self.source, w, h, aa, cancel)?;
         cancel.check()?;
         self.cache.lock().expect("Game Asset cache poisoned").target =
-            Some(((w, h), Arc::new(result.clone())));
+            Some(((w, h, aa), Arc::new(result.clone())));
         Ok(result)
     }
 }

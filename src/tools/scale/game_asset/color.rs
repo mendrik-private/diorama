@@ -1,5 +1,10 @@
 //! Straight linear-light RGBA at the analysis and composition boundaries.
 use image::{Rgba, RgbaImage};
+use std::sync::LazyLock;
+
+// Exact values of the existing conversion at every possible RGBA8 input.
+static SRGB8_TO_LINEAR: LazyLock<[f64; 256]> =
+    LazyLock::new(|| std::array::from_fn(|v| decode(v as f64 / 255.)));
 
 #[derive(Clone)]
 pub struct LinearImage {
@@ -37,6 +42,7 @@ pub fn rgba(p: [f64; 4]) -> Rgba<u8> {
 }
 impl LinearImage {
     pub fn from_rgba(source: &RgbaImage) -> Self {
+        let decoded = &*SRGB8_TO_LINEAR;
         Self {
             w: source.width() as usize,
             h: source.height() as usize,
@@ -44,13 +50,32 @@ impl LinearImage {
                 .pixels()
                 .map(|p| {
                     [
-                        decode(p[0] as f64 / 255.),
-                        decode(p[1] as f64 / 255.),
-                        decode(p[2] as f64 / 255.),
+                        decoded[p[0] as usize],
+                        decoded[p[1] as usize],
+                        decoded[p[2] as usize],
                         p[3] as f64 / 255.,
                     ]
                 })
                 .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_lookup_matches_transfer_function_exactly() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| {
+            Rgba([x as u8, (255 - x) as u8, ((x * 17) % 256) as u8, x as u8])
+        });
+        let linear = LinearImage::from_rgba(&image);
+        for (p, actual) in image.pixels().zip(linear.pixels) {
+            for c in 0..3 {
+                assert_eq!(actual[c].to_bits(), decode(p[c] as f64 / 255.).to_bits());
+            }
+            assert_eq!(actual[3], p[3] as f64 / 255.);
         }
     }
 }

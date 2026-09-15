@@ -10,5 +10,5 @@ pub use annotation::{
 use history::History;
 pub use model::{CancellationToken, Document, ImageSource, Metadata, RenderedImage};
 pub use operation::{
-    BrushPoint, Operation, ProtectedColor, Resampling, Rotation, Stroke, StrokePath,
+    BrushPoint, GameAssetAa, Operation, ProtectedColor, Resampling, Rotation, Stroke, StrokePath,
 };

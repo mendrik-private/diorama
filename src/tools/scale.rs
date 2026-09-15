@@ -18,10 +18,11 @@ pub fn resize(
     if target_width == 0 || target_height == 0 {
         return Err(AppError::InvalidDimensions);
     }
-    if resampling == Resampling::GameAsset {
+    if let Resampling::GameAsset(aa) = resampling {
         return game_asset::Session::new(std::sync::Arc::new(image.clone())).resize(
             target_width,
             target_height,
+            aa,
             cancellation,
         );
     }
@@ -49,7 +50,7 @@ pub fn resize(
         Resampling::Lanczos => {
             fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3)
         }
-        Resampling::GameAsset => unreachable!(),
+        Resampling::GameAsset(_) => unreachable!(),
     };
     let options = fast_image_resize::ResizeOptions::new().resize_alg(algorithm);
     fast_image_resize::Resizer::new()
@@ -108,7 +109,7 @@ mod tests {
         for method in [
             Resampling::Nearest,
             Resampling::Bicubic,
-            Resampling::GameAsset,
+            Resampling::GameAsset(Default::default()),
             Resampling::Lanczos,
         ] {
             for (width, height) in [(8, 6), (8, 3), (4, 6), (4, 3)] {

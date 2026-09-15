@@ -8,13 +8,35 @@ pub enum Rotation {
 pub enum Resampling {
     Nearest,
     Bicubic,
-    GameAsset,
+    GameAsset(GameAssetAa),
     Lanczos,
 }
 
 impl Resampling {
     pub fn downscale_only(self) -> bool {
-        matches!(self, Self::GameAsset)
+        matches!(self, Self::GameAsset(_))
+    }
+}
+
+/// Game Asset AA intensity in whole percent. Zero disables AA; 100 permits
+/// up to 10% core attenuation and the full geometric fringe. Intrinsic contour
+/// strength remains separate. Values above 100 are clamped at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameAssetAa(u8);
+
+impl GameAssetAa {
+    pub fn new(percent: u8) -> Self {
+        Self(percent.min(100))
+    }
+
+    pub fn percent(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for GameAssetAa {
+    fn default() -> Self {
+        Self(50)
     }
 }
 

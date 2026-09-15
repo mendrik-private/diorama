@@ -11,8 +11,8 @@ use crate::compare::{SplitOrientation, choose_split};
 use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
-    HIGHLIGHT_STROKE_WIDTH, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect,
-    Resampling, Rotation, Shape, StrokePath, StrokeStyle,
+    GameAssetAa, HIGHLIGHT_STROKE_WIDTH, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry,
+    Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -598,6 +598,8 @@ struct WindowState {
     scale_lock: gtk::ToggleButton,
     scale_unit: gtk::DropDown,
     scale_method: gtk::DropDown,
+    scale_aa_controls: gtk::Box,
+    scale_aa: gtk::SpinButton,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
@@ -825,7 +827,29 @@ impl ViewerWindow {
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
         scale_slider_row.append(&scale_slider);
-        scale_content.append(&scale_control_row);
+        let scale_aa_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        scale_aa_controls.set_valign(gtk::Align::Start);
+        scale_aa_controls.set_visible(matches!(scale_resampling, Resampling::GameAsset(_)));
+        let scale_aa_label = gtk::Label::with_mnemonic(&gettext("_AA"));
+        let scale_aa = spin(0.0, 100.0, f64::from(settings.game_asset_aa().percent()));
+        scale_aa.set_width_chars(3);
+        scale_aa_label.set_mnemonic_widget(Some(&scale_aa));
+        let aa_description = gettext(
+            "Antialiasing: 0% keeps cores opaque with no outer smoothing; 100% allows up to 10% core opacity loss and full outer smoothing",
+        );
+        scale_aa.set_tooltip_text(Some(&aa_description));
+        scale_aa.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Antialiasing (%)")),
+            gtk::accessible::Property::Description(&aa_description),
+        ]);
+        scale_aa_controls.append(&scale_aa_label);
+        scale_aa_controls.append(&scale_aa);
+        scale_aa_controls.append(&gtk::Label::new(Some("%")));
+        let scale_top_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        scale_control_row.set_valign(gtk::Align::Start);
+        scale_top_row.append(&scale_control_row);
+        scale_top_row.append(&scale_aa_controls);
+        scale_content.append(&scale_top_row);
         scale_content.append(&scale_slider_row);
         scale_surface.append(&scale_content);
         scale_controls.append(&scale_surface);
@@ -1050,6 +1074,8 @@ impl ViewerWindow {
             scale_lock,
             scale_unit,
             scale_method,
+            scale_aa_controls,
+            scale_aa,
             scale_original_button,
             scale_source: RefCell::new(None),
             scale_gpu: RefCell::new(None),
@@ -1360,6 +1386,10 @@ impl ViewerWindow {
         self.add_action("copy-image", {
             let this = self.clone();
             move || this.copy_current_selection_or_image_to_clipboard()
+        });
+        self.add_action("copy-filepath", {
+            let this = self.clone();
+            move || this.copy_current_filepath_to_clipboard()
         });
         self.add_action("zoom-in", {
             let this = self.clone();
@@ -2313,6 +2343,16 @@ impl ViewerWindow {
             self.set_action_enabled(action, has_image);
         }
         self.set_action_enabled("open-with", has_file && has_image);
+        self.set_action_enabled(
+            "copy-filepath",
+            has_image
+                && self
+                    .0
+                    .current_file
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|file| file.path().is_some()),
+        );
         self.set_action_enabled("delete-file", has_file && has_image);
         self.set_action_enabled("previous", has_image && has_neighbors);
         self.set_action_enabled("next", has_image && has_neighbors);
@@ -2609,7 +2649,11 @@ impl ViewerWindow {
             let this = self.clone();
             move |button| this.tool_button_toggled(button, Tool::Scale)
         });
-        for field in [&self.0.scale_width, &self.0.scale_height] {
+        for field in [
+            self.0.scale_width.clone().upcast::<gtk::Widget>(),
+            self.0.scale_height.clone().upcast(),
+            self.0.scale_aa.clone().upcast(),
+        ] {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
             keys.connect_key_pressed({
@@ -2649,7 +2693,12 @@ impl ViewerWindow {
         self.0.scale_method.connect_selected_notify({
             let this = self.clone();
             move |dropdown| {
-                let resampling = resampling_at(dropdown.selected());
+                let resampling = match resampling_at(dropdown.selected()) {
+                    Resampling::GameAsset(_) => Resampling::GameAsset(GameAssetAa::new(
+                        this.0.scale_aa.value().round() as u8,
+                    )),
+                    method => method,
+                };
                 this.0.scale_resampling.set(resampling);
                 this.0.settings.set_scale_resampling(resampling);
                 this.refresh_scale_method();
@@ -2658,6 +2707,20 @@ impl ViewerWindow {
         self.0.scale_slider.connect_value_changed({
             let this = self.clone();
             move |slider| this.scale_slider_changed(slider.value())
+        });
+        self.0.scale_aa.connect_value_changed({
+            let this = self.clone();
+            move |spin| {
+                if this.0.scale_updating_controls.get() {
+                    return;
+                }
+                let aa = GameAssetAa::new(spin.value().round() as u8);
+                this.0.settings.set_game_asset_aa(aa);
+                if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
+                    this.0.scale_resampling.set(Resampling::GameAsset(aa));
+                    this.refresh_scale_controls();
+                }
+            }
         });
         let original = gtk::GestureClick::new();
         original.set_button(1);
@@ -2898,6 +2961,10 @@ impl ViewerWindow {
     }
 
     fn refresh_scale_method(&self) {
+        self.0.scale_aa_controls.set_visible(matches!(
+            self.0.scale_resampling.get(),
+            Resampling::GameAsset(_)
+        ));
         self.0
             .scale_method
             .set_selected(resampling_index(self.0.scale_resampling.get()));
@@ -2929,9 +2996,9 @@ impl ViewerWindow {
         self.0.scale_original_button.set_sensitive(false);
         let resampling = self.0.scale_resampling.get();
         let gpu = self.0.scale_gpu.borrow().clone();
-        let game_asset = if resampling == Resampling::GameAsset {
+        let game_asset = if let Resampling::GameAsset(aa) = resampling {
             let mut session = self.0.scale_game_asset.borrow_mut();
-            Some(
+            Some((
                 session
                     .get_or_insert_with(|| {
                         Arc::new(crate::tools::scale::game_asset::Session::new(
@@ -2939,7 +3006,8 @@ impl ViewerWindow {
                         ))
                     })
                     .clone(),
-            )
+                aa,
+            ))
         } else {
             None
         };
@@ -2960,8 +3028,8 @@ impl ViewerWindow {
             let weak = Rc::downgrade(&state);
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
-                    if let Some(session) = game_asset {
-                        return session.resize(target_width, target_height, &cancellation);
+                    if let Some((session, aa)) = game_asset {
+                        return session.resize(target_width, target_height, aa, &cancellation);
                     }
                     if let Some(gpu) = gpu
                         && let Some(preview) =
@@ -3006,13 +3074,13 @@ impl ViewerWindow {
         if self.0.scale_showing_original.get() {
             return;
         }
-        self.0
-            .canvas
-            .set_filter(if self.0.scale_resampling.get() == Resampling::GameAsset {
+        self.0.canvas.set_filter(
+            if matches!(self.0.scale_resampling.get(), Resampling::GameAsset(_)) {
                 ZoomFilter::Hard
             } else {
                 self.0.settings.zoom_filter()
-            });
+            },
+        );
         match texture_from_rgba(&preview) {
             Ok(texture) => {
                 self.0.canvas.set_texture(Some(&texture));
@@ -3072,13 +3140,13 @@ impl ViewerWindow {
             self.0.scale_width.value().round() as u32,
             self.0.scale_height.value().round() as u32,
         );
-        self.0
-            .canvas
-            .set_filter(if self.0.scale_resampling.get() == Resampling::GameAsset {
+        self.0.canvas.set_filter(
+            if matches!(self.0.scale_resampling.get(), Resampling::GameAsset(_)) {
                 ZoomFilter::Hard
             } else {
                 self.0.settings.zoom_filter()
-            });
+            },
+        );
         let preview = self
             .0
             .scale_preview
@@ -3211,6 +3279,22 @@ impl ViewerWindow {
         if let Some(tool) = return_tool {
             self.set_tool(tool);
         }
+    }
+
+    fn copy_current_filepath_to_clipboard(&self) {
+        let Some(path) = self
+            .0
+            .current_file
+            .borrow()
+            .as_ref()
+            .and_then(|file| file.path())
+        else {
+            return;
+        };
+        self.0.window.clipboard().set_text(&path.to_string_lossy());
+        self.0
+            .toasts
+            .add_toast(adw::Toast::new(&gettext("Copied filepath")));
     }
 
     fn copy_current_image_to_clipboard(&self) {
@@ -6822,6 +6906,7 @@ fn main_menu() -> gio::Menu {
     menu_item(&menu, "Open…", "win.open");
     menu_item(&menu, "Open With…", "win.open-with");
     menu_item(&menu, "Copy Image or Selection", "win.copy-image");
+    menu_item(&menu, "Copy Filepath", "win.copy-filepath");
     menu_item(&menu, "Save", "win.save");
     menu_item(&menu, "Save As…", "win.save-as");
     menu_item(&menu, "Print…", "win.print");
@@ -7706,7 +7791,7 @@ mod tests {
         for resampling in [
             Resampling::Nearest,
             Resampling::Bicubic,
-            Resampling::GameAsset,
+            Resampling::GameAsset(Default::default()),
             Resampling::Lanczos,
         ] {
             assert_eq!(resampling_at(resampling_index(resampling)), resampling);
@@ -9341,6 +9426,8 @@ mod tests {
             .parent()
             .expect("scale content")
             .first_child()
+            .expect("scale top row")
+            .first_child()
             .expect("scale control row")
             .downcast::<adw::WrapBox>()
             .expect("responsive scale control row");
@@ -9655,11 +9742,17 @@ mod tests {
         }
 
         window.0.scale_method.set_selected(2);
-        assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset);
+        assert_eq!(
+            window.0.scale_resampling.get(),
+            Resampling::GameAsset(Default::default())
+        );
         if gio::SettingsSchemaSource::default()
             .is_some_and(|source| source.lookup(crate::APP_ID, true).is_some())
         {
-            assert_eq!(window.0.settings.scale_resampling(), Resampling::GameAsset);
+            assert_eq!(
+                window.0.settings.scale_resampling(),
+                Resampling::GameAsset(Default::default())
+            );
         }
         assert_eq!(window.0.scale_width.adjustment().upper(), 8.0);
         assert_eq!(window.0.scale_height.adjustment().upper(), 6.0);
@@ -9680,7 +9773,7 @@ mod tests {
             &source,
             2,
             2,
-            Resampling::GameAsset,
+            Resampling::GameAsset(Default::default()),
             &CancellationToken::default(),
         )
         .unwrap();

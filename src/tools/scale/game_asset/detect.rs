@@ -19,12 +19,7 @@ pub fn detect(image: &RgbaImage, cancel: &CancellationToken) -> Result<Vec<Sampl
     }
     let mut records = Vec::new();
     for sigma in [0.65f64, 1., 1.5, 2.2] {
-        let l = lum.gaussian(sigma, 0, 0, cancel)?;
-        let gx = lum.gaussian(sigma, 0, 1, cancel)?;
-        let gy = lum.gaussian(sigma, 1, 0, cancel)?;
-        let hxx = lum.gaussian(sigma, 0, 2, cancel)?;
-        let hyy = lum.gaussian(sigma, 2, 0, cancel)?;
-        let hxy = lum.gaussian(sigma, 1, 1, cancel)?;
+        let [l, gx, gy, hxx, hyy, hxy] = lum.gaussian_derivatives(sigma, cancel)?;
         for (dx, dy) in [(1f64, 0f64), (0., 1.), (1., 1.), (1., -1.)] {
             for y in 5..h.saturating_sub(5) {
                 cancel.check()?;

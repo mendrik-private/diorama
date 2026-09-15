@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.13" date="2026-09-15">
+      <description>
+        <p>Speeds up Game Asset scaling and preserves continuous contours with biharmonic texture filling. Adds adjustable antialiasing with a 50% default and a compact numeric control, plus Copy Filepath in the main menu. Also fixes zoom levels.</p>
+      </description>
+    </release>
     <release version="0.3.12" date="2026-09-14">
       <description>
         <p>Adds contour-aware Game Asset reduction with tight antialiasing, median fill correction, and automatic contour weighting. Also refines annotation rendering and removes obsolete scaling modes.</p>

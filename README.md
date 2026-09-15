@@ -267,6 +267,11 @@ meson compile -C build
 ./build/diorama
 ```
 
+Development builds enable compiler optimization for the image-processing code
+while retaining debug symbols, assertions, and overflow checks. Fully unoptimized
+stepping can be enabled with `CARGO_PROFILE_DEV_OPT_LEVEL=0 cargo run`; Game Asset
+scaling will be substantially slower in that mode.
+
 Run the standard checks with:
 
 ```sh

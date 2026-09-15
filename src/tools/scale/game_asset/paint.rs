@@ -27,20 +27,16 @@ fn source_color(source: &LinearImage, point: [f64; 2]) -> Option<[f64; 3]> {
     (total > 1e-8).then(|| sum.map(|v| v / total))
 }
 
-pub struct Ink {
-    pub colors: Vec<[f64; 3]>,
-    pub owners: Vec<Option<usize>>,
-}
-
 pub fn ink_colors(
     source: &LinearImage,
     original: &[Model],
     smoothed: &[Model],
     model_owners: &[usize],
-    coverage: &GrayImage,
+    strokes: &super::strokes::Strokes,
     scale: [f64; 2],
     cancel: &CancellationToken,
-) -> Result<Ink> {
+) -> Result<Vec<[f64; 3]>> {
+    let coverage = &strokes.coverage;
     let mut points = Vec::new();
     let mut colors = Vec::new();
     let mut owners = Vec::new();
@@ -58,7 +54,6 @@ pub fn ink_colors(
     }
     let spatial = Spatial::new(points, 2.);
     let mut ink = vec![[0.; 3]; coverage.as_raw().len()];
-    let mut pixel_owners = vec![None; coverage.as_raw().len()];
     for (i, p) in coverage.pixels().enumerate() {
         if i % 4096 == 0 {
             cancel.check()?;
@@ -71,9 +66,11 @@ pub fn ink_colors(
             (i / coverage.width() as usize) as f64,
         ];
         let nearest = spatial
-            .radius(q, 1.5)
+            .radius(q, 2.)
             .into_iter()
-            .filter(|&j| colors[j].is_some())
+            // The rasterizer owns topology and overlap decisions. A closer
+            // sample from another colored contour must never repaint its core.
+            .filter(|&j| Some(owners[j]) == strokes.owners[i] && colors[j].is_some())
             .min_by(|&a, &b| {
                 distance2(q, spatial.points[a])
                     .total_cmp(&distance2(q, spatial.points[b]))
@@ -85,12 +82,8 @@ pub fn ink_colors(
             )));
         };
         ink[i] = colors[j].unwrap();
-        pixel_owners[i] = Some(owners[j]);
     }
-    Ok(Ink {
-        colors: ink,
-        owners: pixel_owners,
-    })
+    Ok(ink)
 }
 
 pub fn composite(base: &LinearImage, ink: &[[f64; 3]], coverage: &GrayImage) -> RgbaImage {
@@ -109,4 +102,74 @@ pub fn composite(base: &LinearImage, ink: &[[f64; 3]], coverage: &GrayImage) -> 
             alpha,
         ])
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::scale::game_asset::{opacity, strokes::Strokes};
+
+    #[test]
+    fn closer_green_donor_cannot_repaint_owned_black_core() {
+        let source = LinearImage::from_rgba(&RgbaImage::from_fn(20, 20, |_, y| {
+            image::Rgba(if y == 8 {
+                [0, 0, 0, 255]
+            } else {
+                [60, 150, 30, 255]
+            })
+        }));
+        let black = [0., 8., 0., 1., 0., 0., 0., -18., -1., 1.];
+        let green = [0., 9., 0., 1., 0., 0., 0., -18., -1., 1.];
+        let mut shifted_black = black;
+        shifted_black[1] = 8.4;
+        let mut strokes = Strokes {
+            core: GrayImage::new(20, 20),
+            coverage: GrayImage::new(20, 20),
+            owners: vec![None; 400],
+        };
+        for x in 1..19 {
+            strokes.core.put_pixel(x, 9, image::Luma([255]));
+            strokes.coverage.put_pixel(x, 9, image::Luma([243]));
+            strokes.owners[9 * 20 + x as usize] = Some(0);
+        }
+        let colors = ink_colors(
+            &source,
+            &[black, green],
+            &[shifted_black, green],
+            &[0, 1],
+            &strokes,
+            [1., 1.],
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        for x in 1..19 {
+            assert_eq!(colors[9 * 20 + x], [0.; 3]);
+        }
+        let coverage = opacity::apply(&strokes.coverage, &strokes.owners, &[1., 0.6]);
+        assert_eq!(coverage.get_pixel(8, 9)[0], 243);
+        let composite = composite(&source, &colors, &coverage);
+        assert_eq!(
+            *composite.get_pixel(8, 9),
+            rgba([
+                source.pixels[9 * 20 + 8][0] * 12. / 255.,
+                source.pixels[9 * 20 + 8][1] * 12. / 255.,
+                source.pixels[9 * 20 + 8][2] * 12. / 255.,
+                1.
+            ])
+        );
+        // Invisible donors may not fall back to a different contour's color.
+        let invisible = LinearImage::from_rgba(&RgbaImage::new(20, 20));
+        assert!(
+            ink_colors(
+                &invisible,
+                &[black],
+                &[shifted_black],
+                &[0],
+                &strokes,
+                [1., 1.],
+                &CancellationToken::default()
+            )
+            .is_err()
+        );
+    }
 }

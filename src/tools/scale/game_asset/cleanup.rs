@@ -2,6 +2,7 @@ use crate::tools::scale::game_asset::raster::Mask;
 use crate::{document::CancellationToken, error::Result};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::LazyLock;
 
 // (dy,dx), exactly matching the supplied clockwise ring order.
 pub const N8: [(isize, isize); 8] = [
@@ -129,7 +130,8 @@ impl Ord for Candidate {
 
 pub fn thin(raw: &Mask, distance: &[f64], cancel: &CancellationToken) -> Result<Mask> {
     let mut mask = raw.clone();
-    let tables = Tables::new();
+    static TABLES: LazyLock<Tables> = LazyLock::new(Tables::new);
+    let tables = &*TABLES;
     let mut heap = BinaryHeap::new();
     let push = |heap: &mut BinaryHeap<Candidate>, mask: &Mask, y: usize, x: usize| {
         if mask.data[y * mask.w + x] && tables.removable(ring(mask, y, x)) {

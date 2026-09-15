@@ -2,7 +2,7 @@ use gio::prelude::*;
 
 use crate::APP_ID;
 use crate::canvas::{Background, ZoomFilter};
-use crate::document::Resampling;
+use crate::document::{GameAssetAa, Resampling};
 use crate::navigation::SortOrder;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -128,21 +128,32 @@ impl Settings {
         match self.string("scale-resampling").as_deref() {
             Some("nearest") => Resampling::Nearest,
             Some("lanczos") => Resampling::Lanczos,
-            Some("game-asset") => Resampling::GameAsset,
+            Some("game-asset") => Resampling::GameAsset(self.game_asset_aa()),
             _ => Resampling::Bicubic,
         }
     }
 
     pub fn set_scale_resampling(&self, resampling: Resampling) {
+        if let Resampling::GameAsset(aa) = resampling {
+            self.set_game_asset_aa(aa);
+        }
         self.set_string(
             "scale-resampling",
             match resampling {
                 Resampling::Nearest => "nearest",
                 Resampling::Bicubic => "bicubic",
-                Resampling::GameAsset => "game-asset",
+                Resampling::GameAsset(_) => "game-asset",
                 Resampling::Lanczos => "lanczos",
             },
         );
+    }
+
+    pub fn game_asset_aa(&self) -> GameAssetAa {
+        GameAssetAa::new(self.integer("game-asset-aa").unwrap_or(50).clamp(0, 100) as u8)
+    }
+
+    pub fn set_game_asset_aa(&self, aa: GameAssetAa) {
+        self.set_integer("game-asset-aa", i32::from(aa.percent()));
     }
 
     pub fn color_picker_format(&self) -> ColorFormat {
@@ -365,6 +376,11 @@ mod tests {
         assert_eq!(settings.last_zoom_mode(), ZoomMode::Fit);
         assert_eq!(settings.pencil_size(), 1);
         assert!(!settings.pencil_antialiasing());
+        assert_eq!(
+            settings.game_asset_aa(),
+            crate::document::GameAssetAa::default()
+        );
+        settings.set_game_asset_aa(crate::document::GameAssetAa::new(100));
         settings.set_pencil_size(128);
         settings.set_pencil_antialiasing(true);
     }

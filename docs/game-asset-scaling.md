@@ -17,20 +17,30 @@ Source ink is the detected shoulder-supported footprint plus the thinned centerl
 Each visible detector sample near a trace measures the contiguous ink span along its
 normal in quarter-pixel steps, capped at 32 source pixels on each side. The mean of
 all supported measurements gives that contour's source thickness. Analysis and widths
-are cached once per immutable source; one target result is cached per session.
+are cached once per immutable source; one target result is cached per session,
+keyed by dimensions and AA intensity. Changing AA reuses source analysis, but
+rebuilds target contours and fill; the existing preview debounce and cancellation
+discard superseded work.
 
 ## Target contours
 
 A contour must project to more than three distinct target Bresenham pixels. Target
 coordinates use pixel-center alignment independently on each axis. Local robust
 quadratic smoothing uses a 6.4-target-pixel sigma tapered toward zero at source scale;
-for unequal scale factors it uses the smaller factor. Directional digital coverage,
-topology-preserving thinning and tight AA provide one coverage value per target pixel.
-No silhouette expansion or integer rounding of target curve controls is applied.
+for unequal scale factors it uses the smaller factor. Each retained source contour
+is rasterized with canonical-direction Zingl/Bresenham quadratics and thinned in
+its own target bounding box. Cleanup cannot replace a black contour connection
+with a route through a different, green contour. Only digital core construction
+rounds coordinates; geometric AA samples retain the subpixel curve coordinates.
 
-Every painted pixel uses one nearest smoothed-model sample for both contour ownership
-and original-source ink color. Shared model assignments choose the longest retained
-trace, with stable ID ties; overlapping patches never stack opacity.
+Rasterization assigns contour ownership before color lookup. Core pixels always
+win over another contour's fringe. At a genuine core overlap, the greater intrinsic
+strength (using the contour-local core length), then greater local core length,
+then lower source ID wins. This is explicit occlusion, not a claim that two colors
+can occupy the same pixel. Fringe overlaps choose the greater weighted coverage.
+Colors come from the nearest visible original-source donor of the selected contour,
+never from an unconstrained nearest neighbor. Shared model assignments still choose
+the longest retained source trace. Overlapping patches never stack opacity.
 
 Let `L` be the contour's final owned core-pixel count and `T` its mean source width:
 
@@ -40,8 +50,47 @@ opacity = 0.6 + 0.4 * sqrt(clamp((L - 4) / 28, 0, 1) * clamp((T - 1) / 5, 0, 1))
 
 The result ranges from 60% to 100%, reaching full opacity at 32 final pixels and six
 source pixels of average thickness. Without width measurements the contour uses 60%.
-Intrinsic opacity multiplies tight-AA coverage; the AA transition has a 65% minimum
-core and a 35% maximum fringe before this multiplication.
+Intrinsic opacity multiplies AA coverage once, after final ownership and core-length
+measurement. It is separate from the per-pixel AA allowance below.
+
+### Core-preserving manual antialiasing
+
+Inspired by section 7 of Inglis, Vogel and Kaplan's
+[Superpixelator paper](https://doi.org/10.1145/2486042.2486044), a 0.75-target-pixel
+stroke is sampled on an 8-by-8 subpixel grid. Per-pixel sample bit masks are unioned
+across all patches of the same contour, so duplicates do not darken a stroke.
+Local contiguous row/column coverage sums estimate apparent thickness; the smaller
+sum normalizes each sample. A disconnected piece or the opposite side of a loop
+does not contribute merely because it occupies the same row or column.
+
+The **AA** numeric spinner appears at the right of the first control row, only
+for Game Asset. It defaults to **50%** and has no AA slider. One intensity
+controls both core attenuation and the geometric outer fringe:
+
+| AA setting | Minimum core coverage | Outer smoothing intensity |
+|---|---|---|
+| 0% | 100% | Off |
+| 50% (default) | 95% | 50% |
+| 100% | 90% | 100% |
+
+For integer percentage `p`, the core floor is `255 - floor(255*p/1000)`.
+AA coverage, not RGB colors, is quantized. Selection retains the original core
+217/236/255 and fringe 0/43/85 thresholds. For selected core byte `c`, output is
+`255 - floor((255-c)*p*255/38000)`; fringe byte `f` becomes `round(f*p/100)`.
+Thus 100% outer smoothing means the full sampled fringe, not solid opaque pixels
+outside the core. Fully opaque cores stay opaque at every setting. At default
+50%, core levels **243, 249, 255** and fringe levels **0, 22, 43** remain byte-exact
+with the preceding fixed recipe. The floor applies after quantization to every core pixel,
+not the contour's average. Clean horizontal, vertical and 45-degree digital runs,
+including their endpoints, stay at 255; only pixels near bends receive fringe AA.
+Fringe is confined to the eight-neighbor core band and never repaints another core.
+
+This is an adaptation, not a literal implementation of the paper's global opacity
+normalization, shape realignment or partial sorting. The protected core and bounded
+fringe can add apparent thickness; we do not dim the core below its agreed floor to
+compensate. A full-strength contour has at most 10% AA opacity loss at maximum AA; deliberately
+weaker contours retain their separate intrinsic weighting. The bound is on ink
+coverage, not encoded RGB brightness or the alpha of an opaque composited image.
 
 ## Biharmonic fill and composition
 
@@ -57,7 +106,9 @@ transparent pixels contribute transparent RGBA, never their hidden RGB. The
 original values of masked pixels are unavailable to the solver.
 
 A sparse system with at most thirteen coefficients per row is solved by
-Jacobi-preconditioned conjugate gradients. The Euclidean residual must be at most
+Jacobi-preconditioned conjugate gradients. RGBA channels share matrix reads while
+retaining independent step sizes, restarts and convergence checks. The Euclidean
+residual must be at most
 `max(1e-12, 1e-12 * ||rhs||)` for each channel, checked with an explicit matrix
 product before accepting convergence. Work is limited to 4,096 iterations per
 channel. Missing boundary data or a failed solve produces an application error;
@@ -72,8 +123,12 @@ constraint. Python and scikit-image are not application dependencies.
 Two separable passes perform exact fractional rectangular area integration before
 linear-light source-over composition with the unchanged opacity contours. Alpha
 is repaired and projected together with color. Fully transparent output pixels
-encode as transparent black. Game Asset has one fixed recipe and no settings
-panel, persisted tuning keys, palette quantization or contour-halo alternative.
+encode as transparent black. Game Asset has one recipe with adjustable AA, no RGB
+palette quantization and no alternate fill path. The bounded `GameAssetAa` value
+belongs to `Resampling::GameAsset`, so preview, Apply, export and undo/redo carry
+the same setting. The last selected percentage is stored in `game-asset-aa`
+when the installed GSettings schema supports it; older/missing schemas default
+to 50%. Switching to another method hides AA without forgetting the window's value.
 
 ## Bounds and validation
 
@@ -82,16 +137,27 @@ fitting, tracing, merging, thinning, sparse-system construction, solver iteratio
 work is never committed as a target result. Heavy work stays outside the session lock.
 A conservative one-GiB working-set envelope and a 500,000 detector-candidate limit reject
 unbounded inputs with application errors instead of silently selecting another method.
-The renderer processes one quadratic's flattened segments at a time.
+The renderer processes one contour bounding box and one quadratic's flattened
+segments at a time. The immutable topology lookup tables are shared across calls.
 
 The reviewed 800×800 source and 128/160/200 target images in `game_asset/fixtures/`
-are production regression fixtures. The expected targets are the selected
-biharmonic outputs of the independent Python comparison, preserved before this
-Rust implementation was written. Tests require exact RGBA parity at all three
-sizes. Separate numerical tests cover source/image boundary behavior against
+are regression fixtures. Original `elf-{size}.png` targets remain the independent
+Python comparison's selected biharmonic outputs; tests require exact RGBA parity
+outside the changed contour neighborhood. `elf-aa-{size}.png` are explicitly
+reviewed snapshots of the new renderer, not independent mathematical oracles.
+Their provenance and the drake check are recorded in [Manual AA validation](game-asset-aa.md).
+Independent tests cover analytic horizontal coverage, a separate dense distance
+oracle, the 243 core floor, half-opacity fringe thresholds, clean digital runs, duplicate/reversed patches,
+neighboring-contour protection and locked color donors. Numerical tests cover source/image boundary behavior against
 scikit-image, cubic texture continuation, masked-source poisoning, transparency,
 fractional area conservation, rectangular preview/document equivalence, cache
 reuse, cancellation and dimensions.
+
+The Gaussian derivatives share identical vertical passes, use contiguous SIMD
+loops and precompute reflected row indices. An exact 256-entry sRGB decode table
+avoids repeated transfer-function evaluation. Scalar reference tests check both
+the Gaussian results and batched solver bit for bit. Reproducible release
+benchmarks and tradeoffs are documented in [Game Asset performance](game-asset-performance.md).
 
 Historical fill methods, settings UI, and comparison artifacts are preserved on
 the `experiment` branch and its sibling `diorama-experiment` worktree. They are
