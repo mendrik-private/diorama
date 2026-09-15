@@ -48,17 +48,54 @@ pub(super) fn logical_zoom(device_zoom: f64, render_scale: f64) -> f64 {
 
 pub(super) fn aligned_hard_zoom(zoom: f64, render_scale: f64) -> f64 {
     let render_scale = sanitized_render_scale(render_scale);
-    let render_zoom = (zoom * render_scale).round().max(1.0);
+    let render_zoom = zoom * render_scale;
+    if render_zoom <= 1.0 {
+        return render_zoom / render_scale;
+    }
+    let render_zoom = render_zoom.round();
     render_zoom / render_scale
 }
 
-pub(super) fn stepped_hard_zoom(zoom: f64, render_scale: f64, zoom_in: bool) -> f64 {
+pub(super) fn stepped_zoom(
+    zoom: f64,
+    render_scale: f64,
+    zoom_in: bool,
+    whole_pixels_above_actual: bool,
+) -> f64 {
+    const SUBPIXEL_STEPS: [f64; 4] = [0.25, 0.5, 0.75, 1.0];
+    const STEP_EPSILON: f64 = 1e-9;
+
     let render_scale = sanitized_render_scale(render_scale);
     let render_zoom = zoom * render_scale;
-    let next = if zoom_in {
-        render_zoom.floor() + 1.0
+    let preset = if (SUBPIXEL_STEPS[0] - STEP_EPSILON..=1.0 + STEP_EPSILON).contains(&render_zoom) {
+        if zoom_in {
+            SUBPIXEL_STEPS
+                .into_iter()
+                .find(|step| *step > render_zoom + STEP_EPSILON)
+        } else {
+            SUBPIXEL_STEPS
+                .into_iter()
+                .rev()
+                .find(|step| *step < render_zoom - STEP_EPSILON)
+                .or(Some(SUBPIXEL_STEPS[0]))
+        }
     } else {
+        None
+    };
+    let next = if let Some(preset) = preset {
+        preset
+    } else if render_zoom < SUBPIXEL_STEPS[0] {
+        if zoom_in {
+            SUBPIXEL_STEPS[0]
+        } else {
+            render_zoom * 0.8
+        }
+    } else if whole_pixels_above_actual && zoom_in {
+        render_zoom.floor() + 1.0
+    } else if whole_pixels_above_actual {
         (render_zoom.ceil() - 1.0).max(1.0)
+    } else {
+        render_zoom * if zoom_in { 1.25 } else { 0.8 }
     };
     next / render_scale
 }

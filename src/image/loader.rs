@@ -8,6 +8,8 @@ use image::{DynamicImage, ImageDecoder, ImageReader};
 use crate::document::{ImageSource, Metadata};
 use crate::error::{AppError, Result};
 
+const DEFAULT_MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
     pub max_width: u32,
@@ -17,27 +19,10 @@ pub struct DecodeLimits {
 
 impl Default for DecodeLimits {
     fn default() -> Self {
-        let available = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| {
-                contents.lines().find_map(|line| {
-                    let value = line.strip_prefix("MemAvailable:")?;
-                    value
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()
-                        .and_then(|kilobytes| kilobytes.checked_mul(1024))
-                })
-            });
-        let cache_limit = available
-            .map(|bytes| bytes / 4)
-            .unwrap_or(512 * 1024 * 1024)
-            .min(512 * 1024 * 1024);
         Self {
             max_width: 100_000,
             max_height: 100_000,
-            max_decoded_bytes: cache_limit,
+            max_decoded_bytes: DEFAULT_MAX_DECODED_BYTES,
         }
     }
 }
@@ -269,6 +254,15 @@ mod tests {
         };
         assert!(enforce_limits(101, 1, limits).is_err());
         assert!(enforce_limits(20, 20, limits).is_err());
+    }
+
+    #[test]
+    fn default_memory_limit_accepts_one_gibibyte_boundary() {
+        let limits = DecodeLimits::default();
+
+        assert_eq!(limits.max_decoded_bytes, 1024 * 1024 * 1024);
+        assert!(enforce_limits(65_536, 4_096, limits).is_ok());
+        assert!(enforce_limits(65_536, 4_097, limits).is_err());
     }
 
     #[test]

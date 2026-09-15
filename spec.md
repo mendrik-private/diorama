@@ -227,7 +227,7 @@ Performance must be measured on a documented reference system.
 * Use downsampled previews when the display size does not require full resolution.
 * Generate mip levels lazily.
 * Use tiled rendering for extremely large images where the decoder allows it.
-* Default decoded-image cache: the lower of 512 MB or 25% of available memory.
+* Default decoded-image memory limit: 1 GiB.
 * Release full-resolution buffers when the window is minimized or memory pressure is reported.
 * Avoid duplicate RGBA buffers between the document, preview and renderer.
 

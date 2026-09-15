@@ -61,7 +61,7 @@ use tool::{Tool, palette_visible, pencil_drag_available, resting_tool};
 use zoom::{
     aligned_hard_zoom, anchored_adjustment_value, centered_adjustment_value, comparison_zoom,
     device_zoom, fit_on_load, logical_zoom, panel_fit_zoom, sanitized_render_scale,
-    scale_preview_zoom, stepped_hard_zoom, usable_panel_size, zoom_rect_target,
+    scale_preview_zoom, stepped_zoom, usable_panel_size, zoom_rect_target,
 };
 
 #[derive(Clone)]
@@ -2609,6 +2609,21 @@ impl ViewerWindow {
             let this = self.clone();
             move |button| this.tool_button_toggled(button, Tool::Scale)
         });
+        for field in [&self.0.scale_width, &self.0.scale_height] {
+            let keys = gtk::EventControllerKey::new();
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            keys.connect_key_pressed({
+                let canvas = self.0.canvas.clone();
+                move |_, key, _, _| {
+                    if key != gtk::gdk::Key::Escape {
+                        return glib::Propagation::Proceed;
+                    }
+                    canvas.grab_focus();
+                    glib::Propagation::Stop
+                }
+            });
+            field.add_controller(keys);
+        }
         self.0.scale_width.connect_value_changed({
             let this = self.clone();
             move |_| this.scale_dimension_changed(true)
@@ -5586,11 +5601,12 @@ impl ViewerWindow {
         if self.0.tool.get() == Tool::Pencil {
             self.abort_pencil_drag();
         }
-        let zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
-            stepped_hard_zoom(self.0.canvas.zoom(), self.0.render_scale.get(), zoom_in)
-        } else {
-            self.0.canvas.zoom() * if zoom_in { 1.25 } else { 0.8 }
-        };
+        let zoom = stepped_zoom(
+            self.0.canvas.zoom(),
+            self.0.render_scale.get(),
+            zoom_in,
+            self.0.canvas.filter() == ZoomFilter::Hard,
+        );
         self.set_zoom_centered(zoom);
     }
 
@@ -5811,7 +5827,7 @@ impl ViewerWindow {
     fn zoom_at(&self, factor: f64, position: Option<(f64, f64)>) {
         let old_zoom = self.0.canvas.zoom();
         let new_zoom = if self.0.canvas.filter() == ZoomFilter::Hard {
-            stepped_hard_zoom(old_zoom, self.0.render_scale.get(), factor > 1.0)
+            stepped_zoom(old_zoom, self.0.render_scale.get(), factor > 1.0, true)
         } else {
             old_zoom * factor
         }
@@ -7245,12 +7261,52 @@ mod tests {
     fn hard_zoom_steps_by_whole_render_pixels_above_actual_size() {
         let render_scale = 2.0;
 
-        assert_eq!(stepped_hard_zoom(1.0, render_scale, true), 1.5);
-        assert_eq!(stepped_hard_zoom(1.5, render_scale, true), 2.0);
-        assert_eq!(stepped_hard_zoom(2.0, render_scale, false), 1.5);
-        assert_eq!(stepped_hard_zoom(1.5, render_scale, false), 1.0);
-        assert_eq!(stepped_hard_zoom(1.0, render_scale, false), 0.5);
-        assert_eq!(stepped_hard_zoom(0.8, render_scale, false), 0.5);
+        assert_eq!(stepped_zoom(1.0, render_scale, true, true), 1.5);
+        assert_eq!(stepped_zoom(1.5, render_scale, true, true), 2.0);
+        assert_eq!(stepped_zoom(2.0, render_scale, false, true), 1.5);
+        assert_eq!(stepped_zoom(1.5, render_scale, false, true), 1.0);
+        assert_eq!(stepped_zoom(1.0, render_scale, false, true), 0.5);
+        assert_eq!(stepped_zoom(0.8, render_scale, false, true), 0.5);
+    }
+
+    #[test]
+    fn zoom_steps_through_presets_at_or_below_actual_size() {
+        let render_scale = 2.0;
+        let zoom_100 = logical_zoom(1.0, render_scale);
+        let zoom_75 = logical_zoom(0.75, render_scale);
+        let zoom_50 = logical_zoom(0.5, render_scale);
+        let zoom_25 = logical_zoom(0.25, render_scale);
+
+        for whole_pixels_above_actual in [false, true] {
+            assert_eq!(
+                stepped_zoom(zoom_100, render_scale, false, whole_pixels_above_actual),
+                zoom_75
+            );
+            assert_eq!(
+                stepped_zoom(zoom_75, render_scale, false, whole_pixels_above_actual),
+                zoom_50
+            );
+            assert_eq!(
+                stepped_zoom(zoom_50, render_scale, false, whole_pixels_above_actual),
+                zoom_25
+            );
+            assert_eq!(
+                stepped_zoom(zoom_25, render_scale, false, whole_pixels_above_actual),
+                zoom_25
+            );
+            assert_eq!(
+                stepped_zoom(zoom_25, render_scale, true, whole_pixels_above_actual),
+                zoom_50
+            );
+            assert_eq!(
+                stepped_zoom(zoom_50, render_scale, true, whole_pixels_above_actual),
+                zoom_75
+            );
+            assert_eq!(
+                stepped_zoom(zoom_75, render_scale, true, whole_pixels_above_actual),
+                zoom_100
+            );
+        }
     }
 
     #[test]
@@ -9309,7 +9365,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn focused_scale_dimension_suppresses_global_shortcuts() {
+    fn focused_scale_dimension_suppresses_shortcuts_and_escape_returns_to_canvas() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik_private.Diorama.ScaleFocusTest")
@@ -9339,6 +9395,41 @@ mod tests {
             application.accels_for_action("win.zoom-100").is_empty(),
             "number-key zoom shortcuts must be disabled while a scale field has focus",
         );
+
+        for field in [&window.0.scale_width, &window.0.scale_height] {
+            field.grab_focus();
+            while context.pending() {
+                context.iteration(false);
+            }
+            let controllers = field.observe_controllers();
+            let escape_was_handled = (0..controllers.n_items())
+                .filter_map(|index| controllers.item(index))
+                .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+                .filter(|controller| {
+                    controller.propagation_phase() == gtk::PropagationPhase::Capture
+                })
+                .fold(false, |handled, controller| {
+                    controller.emit_by_name::<bool>(
+                        "key-pressed",
+                        &[
+                            &gtk::gdk::Key::Escape,
+                            &0_u32,
+                            &gtk::gdk::ModifierType::empty(),
+                        ],
+                    ) || handled
+                });
+            while context.pending() {
+                context.iteration(false);
+            }
+
+            assert!(escape_was_handled);
+            assert_eq!(
+                gtk::prelude::GtkWindowExt::focus(&window.0.window),
+                Some(window.0.canvas.clone().upcast()),
+            );
+            assert_eq!(window.0.tool.get(), Tool::Scale);
+            assert_eq!(application.accels_for_action("win.zoom-100"), ["1"]);
+        }
 
         window.0.scale_slider.grab_focus();
         while context.pending() {
@@ -9724,6 +9815,49 @@ mod tests {
             (window.0.scrolled.width(), window.0.scrolled.height()),
         );
         assert_eq!(window.0.zoom_label.label().as_deref(), Some("100%"));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn zoom_presets_and_minus_steps_match_in_both_filter_modes() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ZoomStepsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::new(16, 16);
+        let texture = texture_from_rgba(&image).expect("image texture");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.update_action_states();
+        window.update_render_scale(2.0);
+
+        for filter in [ZoomFilter::Hard, ZoomFilter::Soft] {
+            window.0.canvas.set_filter(filter);
+            gio::prelude::ActionGroupExt::activate_action(&window.0.window, "zoom-25", None);
+            assert_eq!(window.0.zoom_label.label().as_deref(), Some("25%"));
+            assert!(
+                (device_zoom(window.0.canvas.zoom(), window.0.render_scale.get()) - 0.25).abs()
+                    < 1e-6,
+                "{filter:?}: the 25% action must display at 25%",
+            );
+
+            gio::prelude::ActionGroupExt::activate_action(&window.0.window, "zoom-100", None);
+            for expected in [0.75, 0.5, 0.25] {
+                gio::prelude::ActionGroupExt::activate_action(&window.0.window, "zoom-out", None);
+                let actual = device_zoom(window.0.canvas.zoom(), window.0.render_scale.get());
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "{filter:?}: minus produced {:.0}% instead of {:.0}%",
+                    actual * 100.0,
+                    expected * 100.0,
+                );
+            }
+        }
     }
 
     #[test]
