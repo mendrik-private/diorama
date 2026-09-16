@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.15" date="2026-09-16">
+      <description>
+        <p>Asks for confirmation before permanently deleting the current image when no annotation or region is selected, while keeping annotation and region deletion actions unchanged.</p>
+      </description>
+    </release>
     <release version="0.3.14" date="2026-09-16">
       <description>
         <p>Restores Arrow endpoint rotation, stroke-width Escape and canvas-blur behavior for Delete and undo, and scale-preview zoom across dimension, antialiasing, and method changes. Also improves Game Asset silhouette edge and background separation.</p>

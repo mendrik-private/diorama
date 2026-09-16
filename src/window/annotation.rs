@@ -971,7 +971,6 @@ impl ViewerWindow {
         modifiers: gtk::gdk::ModifierType,
     ) -> bool {
         if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete)
-            && matches!(self.0.tool.get(), Tool::None | Tool::Select)
             && let Some(selection) = self.0.region_selection.get()
         {
             let rect = Rect {
@@ -1014,10 +1013,8 @@ impl ViewerWindow {
             self.0.canvas.grab_focus();
             return true;
         }
-        if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete)
-            && self.0.tool.get() == Tool::None
-        {
-            gtk::prelude::WidgetExt::activate_action(&self.0.window, "delete-file", None).ok();
+        if matches!(key, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete) {
+            gio::prelude::ActionGroupExt::activate_action(&self.0.window, "delete-file", None);
             return true;
         }
         let delta = match key {

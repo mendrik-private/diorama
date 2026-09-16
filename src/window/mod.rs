@@ -7106,6 +7106,87 @@ fn sync_adjustment(source: &gtk::Adjustment, target: &gtk::Adjustment) {
 mod tests {
     use super::*;
 
+    struct DeleteFixture {
+        _application: adw::Application,
+        window: ViewerWindow,
+        path: PathBuf,
+        _directory: tempfile::TempDir,
+        annotation: AnnotationId,
+    }
+
+    fn delete_fixture(application_id: &str) -> DeleteFixture {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id(application_id)
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        let mut document = Document::new(crate::document::ImageSource {
+            pixels: Arc::new(image.clone()),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        let annotation = Annotation {
+            id: document.allocate_annotation_id(),
+            shape: Shape::Highlight {
+                rect: Rect {
+                    x: 2.0,
+                    y: 2.0,
+                    width: 8.0,
+                    height: 8.0,
+                },
+                seed: 1,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            annotation.clone(),
+        )));
+        let directory = tempfile::tempdir().expect("temporary image directory");
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"image").expect("temporary image");
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.document.replace(Some(document));
+        window
+            .0
+            .current_file
+            .replace(Some(gio::File::for_path(&path)));
+        window.update_action_states();
+
+        DeleteFixture {
+            _application: application,
+            window,
+            path,
+            _directory: directory,
+            annotation: annotation.id,
+        }
+    }
+
+    fn alert_response_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Ok(button) = current.clone().downcast::<gtk::Button>()
+                && button.label().as_deref() == Some(label)
+            {
+                return Some(button);
+            }
+            if let Some(button) = alert_response_button(&current, label) {
+                return Some(button);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
     #[test]
     fn region_handles_use_directional_resize_cursors() {
         let rect = gtk::graphene::Rect::new(20.0, 30.0, 100.0, 80.0);
@@ -8132,6 +8213,118 @@ mod tests {
 
         window.toggle_tool(Tool::Select);
         assert_eq!(window.0.tool.get(), Tool::Select);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn delete_keys_prompt_for_the_file_only_without_a_selection() {
+        let fixture = delete_fixture("io.github.mendrik_private.Diorama.DeleteKeyConfirmationTest");
+        let window = &fixture.window;
+
+        let prompts = Rc::new(Cell::new(0));
+        let prompt_count = prompts.clone();
+        window
+            .0
+            .window
+            .lookup_action("delete-file")
+            .expect("delete action")
+            .downcast::<gio::SimpleAction>()
+            .expect("simple delete action")
+            .connect_activate(move |_, _| prompt_count.set(prompt_count.get() + 1));
+
+        window.set_tool(Tool::None);
+        assert_eq!(window.0.tool.get(), Tool::Select);
+
+        window.select_annotation(Some(fixture.annotation));
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .is_empty()
+        );
+        assert_eq!(prompts.get(), 0);
+
+        window.set_region_selection(Some(CropOverlay {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            image_width: 16,
+            image_height: 16,
+        }));
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::KP_Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(prompts.get(), 0);
+        assert!(fixture.path.exists());
+
+        window.set_region_selection(None);
+        assert!(
+            !window
+                .handle_annotation_key(gtk::gdk::Key::BackSpace, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(prompts.get(), 0);
+
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(prompts.get(), 1);
+        let dialog = window
+            .0
+            .window
+            .visible_dialog()
+            .expect("delete confirmation")
+            .downcast::<adw::AlertDialog>()
+            .expect("delete alert dialog");
+        assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+        assert_eq!(dialog.close_response(), "cancel");
+        assert_eq!(
+            dialog.response_appearance("delete"),
+            adw::ResponseAppearance::Destructive
+        );
+        let dialog_widget = dialog.upcast::<gtk::Widget>();
+        alert_response_button(&dialog_widget, &gettext("Cancel"))
+            .expect("cancel response button")
+            .emit_clicked();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(fixture.path.exists());
+        assert!(!window.0.deletion_running.get());
+
+        window.set_tool(Tool::Arrow);
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::KP_Delete, gtk::gdk::ModifierType::empty())
+        );
+        assert_eq!(prompts.get(), 2);
+        let dialog = window
+            .0
+            .window
+            .visible_dialog()
+            .expect("delete confirmation")
+            .downcast::<adw::AlertDialog>()
+            .expect("delete alert dialog");
+        let dialog_widget = dialog.upcast::<gtk::Widget>();
+        alert_response_button(&dialog_widget, &gettext("Delete"))
+            .expect("delete response button")
+            .emit_clicked();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fixture.path.exists() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(
+            !fixture.path.exists(),
+            "confirmed deletion must remove the file"
+        );
     }
 
     #[test]
