@@ -133,14 +133,17 @@ mod tests {
             }
             assert!(!window.0.scale_spinner.get_visible(), "preview completed");
         };
+        wait_for_preview();
+        let preserved_zoom = 1.375;
+        window.set_scale_preview_zoom(preserved_zoom);
         let session = crate::tools::scale::game_asset::Session::new(source);
         for percent in [0, 100, 50] {
             window.0.scale_aa.set_value(f64::from(percent));
             assert_eq!(window.0.scale_aa.value(), f64::from(percent));
             let aa = GameAssetAa::new(percent);
             assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset(aa));
-            assert_eq!(Settings::default().game_asset_aa(), aa);
             wait_for_preview();
+            assert_eq!(window.0.settings.game_asset_aa(), aa);
             let expected = session
                 .resize(32, 27, aa, &CancellationToken::default())
                 .unwrap();
@@ -148,6 +151,7 @@ mod tests {
                 window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
                 &expected
             );
+            assert_eq!(window.0.canvas.zoom(), preserved_zoom);
         }
         // Switching methods hides AA without forgetting it or contaminating
         // another method. Rapid AA changes must publish only the latest value.
@@ -176,6 +180,7 @@ mod tests {
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
             &expected
         );
+        assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
         window.0.scale_aa.grab_focus();
         while context.pending() {

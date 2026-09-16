@@ -21,18 +21,28 @@ mod opacity;
 mod paint;
 mod project;
 mod raster;
+mod silhouette;
 mod smoothing;
 mod source;
 mod strokes;
 #[cfg(test)]
 mod tests;
 const MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+// The source phase keeps the established 512 B/pixel allowance for analysis,
+// contour storage and the sparse repair solve.  Target data is not concurrent
+// with analysis, but can contain two linear images, contour ownership/colors,
+// support/opacity projections, the output and cache; 160 B/pixel conservatively
+// accounts for that composition peak.  This is phase-aware without weakening
+// the explicit 1 GiB source safety limit.
+const SOURCE_PHASE_BYTES: u64 = 512;
+const TARGET_PHASE_BYTES: u64 = 160;
 struct Prepared {
     models: Vec<detect::Model>,
     widths: Vec<f64>,
     contours: contours::Contours,
     mask: raster::Mask,
     linear: color::LinearImage,
+    silhouette: Option<silhouette::Silhouette>,
 }
 struct TargetContours {
     strokes: strokes::Strokes,
@@ -56,12 +66,15 @@ impl Prepared {
         let mask = ink::ink_mask(image, &samples, &thinned, cancel)?;
         cancel.check()?;
         let widths = opacity::widths(image, &mask, &samples, &contours, cancel)?;
+        let linear = color::LinearImage::from_rgba(image);
+        let silhouette = silhouette::Silhouette::detect(image, cancel)?;
         Ok(Self {
             models,
             widths,
             contours,
             mask,
-            linear: color::LinearImage::from_rgba(image),
+            linear,
+            silhouette,
         })
     }
     fn target_contours(
@@ -115,11 +128,75 @@ impl Prepared {
             w as f64 / image.width() as f64,
             h as f64 / image.height() as f64,
         ];
-        let retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
+        let mut retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
         cancel.check()?;
-        let repaired = biharmonic::repair(&self.linear, &retained_mask, cancel)?;
+        let isolated = if let Some(silhouette) = &self.silhouette {
+            for (i, (masked, &supported)) in retained_mask
+                .data
+                .iter_mut()
+                .zip(&silhouette.support.data)
+                .enumerate()
+            {
+                if i % 4096 == 0 {
+                    cancel.check()?;
+                }
+                *masked &= supported;
+            }
+            Some(silhouette.isolated(&self.linear, cancel)?)
+        } else {
+            None
+        };
+        let repair_source = isolated.as_ref().unwrap_or(&self.linear);
+        let repaired = biharmonic::repair(repair_source, &retained_mask, cancel)?;
         let base = project::area(&repaired, w as usize, h as usize, cancel)?;
-        let result = paint::composite(&base, &colors, &paint);
+        let fill = if let Some(silhouette) = &self.silhouette {
+            let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
+            let retained_coverage =
+                silhouette.project_mask(&retained_mask, w as usize, h as usize, cancel)?;
+            let coverage = silhouette.target_coverage(
+                &source_coverage,
+                &retained_coverage,
+                &strokes.core,
+                aa,
+                cancel,
+            )?;
+            let opacity = silhouette.intrinsic_opacity(
+                repair_source,
+                &source_coverage,
+                w as usize,
+                h as usize,
+                cancel,
+            )?;
+            let exterior = silhouette.exterior();
+            let mut pixels = Vec::with_capacity(base.pixels.len());
+            for (i, ((pixel, support), intrinsic)) in
+                base.pixels.iter().zip(coverage).zip(opacity).enumerate()
+            {
+                if i % 4096 == 0 {
+                    cancel.check()?;
+                }
+                let alpha = (intrinsic * support).clamp(0., 1.);
+                let out_alpha = alpha + exterior[3] * (1. - alpha);
+                pixels.push(if out_alpha <= 1e-8 {
+                    [0.; 4]
+                } else {
+                    [
+                        (pixel[0] * alpha + exterior[0] * exterior[3] * (1. - alpha)) / out_alpha,
+                        (pixel[1] * alpha + exterior[1] * exterior[3] * (1. - alpha)) / out_alpha,
+                        (pixel[2] * alpha + exterior[2] * exterior[3] * (1. - alpha)) / out_alpha,
+                        out_alpha,
+                    ]
+                });
+            }
+            color::LinearImage {
+                w: w as usize,
+                h: h as usize,
+                pixels,
+            }
+        } else {
+            base
+        };
+        let result = paint::composite(&fill, &colors, &paint);
         cancel.check()?;
         Ok(result)
     }
@@ -157,7 +234,8 @@ impl Session {
         if (w, h) == (sw, sh) {
             return Ok((*self.source).clone());
         }
-        let estimate = u64::from(sw) * u64::from(sh) * 512 + u64::from(w) * u64::from(h) * 256;
+        let estimate = u64::from(sw) * u64::from(sh) * SOURCE_PHASE_BYTES
+            + u64::from(w) * u64::from(h) * TARGET_PHASE_BYTES;
         if estimate > MEMORY_BUDGET {
             return Err(AppError::MemoryLimit {
                 limit_bytes: MEMORY_BUDGET,

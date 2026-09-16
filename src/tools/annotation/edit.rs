@@ -278,6 +278,20 @@ pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotat
         }
         return changed;
     }
+    if let Shape::Arrow {
+        start,
+        end,
+        control,
+        ..
+    } = &mut changed.shape
+    {
+        let center = start.midpoint(*end);
+        let delta = rotation_delta(delta_angle, snap);
+        for point in [start, end, control] {
+            *point = rotate_point(*point, center, delta);
+        }
+        return changed;
+    }
     let Shape::Text {
         anchor,
         angle,
@@ -501,6 +515,112 @@ mod tests {
                     y: point.y,
                 },
                 expected,
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_rotation_uses_endpoint_rings_and_preserves_its_curve() {
+        use super::super::hit::{HitKind, hit_test};
+
+        let original = Annotation {
+            id: AnnotationId(10),
+            shape: Shape::Arrow {
+                start: Point { x: 20.0, y: 30.0 },
+                end: Point { x: 80.0, y: 30.0 },
+                control: Point { x: 50.0, y: 50.0 },
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        let ring = Point { x: 8.0, y: 30.0 };
+        assert_eq!(
+            hit_test(
+                std::slice::from_ref(&original),
+                Some(original.id),
+                ring,
+                8.0
+            )
+            .expect("selected arrow endpoint ring")
+            .kind,
+            HitKind::Rotate
+        );
+        assert_eq!(
+            hit_test(
+                std::slice::from_ref(&original),
+                Some(original.id),
+                Point { x: 20.0, y: 30.0 },
+                8.0
+            )
+            .expect("arrow endpoint handle")
+            .kind,
+            HitKind::Handle(HandleKind::Start),
+            "endpoint handles take precedence over their rotation rings"
+        );
+        assert!(
+            !matches!(
+                hit_test(
+                    std::slice::from_ref(&original),
+                    Some(original.id),
+                    Point { x: 50.0, y: 62.0 },
+                    8.0
+                ),
+                Some(hit) if hit.kind == HitKind::Rotate
+            ),
+            "the arrow's bend control has no rotation ring"
+        );
+        assert!(
+            !matches!(
+                hit_test(std::slice::from_ref(&original), None, ring, 8.0),
+                Some(hit) if hit.kind == HitKind::Rotate
+            ),
+            "rotation rings appear only for selected arrows"
+        );
+
+        let turned = rotated(&original, std::f32::consts::FRAC_PI_2, false);
+        let Shape::Arrow {
+            start,
+            end,
+            control,
+            ..
+        } = turned.shape
+        else {
+            unreachable!()
+        };
+        assert!(start.distance(Point { x: 50.0, y: 0.0 }) < 0.001);
+        assert!(end.distance(Point { x: 50.0, y: 60.0 }) < 0.001);
+        assert!(control.distance(Point { x: 30.0, y: 30.0 }) < 0.001);
+        assert!(start.midpoint(end).distance(Point { x: 50.0, y: 30.0 }) < 0.001);
+
+        let snapped = rotated(&original, 38.0_f32.to_radians(), true);
+        let expected = rotated(&original, 45.0_f32.to_radians(), false);
+        let (
+            Shape::Arrow {
+                start: snapped_start,
+                end: snapped_end,
+                control: snapped_control,
+                ..
+            },
+            Shape::Arrow {
+                start: expected_start,
+                end: expected_end,
+                control: expected_control,
+                ..
+            },
+        ) = (snapped.shape, expected.shape)
+        else {
+            unreachable!()
+        };
+        for (actual, expected) in [
+            (snapped_start, expected_start),
+            (snapped_end, expected_end),
+            (snapped_control, expected_control),
+        ] {
+            assert!(
+                actual.distance(expected) < 0.001,
+                "{actual:?} != {expected:?}"
             );
         }
     }

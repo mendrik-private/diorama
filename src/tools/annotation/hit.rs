@@ -278,7 +278,8 @@ fn handle_hit(annotation: &Annotation, point: Point, tolerance: f32) -> Option<H
 fn rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
     if !matches!(
         annotation.shape,
-        Shape::Text { .. }
+        Shape::Arrow { .. }
+            | Shape::Text { .. }
             | Shape::Pencil {
                 geometry: PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_),
                 ..

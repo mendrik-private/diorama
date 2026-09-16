@@ -132,6 +132,10 @@ window responsive while larger edits render.
   a control to compare against the original.
 - Choose nearest-neighbor, bicubic, Lanczos, or contour-preserving Game Asset
   scaling with biharmonic texture filling.
+- Game Asset uses final contour cores with conservative source support to
+  separate transparent or confidently flat-canvas assets; opaque images with
+  uncertain backgrounds stay on the normal filtering path rather than guessing
+  a silhouette.
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
 

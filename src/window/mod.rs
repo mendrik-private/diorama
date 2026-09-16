@@ -2642,6 +2642,33 @@ impl ViewerWindow {
                 this.update_selected_annotation_style(None, Some(spinner.value() as f32));
             }
         });
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let this = self.clone();
+            move |_, key, _, _| {
+                if key != gtk::gdk::Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                this.restore_canvas_focus_from_stroke_width();
+                glib::Propagation::Stop
+            }
+        });
+        self.0.pencil_size.add_controller(keys);
+    }
+
+    fn restore_canvas_focus_from_stroke_width(&self) {
+        if self.stroke_width_has_focus() {
+            self.0.pencil_size.update();
+            self.0.canvas.grab_focus();
+        }
+    }
+
+    fn stroke_width_has_focus(&self) -> bool {
+        gtk::prelude::GtkWindowExt::focus(&self.0.window).is_some_and(|focus| {
+            focus == self.0.pencil_size.clone().upcast::<gtk::Widget>()
+                || focus.is_ancestor(&self.0.pencil_size)
+        })
     }
 
     fn install_scale_controls(&self) {
@@ -2926,10 +2953,18 @@ impl ViewerWindow {
         self.refresh_scale_controls_with_preserved_zoom(None);
     }
 
+    fn scale_preview_zoom_to_preserve(&self) -> Option<f64> {
+        (self.0.scale_preview_view.get() != ScalePreviewView::Fit).then(|| self.0.canvas.zoom())
+    }
+
     fn refresh_scale_controls_with_preserved_zoom(&self, preserved_zoom: Option<f64>) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
             return;
         };
+        // Replacing a preview should not discard a zoom chosen while scaling.
+        // Fit is the exception: it is a mode, so each replacement must refit
+        // to its own dimensions.
+        let preserved_zoom = preserved_zoom.or_else(|| self.scale_preview_zoom_to_preserve());
         let width = self.0.scale_width.value().round() as u32;
         let height = self.0.scale_height.value().round() as u32;
         let percent = f64::from(width) * 100.0 / f64::from(source.width().max(1));
@@ -2986,8 +3021,10 @@ impl ViewerWindow {
         self.0.scale_updating_controls.set(true);
         self.configure_scale_ranges(source.width(), source.height());
         self.0.scale_updating_controls.set(false);
-        let preserved_zoom = self.0.canvas.zoom();
-        self.scale_dimension_changed_with_preserved_zoom(true, Some(preserved_zoom));
+        self.scale_dimension_changed_with_preserved_zoom(
+            true,
+            self.scale_preview_zoom_to_preserve(),
+        );
     }
 
     fn schedule_scale_preview(
@@ -9565,6 +9602,282 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn focused_stroke_width_returns_keyboard_control_to_the_canvas() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.StrokeWidthFocusTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(80, 60, image::Rgba([1, 2, 3, 255]));
+        let texture = texture_from_rgba(&image).expect("image texture");
+        let mut document = Document::new(crate::document::ImageSource {
+            pixels: Arc::new(image.clone()),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        let annotation = Annotation {
+            id: document.allocate_annotation_id(),
+            shape: Shape::Arrow {
+                start: Point { x: 10.0, y: 20.0 },
+                end: Point { x: 50.0, y: 20.0 },
+                control: Point { x: 30.0, y: 30.0 },
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            annotation.clone(),
+        )));
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.rendered.replace(Some(image));
+        window.0.document.replace(Some(document));
+        window.set_tool(Tool::Arrow);
+        window.select_annotation(Some(annotation.id));
+        window.present();
+
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        window.0.pencil_size.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(window.stroke_width_has_focus());
+        window.0.pencil_size.set_text("17");
+
+        let window_controllers = window.0.window.observe_controllers();
+        let delete_is_suppressed = !(0..window_controllers.n_items())
+            .filter_map(|index| window_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::Delete,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                )
+            });
+        assert!(
+            delete_is_suppressed,
+            "Delete remains text input while editing width"
+        );
+        let undo_is_suppressed = !(0..window_controllers.n_items())
+            .filter_map(|index| window_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::z,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::CONTROL_MASK,
+                    ],
+                )
+            });
+        assert!(
+            undo_is_suppressed,
+            "Ctrl+Z remains text input while editing width"
+        );
+
+        let field_controllers = window.0.pencil_size.observe_controllers();
+        let escape_was_handled = (0..field_controllers.n_items())
+            .filter_map(|index| field_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::Escape,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                )
+            });
+        assert!(
+            escape_was_handled,
+            "Escape must blur the stroke-width field"
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(
+            gtk::prelude::GtkWindowExt::focus(&window.0.window),
+            Some(window.0.canvas.clone().upcast()),
+        );
+        assert_eq!(window.0.tool.get(), Tool::Arrow);
+        assert_eq!(window.0.selected_annotation.get(), Some(annotation.id));
+        assert_eq!(window.0.pencil_size.value(), 17.0);
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .iter()
+                .find(|candidate| candidate.id == annotation.id)
+                .and_then(|annotation| match annotation.shape {
+                    Shape::Arrow { style, .. } => Some(style.width),
+                    _ => None,
+                }),
+            Some(17.0),
+            "blurring commits the displayed stroke width before returning to the canvas"
+        );
+
+        window.0.pencil_size.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(window.stroke_width_has_focus());
+        window.0.pencil_size.set_text("18");
+        let canvas_controllers = window.0.canvas.observe_controllers();
+        let click_was_handled = (0..canvas_controllers.n_items())
+            .filter_map(|index| canvas_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureClick>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<()>("pressed", &[&1_i32, &20.0_f64, &20.0_f64]);
+                true
+            });
+        assert!(
+            click_was_handled,
+            "canvas has a capture-phase click handler"
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(
+            gtk::prelude::GtkWindowExt::focus(&window.0.window),
+            Some(window.0.canvas.clone().upcast()),
+            "a canvas click blurs the stroke-width field"
+        );
+        assert_eq!(window.0.pencil_size.value(), 18.0);
+
+        let new_arrow = {
+            let mut document = window.0.document.borrow_mut();
+            let document = document.as_mut().expect("document");
+            Annotation {
+                id: document.allocate_annotation_id(),
+                shape: Shape::Arrow {
+                    start: Point { x: 10.0, y: 40.0 },
+                    end: Point { x: 50.0, y: 40.0 },
+                    control: Point { x: 30.0, y: 50.0 },
+                    style: StrokeStyle {
+                        color: [255, 0, 0, 255],
+                        width: 18.0,
+                    },
+                },
+            }
+        };
+        window.apply(Operation::Annotate(AnnotationEdit::Create(
+            new_arrow.clone(),
+        )));
+        window.select_annotation(Some(new_arrow.id));
+
+        let window_controllers = window.0.window.observe_controllers();
+        let undo_was_handled = (0..window_controllers.n_items())
+            .filter_map(|index| window_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::z,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::CONTROL_MASK,
+                    ],
+                )
+            });
+        assert!(undo_was_handled, "Ctrl+Z must reach undo after blur");
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .iter()
+                .all(|candidate| candidate.id != new_arrow.id),
+            "Ctrl+Z removes the newly created arrow"
+        );
+        let redo_was_handled = (0..window_controllers.n_items())
+            .filter_map(|index| window_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::z,
+                        &0_u32,
+                        &(gtk::gdk::ModifierType::CONTROL_MASK
+                            | gtk::gdk::ModifierType::SHIFT_MASK),
+                    ],
+                )
+            });
+        assert!(redo_was_handled, "Ctrl+Shift+Z must restore the new arrow");
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .iter()
+                .any(|candidate| candidate.id == new_arrow.id),
+            "Ctrl+Shift+Z restores the newly created arrow"
+        );
+        window.select_annotation(Some(new_arrow.id));
+        let delete_was_handled = (0..window_controllers.n_items())
+            .filter_map(|index| window_controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+            .any(|controller| {
+                controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::gdk::Key::Delete,
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                )
+            });
+        assert!(
+            delete_was_handled,
+            "Delete must reach the selected arrow after blur"
+        );
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .iter()
+                .all(|candidate| candidate.id != new_arrow.id),
+            "Delete removes the selected arrow after focus returns to the canvas"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn scale_action_enables_after_the_editable_decode() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -9686,6 +9999,55 @@ mod tests {
         assert!(usable_panel_size(viewport));
         assert!(window.0.canvas.zoom() > 64.0);
         assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (4, 3)));
+
+        let replacement_method = if window.0.scale_method.selected() == 0 {
+            1
+        } else {
+            0
+        };
+        window.0.scale_method.set_selected(replacement_method);
+        assert_eq!(
+            window
+                .0
+                .scale_preview
+                .borrow()
+                .as_ref()
+                .expect("source-sized scale preview")
+                .dimensions(),
+            (8, 6)
+        );
+        assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (8, 6)));
+
+        window.0.scale_width.set_value(2.0);
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while (window.0.scale_spinner.get_visible()
+            || window
+                .0
+                .scale_preview
+                .borrow()
+                .as_ref()
+                .is_none_or(|preview| preview.dimensions() != (2, 2)))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(
+            !window.0.scale_spinner.get_visible(),
+            "replacement preview completed"
+        );
+        assert_eq!(
+            window
+                .0
+                .scale_preview
+                .borrow()
+                .as_ref()
+                .expect("2 × 2 scale preview")
+                .dimensions(),
+            (2, 2)
+        );
+        assert_eq!(window.0.canvas.zoom(), panel_fit_zoom(viewport, (2, 2)));
     }
 
     #[test]
@@ -9733,16 +10095,76 @@ mod tests {
         assert_eq!(window.0.canvas.filter(), configured_filter);
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
+        let dimension_preserved_zoom = 1.25;
+        window.set_scale_preview_zoom(dimension_preserved_zoom);
         window.0.scale_width.set_value(4.0);
         assert_eq!(window.0.scale_height.value(), 3.0);
         assert!(window.0.scale_spinner.get_visible());
 
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while window
+            .0
+            .scale_preview
+            .borrow()
+            .as_ref()
+            .is_none_or(|preview| preview.dimensions() != (4, 3))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            window
+                .0
+                .scale_preview
+                .borrow()
+                .as_ref()
+                .expect("4 × 3 scale preview")
+                .dimensions(),
+            (4, 3)
+        );
+        assert_eq!(window.0.canvas.zoom(), dimension_preserved_zoom);
+
+        window.0.scale_lock.set_active(false);
+        let height_preserved_zoom = 1.375;
+        window.set_scale_preview_zoom(height_preserved_zoom);
+        window.0.scale_height.set_value(4.0);
+        assert_eq!(window.0.scale_width.value(), 4.0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while window
+            .0
+            .scale_preview
+            .borrow()
+            .as_ref()
+            .is_none_or(|preview| preview.dimensions() != (4, 4))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            window
+                .0
+                .scale_preview
+                .borrow()
+                .as_ref()
+                .expect("4 × 4 scale preview")
+                .dimensions(),
+            (4, 4)
+        );
+        assert_eq!(window.0.canvas.zoom(), height_preserved_zoom);
+
+        window.0.scale_lock.set_active(true);
+        assert_eq!(window.0.scale_height.value(), 3.0);
+        let slider_preserved_zoom = 1.5;
+        window.set_scale_preview_zoom(slider_preserved_zoom);
         window.0.scale_unit.set_selected(1);
         window.0.scale_slider.set_value(25.0);
         assert_eq!(window.0.scale_width.value(), 2.0);
         assert_eq!(window.0.scale_height.value(), 2.0);
         assert_eq!(window.0.scale_value_label.label(), "8 × 6 → 2 × 2 (25%)");
-        let context = glib::MainContext::default();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while window
             .0
@@ -9766,6 +10188,7 @@ mod tests {
             (2, 2)
         );
         assert!(!window.0.scale_spinner.get_visible());
+        assert_eq!(window.0.canvas.zoom(), slider_preserved_zoom);
 
         let previous_preview = window
             .0

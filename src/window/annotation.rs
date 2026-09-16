@@ -103,6 +103,15 @@ impl ViewerWindow {
             });
         }
 
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed({
+            let this = self.clone();
+            move |_, _, _, _| this.restore_canvas_focus_from_stroke_width()
+        });
+        self.0.canvas.add_controller(click);
+
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
         drag.connect_drag_begin({
@@ -1068,6 +1077,9 @@ impl ViewerWindow {
 }
 
 fn rotation_center(annotation: &Annotation) -> Point {
+    if let Shape::Arrow { start, end, .. } = &annotation.shape {
+        return start.midpoint(*end);
+    }
     if let Shape::Pencil { geometry, .. } = &annotation.shape {
         return crate::tools::annotation::pencil::geometry_bounds(geometry).center();
     }
@@ -1156,6 +1168,23 @@ mod tests {
             unreachable!()
         };
         assert_eq!(control, Point { x: 6.0, y: 6.0 });
+    }
+
+    #[test]
+    fn arrow_rotation_center_is_its_chord_midpoint() {
+        let annotation = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Arrow {
+                start: Point { x: 2.0, y: 4.0 },
+                end: Point { x: 10.0, y: 8.0 },
+                control: Point { x: 20.0, y: 20.0 },
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+            },
+        };
+        assert_eq!(rotation_center(&annotation), Point { x: 6.0, y: 6.0 });
     }
 
     #[test]
