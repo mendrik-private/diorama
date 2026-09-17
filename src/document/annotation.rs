@@ -127,7 +127,6 @@ pub enum AnnotationEdit {
     Create(Annotation),
     Set(Annotation),
     Delete(AnnotationId),
-    DeleteMany(Vec<AnnotationId>),
 }
 
 #[must_use]
@@ -136,10 +135,14 @@ pub fn fold_annotations(
     operations: &[Operation],
 ) -> Vec<Annotation> {
     let mut dimensions = (source_dimensions.0 as f32, source_dimensions.1 as f32);
-    let mut annotations = Vec::new();
+    let mut annotations: Vec<Annotation> = Vec::new();
 
     for operation in operations {
         match operation {
+            Operation::SelectionEdit {
+                flattened_annotations,
+                ..
+            } => annotations.retain(|annotation| !flattened_annotations.contains(&annotation.id)),
             Operation::Annotate(AnnotationEdit::Create(annotation)) => {
                 if let Some(existing) = annotations
                     .iter_mut()
@@ -160,9 +163,6 @@ pub fn fold_annotations(
             }
             Operation::Annotate(AnnotationEdit::Delete(id)) => {
                 annotations.retain(|annotation| annotation.id != *id);
-            }
-            Operation::Annotate(AnnotationEdit::DeleteMany(ids)) => {
-                annotations.retain(|annotation| !ids.contains(&annotation.id));
             }
             Operation::Crop {
                 x,

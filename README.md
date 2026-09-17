@@ -298,6 +298,48 @@ open ordinary changes against `develop`, keep commits focused, and include tests
 for behavior changes. The `main` branch contains released code and `vX.Y.Z`
 tags; feature branches start from and return to `develop`.
 
+## Local content-aware fill and cutouts
+
+As soon as you finish drawing a rectangle, Diorama prepares its cutout and a
+LaMa-repaired background locally. Click inside the rectangle to activate the
+cutout: its animated lasso follows the foreground contours, including holes,
+and replaces the rectangle labels. Drag the foreground anywhere, including
+beyond an image edge; it retains its full pixels while it is outside the canvas
+so you can drag it back. The repaired background is cached throughout the
+selection session, so repeated moves restore covered texture without rerunning
+inference.
+
+Delete on an activated cutout uses that same repaired background. Delete on an
+ordinary rectangle fills it with the detected background color, or transparency
+when no background color is available. Every committed cut, move, and fill is
+undoable.
+
+Install the model once (about 200 MB) with:
+
+```sh
+python3 build-aux/setup-lama.py
+```
+
+The worker requires Python with `torch`, `numpy`, and `Pillow`. It runs offline
+and defaults to CPU inference. The setup command records the Python executable
+that has those packages in `~/.config/diorama/lama-runtime.conf`; Flatpak uses
+that host interpreter and the existing host model through its local host-launch
+permission. `DIORAMA_LAMA_PYTHON` selects a Python executable,
+`DIORAMA_LAMA_MODEL` selects a trusted TorchScript LaMa model, and
+`DIORAMA_LAMA_DEVICE=cuda` selects a supported PyTorch GPU.
+The default model location is `$XDG_CACHE_HOME/diorama/big-lama.pt`, or
+`~/.cache/diorama/big-lama.pt` when `XDG_CACHE_HOME` is unset. Flatpak first uses
+an app-cache model if present, then reuses this host-cache model, so it does not
+download a second copy. The setup script verifies the checksum published by the
+[IOPaint LaMa integration](https://github.com/Sanster/IOPaint/blob/main/iopaint/model/lama.py).
+
+Inference uses surrounding image context, a slightly expanded removal mask, and
+at most 1024 pixels on its longest input side to bound laptop memory usage. Only
+pixels in the actual cutout are replaced; holes and surrounding pixels stay
+unchanged. Transparent sprites retain transparent holes. If the local runtime
+fails or is unavailable, Diorama reports it and uses the background color (or
+transparency) for that selection instead.
+
 ## License
 
 Diorama is available under the [GNU General Public License v3.0](LICENSE).

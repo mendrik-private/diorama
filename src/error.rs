@@ -22,6 +22,10 @@ pub enum AppError {
     InvalidDimensions,
     #[error("Could not scale the image: {0}")]
     Scaling(String),
+    #[error("Could not fill the selected background: {0}")]
+    Inpainting(String),
+    #[error("Could not remove the selected background: {0}")]
+    BackgroundRemoval(String),
     #[error("The file changed outside Diorama: {0}")]
     ExternallyChanged(PathBuf),
     #[error("The file was deleted or moved: {0}")]

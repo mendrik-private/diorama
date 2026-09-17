@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gtk::gdk;
@@ -257,6 +259,206 @@ pub struct CropOverlay {
     pub image_height: u32,
 }
 
+/// The alpha matte of an activated selection. Keeping it separate from the
+/// rectangular bounds lets existing crop/resize affordances remain available.
+#[derive(Debug, Clone)]
+pub struct LassoOverlay {
+    pub crop: CropOverlay,
+    pub mask: Arc<image::GrayImage>,
+    /// The prepared foreground may travel beyond the image, while `crop`
+    /// remains the in-bounds provenance rectangle used by normal selection
+    /// actions.
+    pub origin_x: i64,
+    pub origin_y: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CachedLassoOverlay {
+    overlay: LassoOverlay,
+    contours: Vec<LassoContour>,
+}
+
+impl CachedLassoOverlay {
+    fn new(overlay: LassoOverlay) -> Self {
+        let contours = trace_lasso_contours(&overlay.mask);
+        Self { overlay, contours }
+    }
+
+    fn can_rebase_to(&self, overlay: &LassoOverlay) -> bool {
+        Arc::ptr_eq(&self.overlay.mask, &overlay.mask)
+            && self.overlay.crop.width == overlay.crop.width
+            && self.overlay.crop.height == overlay.crop.height
+            && self.overlay.crop.image_width == overlay.crop.image_width
+            && self.overlay.crop.image_height == overlay.crop.image_height
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LassoContour {
+    /// Grid vertices, with the first point repeated at the end to make the
+    /// closure explicit to the renderer.
+    points: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LassoBoundaryEdge {
+    start: (u32, u32),
+    end: (u32, u32),
+}
+
+fn opaque_mask_pixel(mask: &image::GrayImage, x: i64, y: i64) -> bool {
+    x >= 0
+        && y >= 0
+        && x < i64::from(mask.width())
+        && y < i64::from(mask.height())
+        && mask.get_pixel(x as u32, y as u32)[0] != 0
+}
+
+fn edge_direction(edge: LassoBoundaryEdge) -> usize {
+    match (
+        edge.end.0 as i64 - edge.start.0 as i64,
+        edge.end.1 as i64 - edge.start.1 as i64,
+    ) {
+        (1, 0) => 0,  // right
+        (0, 1) => 1,  // down
+        (-1, 0) => 2, // left
+        (0, -1) => 3, // up
+        _ => unreachable!("lasso boundaries consist of unit grid edges"),
+    }
+}
+
+/// Trace every exposed alpha-matte edge into ordered, closed loops.
+///
+/// The foreground stays on the right of each directed edge. At a vertex where
+/// two diagonal components touch, taking the clockwise continuation keeps the
+/// components as separate loops instead of joining them through that point.
+fn trace_lasso_contours(mask: &image::GrayImage) -> Vec<LassoContour> {
+    let mut edges = Vec::new();
+    for y in 0..mask.height() {
+        for x in 0..mask.width() {
+            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y)) {
+                continue;
+            }
+            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) - 1) {
+                edges.push(LassoBoundaryEdge {
+                    start: (x, y),
+                    end: (x + 1, y),
+                });
+            }
+            if !opaque_mask_pixel(mask, i64::from(x) + 1, i64::from(y)) {
+                edges.push(LassoBoundaryEdge {
+                    start: (x + 1, y),
+                    end: (x + 1, y + 1),
+                });
+            }
+            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) + 1) {
+                edges.push(LassoBoundaryEdge {
+                    start: (x + 1, y + 1),
+                    end: (x, y + 1),
+                });
+            }
+            if !opaque_mask_pixel(mask, i64::from(x) - 1, i64::from(y)) {
+                edges.push(LassoBoundaryEdge {
+                    start: (x, y + 1),
+                    end: (x, y),
+                });
+            }
+        }
+    }
+
+    let mut outgoing = HashMap::<(u32, u32), Vec<usize>>::new();
+    for (index, edge) in edges.iter().copied().enumerate() {
+        outgoing.entry(edge.start).or_default().push(index);
+    }
+
+    // Direction order is clockwise in screen coordinates. Rightmost-first is
+    // the unambiguous digital-contour rule at diagonal contacts.
+    let mut next = Vec::with_capacity(edges.len());
+    for edge in edges.iter().copied() {
+        let incoming = edge_direction(edge);
+        let candidates = outgoing
+            .get(&edge.end)
+            .expect("every generated boundary endpoint has an outgoing edge");
+        let next_edge = [1, 0, 3, 2]
+            .into_iter()
+            .find_map(|turn| {
+                let direction = (incoming + turn) % 4;
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|&index| edge_direction(edges[index]) == direction)
+            })
+            .expect("generated boundary edges form closed contours");
+        next.push(next_edge);
+    }
+
+    let mut visited = vec![false; edges.len()];
+    let mut contours = Vec::new();
+    for first in 0..edges.len() {
+        if visited[first] {
+            continue;
+        }
+        let mut points = vec![edges[first].start];
+        let mut current = first;
+        loop {
+            visited[current] = true;
+            points.push(edges[current].end);
+            current = next[current];
+            if current == first {
+                break;
+            }
+        }
+        contours.push(LassoContour { points });
+    }
+    contours
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LassoDashSegment {
+    start: (f32, f32),
+    end: (f32, f32),
+    dash_index: i32,
+}
+
+fn lasso_dash_segments(points: &[(f32, f32)], phase: f32) -> Vec<LassoDashSegment> {
+    const DASH: f32 = 4.0;
+    let mut segments = Vec::new();
+    let mut distance = 0.0;
+    for edge in points.windows(2) {
+        let start = edge[0];
+        let end = edge[1];
+        let length = (end.0 - start.0).abs() + (end.1 - start.1).abs();
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let direction = ((end.0 - start.0) / length, (end.1 - start.1) / length);
+        let mut dash_index = ((distance - phase) / DASH).floor() as i32;
+        let mut offset = (dash_index + 1) as f32 * DASH - (distance - phase);
+        let mut segment_start = 0.0;
+        while segment_start < length {
+            let segment_end = offset.min(length);
+            if segment_end > segment_start {
+                segments.push(LassoDashSegment {
+                    start: (
+                        start.0 + direction.0 * segment_start,
+                        start.1 + direction.1 * segment_start,
+                    ),
+                    end: (
+                        start.0 + direction.0 * segment_end,
+                        start.1 + direction.1 * segment_end,
+                    ),
+                    dash_index,
+                });
+            }
+            segment_start = segment_end;
+            offset += DASH;
+            dash_index += 1;
+        }
+        distance += length;
+    }
+    segments
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Lens {
     texture: gdk::Texture,
@@ -347,6 +549,7 @@ mod imp {
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
         pub crop_overlay: RefCell<Option<CropOverlay>>,
+        pub(super) lasso_overlay: RefCell<Option<CachedLassoOverlay>>,
         pub crop_dash_phase: Cell<f32>,
         pub crop_animation_running: Cell<bool>,
         pub measurement_cursor: Cell<Option<(f32, f32)>>,
@@ -408,7 +611,8 @@ mod imp {
                 object.height().max(1) as f32,
             );
             let crop_overlay = *self.crop_overlay.borrow();
-            if crop_overlay.is_some() {
+            let label_overlay = crop_overlay;
+            if label_overlay.is_some() {
                 snapshot.push_blend(gtk::gsk::BlendMode::Difference);
             }
             draw_background(
@@ -529,18 +733,27 @@ mod imp {
             if let Some((x, y)) = self.marker.get() {
                 draw_marker(snapshot, bounds, x, y);
             }
-            if let Some(image_bounds) = image_bounds
-                && let Some(overlay) = crop_overlay
-            {
-                draw_crop_overlay(
-                    snapshot,
-                    image_bounds,
-                    &overlay,
-                    self.render_scale.get(),
-                    self.crop_dash_phase.get(),
-                );
+            if let Some(image_bounds) = image_bounds {
+                if let Some(overlay) = crop_overlay {
+                    draw_crop_overlay(
+                        snapshot,
+                        image_bounds,
+                        &overlay,
+                        self.render_scale.get(),
+                        self.crop_dash_phase.get(),
+                    );
+                }
+                if let Some(lasso) = self.lasso_overlay.borrow().as_ref() {
+                    draw_lasso_overlay(
+                        snapshot,
+                        image_bounds,
+                        lasso,
+                        self.render_scale.get(),
+                        self.crop_dash_phase.get(),
+                    );
+                }
             }
-            if let Some(overlay) = crop_overlay {
+            if let Some(overlay) = label_overlay {
                 // The completed canvas is the bottom of the Difference blend;
                 // labels make up its top child.
                 snapshot.pop();
@@ -899,6 +1112,54 @@ mod imp {
         let rect = overlay_rect(image_bounds, overlay);
         draw_dashed_crop_border(snapshot, rect, render_scale, dash_phase);
         draw_crop_handles(snapshot, rect);
+    }
+
+    fn draw_lasso_overlay(
+        snapshot: &gtk::Snapshot,
+        image_bounds: gtk::graphene::Rect,
+        overlay: &CachedLassoOverlay,
+        render_scale: f64,
+        phase: f32,
+    ) {
+        let scale_x = image_bounds.width() / overlay.overlay.crop.image_width.max(1) as f32;
+        let scale_y = image_bounds.height() / overlay.overlay.crop.image_height.max(1) as f32;
+        let thickness = 1.0 / sanitized_render_scale(render_scale) as f32;
+        for contour in &overlay.contours {
+            let points = contour
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    (
+                        image_bounds.x() + (overlay.overlay.origin_x as f32 + x as f32) * scale_x,
+                        image_bounds.y() + (overlay.overlay.origin_y as f32 + y as f32) * scale_y,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for segment in lasso_dash_segments(&points, phase) {
+                let color = if segment.dash_index.rem_euclid(2) == 0 {
+                    &gdk::RGBA::BLACK
+                } else {
+                    &gdk::RGBA::WHITE
+                };
+                let horizontal = (segment.start.1 - segment.end.1).abs() <= f32::EPSILON;
+                let rect = if horizontal {
+                    gtk::graphene::Rect::new(
+                        segment.start.0.min(segment.end.0),
+                        segment.start.1 - thickness / 2.0,
+                        (segment.end.0 - segment.start.0).abs(),
+                        thickness,
+                    )
+                } else {
+                    gtk::graphene::Rect::new(
+                        segment.start.0 - thickness / 2.0,
+                        segment.start.1.min(segment.end.1),
+                        thickness,
+                        (segment.end.1 - segment.start.1).abs(),
+                    )
+                };
+                snapshot.append_color(color, &rect);
+            }
+        }
     }
 
     fn draw_measurement_cursor(
@@ -1325,31 +1586,63 @@ impl ImageCanvas {
         if self.imp().crop_overlay.replace(overlay) == overlay {
             return;
         }
-        if overlay.is_some() && !self.imp().crop_animation_running.replace(true) {
-            let canvas = self.downgrade();
-            self.add_tick_callback(move |_, frame_clock| {
-                let Some(canvas) = canvas.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-                if canvas.imp().crop_overlay.borrow().is_none() {
-                    canvas.imp().crop_dash_phase.set(0.0);
-                    canvas.imp().crop_animation_running.set(false);
-                    return glib::ControlFlow::Break;
-                }
-                if canvas.settings().is_gtk_enable_animations() {
-                    let seconds = frame_clock.frame_time() as f64 / 1_000_000.0;
-                    canvas
-                        .imp()
-                        .crop_dash_phase
-                        .set((seconds * 16.0).rem_euclid(8.0) as f32);
-                    canvas.queue_draw();
-                } else if canvas.imp().crop_dash_phase.replace(0.0) != 0.0 {
-                    canvas.queue_draw();
-                }
-                glib::ControlFlow::Continue
-            });
+        if overlay.is_some() {
+            self.ensure_selection_animation();
         }
         self.queue_draw();
+    }
+
+    fn ensure_selection_animation(&self) {
+        if self.imp().crop_animation_running.replace(true) {
+            return;
+        }
+        let canvas = self.downgrade();
+        self.add_tick_callback(move |_, frame_clock| {
+            let Some(canvas) = canvas.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if canvas.imp().crop_overlay.borrow().is_none()
+                && canvas.imp().lasso_overlay.borrow().is_none()
+            {
+                canvas.imp().crop_dash_phase.set(0.0);
+                canvas.imp().crop_animation_running.set(false);
+                return glib::ControlFlow::Break;
+            }
+            if canvas.settings().is_gtk_enable_animations() {
+                let seconds = frame_clock.frame_time() as f64 / 1_000_000.0;
+                canvas
+                    .imp()
+                    .crop_dash_phase
+                    .set((seconds * 16.0).rem_euclid(8.0) as f32);
+                canvas.queue_draw();
+            } else if canvas.imp().crop_dash_phase.replace(0.0) != 0.0 {
+                canvas.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    pub fn set_lasso_overlay(&self, overlay: Option<LassoOverlay>) {
+        let mut cached = self.imp().lasso_overlay.borrow_mut();
+        let had_overlay = cached.is_some();
+        match overlay {
+            Some(overlay)
+                if cached
+                    .as_ref()
+                    .is_some_and(|current| current.can_rebase_to(&overlay)) =>
+            {
+                cached.as_mut().expect("checked lasso cache").overlay = overlay;
+            }
+            Some(overlay) => *cached = Some(CachedLassoOverlay::new(overlay)),
+            None => *cached = None,
+        }
+        if had_overlay || cached.is_some() {
+            drop(cached);
+            if self.imp().lasso_overlay.borrow().is_some() {
+                self.ensure_selection_animation();
+            }
+            self.queue_draw();
+        }
     }
 
     pub fn set_measurement_cursor(&self, cursor: Option<(f32, f32)>) {
@@ -1465,6 +1758,21 @@ impl ImageCanvas {
         ))
     }
 
+    /// Bounds for an activated foreground whose origin can be outside the
+    /// canvas. The image itself stays the same size.
+    pub fn lasso_display_bounds(&self, overlay: &LassoOverlay) -> Option<gtk::graphene::Rect> {
+        let texture = self.texture()?;
+        let image_bounds = self.image_bounds_for_texture(&texture);
+        let scale_x = image_bounds.width() / overlay.crop.image_width.max(1) as f32;
+        let scale_y = image_bounds.height() / overlay.crop.image_height.max(1) as f32;
+        Some(gtk::graphene::Rect::new(
+            image_bounds.x() + overlay.origin_x as f32 * scale_x,
+            image_bounds.y() + overlay.origin_y as f32 * scale_y,
+            overlay.crop.width as f32 * scale_x,
+            overlay.crop.height as f32 * scale_y,
+        ))
+    }
+
     pub fn pixel_at(&self, x: f64, y: f64) -> Option<(u32, u32)> {
         let texture = self.texture()?;
         let normalized = self.normalized_at(x, y)?;
@@ -1521,6 +1829,21 @@ impl ImageCanvas {
             normalized,
             (texture.width() as u32, texture.height() as u32),
         ))
+    }
+
+    /// Converts a widget point to a pixel boundary without clipping it to the
+    /// image. Drag deltas use this so an activated cutout can cross every edge.
+    pub fn unclamped_pixel_boundary_at(&self, x: f64, y: f64) -> Option<(i64, i64)> {
+        let texture = self.texture()?;
+        let bounds = self.image_bounds_for_texture(&texture);
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            return None;
+        }
+        let pixel_x =
+            (x - f64::from(bounds.x())) / f64::from(bounds.width()) * f64::from(texture.width());
+        let pixel_y =
+            (y - f64::from(bounds.y())) / f64::from(bounds.height()) * f64::from(texture.height());
+        Some((pixel_x.round() as i64, pixel_y.round() as i64))
     }
 
     pub fn set_accessible_label(&self, label: &str) {
@@ -1670,6 +1993,200 @@ mod tests {
     use crate::document::{
         AnnotationId, BrushPoint, PencilGeometry, Rect, Shape, StrokePath, StrokeStyle,
     };
+    use std::collections::{BTreeMap, HashSet};
+
+    fn mask_with_opaque_pixels(width: u32, height: u32, pixels: &[(u32, u32)]) -> image::GrayImage {
+        let mut mask = image::GrayImage::new(width, height);
+        for &(x, y) in pixels {
+            mask.get_pixel_mut(x, y)[0] = 255;
+        }
+        mask
+    }
+
+    fn exposed_edges(mask: &image::GrayImage) -> HashSet<LassoBoundaryEdge> {
+        let mut edges = HashSet::new();
+        for y in 0..mask.height() {
+            for x in 0..mask.width() {
+                if !opaque_mask_pixel(mask, i64::from(x), i64::from(y)) {
+                    continue;
+                }
+                if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) - 1) {
+                    edges.insert(LassoBoundaryEdge {
+                        start: (x, y),
+                        end: (x + 1, y),
+                    });
+                }
+                if !opaque_mask_pixel(mask, i64::from(x) + 1, i64::from(y)) {
+                    edges.insert(LassoBoundaryEdge {
+                        start: (x + 1, y),
+                        end: (x + 1, y + 1),
+                    });
+                }
+                if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) + 1) {
+                    edges.insert(LassoBoundaryEdge {
+                        start: (x + 1, y + 1),
+                        end: (x, y + 1),
+                    });
+                }
+                if !opaque_mask_pixel(mask, i64::from(x) - 1, i64::from(y)) {
+                    edges.insert(LassoBoundaryEdge {
+                        start: (x, y + 1),
+                        end: (x, y),
+                    });
+                }
+            }
+        }
+        edges
+    }
+
+    fn assert_complete_closed_contours(mask: &image::GrayImage, expected_loops: usize) {
+        let contours = trace_lasso_contours(mask);
+        assert_eq!(contours.len(), expected_loops);
+        let edges = contours
+            .iter()
+            .flat_map(|contour| {
+                assert_eq!(contour.points.first(), contour.points.last());
+                contour.points.windows(2).map(|points| LassoBoundaryEdge {
+                    start: points[0],
+                    end: points[1],
+                })
+            })
+            .collect::<Vec<_>>();
+        let unique = edges.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            edges.len(),
+            unique.len(),
+            "a boundary edge was traced twice"
+        );
+        assert_eq!(unique, exposed_edges(mask), "a boundary edge was missed");
+    }
+
+    #[test]
+    fn lasso_contours_include_holes_and_disconnected_components_once() {
+        let mask = mask_with_opaque_pixels(
+            7,
+            5,
+            &[
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (1, 2),
+                (3, 2),
+                (1, 3),
+                (2, 3),
+                (3, 3),
+                (6, 0),
+            ],
+        );
+        assert_complete_closed_contours(&mask, 3);
+    }
+
+    #[test]
+    fn lasso_contours_keep_diagonal_contacts_as_separate_loops() {
+        let mask = mask_with_opaque_pixels(2, 2, &[(0, 0), (1, 1)]);
+        assert_complete_closed_contours(&mask, 2);
+    }
+
+    #[test]
+    fn lasso_contours_cover_every_tiny_binary_matte_boundary_once() {
+        for bits in 0_u16..(1 << 9) {
+            let pixels = (0..9)
+                .filter(|index| bits & (1 << index) != 0)
+                .map(|index| ((index % 3) as u32, (index / 3) as u32))
+                .collect::<Vec<_>>();
+            let mask = mask_with_opaque_pixels(3, 3, &pixels);
+            let contours = trace_lasso_contours(&mask);
+            let edges = contours
+                .iter()
+                .flat_map(|contour| contour.points.windows(2))
+                .map(|points| LassoBoundaryEdge {
+                    start: points[0],
+                    end: points[1],
+                })
+                .collect::<Vec<_>>();
+            let unique = edges.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(
+                edges.len(),
+                unique.len(),
+                "duplicate boundary for matte {bits:09b}"
+            );
+            assert_eq!(
+                unique,
+                exposed_edges(&mask),
+                "missing boundary for matte {bits:09b}"
+            );
+            assert!(
+                contours
+                    .iter()
+                    .all(|contour| contour.points.first() == contour.points.last())
+            );
+        }
+    }
+
+    #[test]
+    fn lasso_dashes_stay_four_screen_pixels_through_high_zoom_corners() {
+        // Five source pixels at 7.4x zoom creates 37px sides, forcing dashes
+        // to continue across corners rather than restarting on every edge.
+        let segments = lasso_dash_segments(
+            &[
+                (0.0, 0.0),
+                (37.0, 0.0),
+                (37.0, 37.0),
+                (0.0, 37.0),
+                (0.0, 0.0),
+            ],
+            0.0,
+        );
+        let mut lengths = BTreeMap::<i32, f32>::new();
+        let mut pieces = BTreeMap::<i32, usize>::new();
+        for segment in segments {
+            let length =
+                (segment.end.0 - segment.start.0).abs() + (segment.end.1 - segment.start.1).abs();
+            *lengths.entry(segment.dash_index).or_default() += length;
+            *pieces.entry(segment.dash_index).or_default() += 1;
+        }
+        assert!(pieces.values().any(|&count| count > 1));
+        for (&index, &length) in &lengths {
+            assert!(
+                (length - 4.0).abs() <= f32::EPSILON,
+                "dash {index} was {length}px"
+            );
+        }
+    }
+
+    #[test]
+    fn lasso_cache_survives_a_same_matte_drag() {
+        let mask = Arc::new(mask_with_opaque_pixels(2, 2, &[(0, 0), (1, 0)]));
+        let crop = CropOverlay {
+            x: 3,
+            y: 4,
+            width: 2,
+            height: 2,
+            image_width: 16,
+            image_height: 16,
+        };
+        let mut cached = CachedLassoOverlay::new(LassoOverlay {
+            crop,
+            mask: mask.clone(),
+            origin_x: i64::from(crop.x),
+            origin_y: i64::from(crop.y),
+        });
+        let contour_buffer = cached.contours.as_ptr();
+        let rebased = LassoOverlay {
+            crop: CropOverlay {
+                x: 9,
+                y: 10,
+                ..crop
+            },
+            mask,
+            origin_x: 7,
+            origin_y: -3,
+        };
+        assert!(cached.can_rebase_to(&rebased));
+        cached.overlay = rebased;
+        assert_eq!(cached.contours.as_ptr(), contour_buffer);
+        assert_eq!((cached.overlay.crop.x, cached.overlay.crop.y), (9, 10));
+    }
 
     #[test]
     fn committed_annotation_preview_stays_visible_until_document_render_finishes() {

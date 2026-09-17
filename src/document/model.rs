@@ -264,6 +264,7 @@ fn apply_operation(
 ) -> Result<RgbaImage> {
     let dynamic = DynamicImage::ImageRgba8(pixels);
     let rendered = match operation {
+        Operation::SelectionEdit { pixels, .. } => return Ok(pixels.as_ref().clone()),
         Operation::ResizeCanvas {
             width,
             height,
@@ -536,24 +537,47 @@ mod tests {
     }
 
     #[test]
-    fn deleting_multiple_annotations_is_one_undo_step() {
+    fn selection_snapshot_flattens_annotations_and_undo_restores_them() {
         let mut document = annotation_document();
-        for id in 1..=3 {
-            document.apply(Operation::Annotate(AnnotationEdit::Create(highlight(
-                id,
-                id as f32 * 20.0,
-            ))));
-        }
-        let original = document.annotations();
-        document.apply(Operation::Annotate(AnnotationEdit::DeleteMany(vec![
-            AnnotationId(1),
-            AnnotationId(3),
-        ])));
-        assert_eq!(document.annotations(), vec![original[1].clone()]);
+        let annotation = highlight(1, 8.0);
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            annotation.clone(),
+        )));
+        let before = document
+            .render(&CancellationToken::default())
+            .unwrap()
+            .pixels;
+        let mut edited = before.clone();
+        edited.put_pixel(0, 0, Rgba([0, 0, 0, 0]));
+        document.apply(Operation::SelectionEdit {
+            pixels: Arc::new(edited.clone()),
+            flattened_annotations: vec![annotation.id],
+        });
+        assert!(document.annotations().is_empty());
+        assert_eq!(
+            document
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            edited
+        );
         assert!(document.undo());
-        assert_eq!(document.annotations(), original);
+        assert_eq!(document.annotations(), vec![annotation]);
+        assert_eq!(
+            document
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            before
+        );
         assert!(document.redo());
-        assert_eq!(document.annotations(), vec![original[1].clone()]);
+        assert_eq!(
+            document
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            edited
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
     "--socket=wayland",
     "--socket=fallback-x11",
     "--device=dri",
+    "--talk-name=org.freedesktop.Flatpak",
     "--filesystem=host",
     "--filesystem=/tmp"
   ],

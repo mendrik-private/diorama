@@ -749,6 +749,7 @@ fn rendered_bounds(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn contained_in(annotation: &Annotation, dimensions: (u32, u32), rect: Rect) -> bool {
     annotation_bounds(annotation, dimensions).is_some_and(|bounds| {
         bounds.min_x >= rect.x

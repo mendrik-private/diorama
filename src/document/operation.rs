@@ -1,3 +1,5 @@
+use super::AnnotationId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
     Clockwise90,
@@ -70,6 +72,12 @@ pub struct ProtectedColor(pub [u8; 4]);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
+    /// A flattened selection edit. `pixels` is a complete, post-edit canvas so
+    /// the operation remains a single undo entry even when it cuts annotations.
+    SelectionEdit {
+        pixels: std::sync::Arc<image::RgbaImage>,
+        flattened_annotations: Vec<AnnotationId>,
+    },
     ResizeCanvas {
         width: u32,
         height: u32,
