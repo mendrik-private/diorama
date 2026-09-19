@@ -8,7 +8,7 @@ use image::{DynamicImage, ImageDecoder, ImageReader};
 use crate::document::{ImageSource, Metadata};
 use crate::error::{AppError, Result};
 
-const DEFAULT_MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_DECODED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
@@ -257,12 +257,13 @@ mod tests {
     }
 
     #[test]
-    fn default_memory_limit_accepts_one_gibibyte_boundary() {
+    fn default_memory_limit_accepts_four_gibibyte_boundary() {
         let limits = DecodeLimits::default();
 
-        assert_eq!(limits.max_decoded_bytes, 1024 * 1024 * 1024);
-        assert!(enforce_limits(65_536, 4_096, limits).is_ok());
-        assert!(enforce_limits(65_536, 4_097, limits).is_err());
+        assert_eq!(limits.max_decoded_bytes, 4 * 1024 * 1024 * 1024);
+        assert!(enforce_limits(65_536, 4_097, limits).is_ok());
+        assert!(enforce_limits(65_536, 16_384, limits).is_ok());
+        assert!(enforce_limits(65_536, 16_385, limits).is_err());
     }
 
     #[test]

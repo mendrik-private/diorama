@@ -1,5 +1,10 @@
 # Game Asset performance
 
+> Historical report: these measurements, solver details, and exact-output CRCs
+> apply only to the retired biharmonic/area-projection pipeline. They are not a
+> performance or correctness contract for the current Lanczos3-plus-halo scaler;
+> no current performance claim is made without a new measurement.
+
 ## Contract and measurement
 
 Preserve the reviewed 800×800 elf at 128, 160 and 200 pixels exactly. Preserve

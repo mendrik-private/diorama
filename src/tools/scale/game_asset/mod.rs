@@ -1,5 +1,5 @@
 //! Game Asset reduction: direction-merged contours, source-width opacity,
-//! tight antialiasing, and biharmonic texture repair with area projection.
+//! tight antialiasing, and Lanczos3 source fill with bounded halo tone-down.
 use crate::{
     document::{CancellationToken, GameAssetAa},
     error::{AppError, Result},
@@ -9,17 +9,17 @@ use std::sync::{Arc, Mutex};
 mod antialias;
 #[cfg(test)]
 mod benchmarks;
-mod biharmonic;
 mod cleanup;
 mod color;
 mod contours;
 mod coverage;
 mod detect;
 mod field;
+mod halo;
 mod ink;
+mod lanczos;
 mod opacity;
 mod paint;
-mod project;
 mod raster;
 mod silhouette;
 mod smoothing;
@@ -29,7 +29,7 @@ mod strokes;
 mod tests;
 const MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
 // The source phase keeps the established 512 B/pixel allowance for analysis,
-// contour storage and the sparse repair solve.  Target data is not concurrent
+// contour storage and source resampling. Target data is not concurrent
 // with analysis, but can contain two linear images, contour ownership/colors,
 // support/opacity projections, the output and cache; 160 B/pixel conservatively
 // accounts for that composition peak.  This is phase-aware without weakening
@@ -146,9 +146,9 @@ impl Prepared {
         } else {
             None
         };
-        let repair_source = isolated.as_ref().unwrap_or(&self.linear);
-        let repaired = biharmonic::repair(repair_source, &retained_mask, cancel)?;
-        let base = project::area(&repaired, w as usize, h as usize, cancel)?;
+        let fill_source = isolated.as_ref().unwrap_or(&self.linear);
+        let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
+        let base = halo::apply(fill_source, &retained_mask, base, &strokes.core, cancel)?;
         let fill = if let Some(silhouette) = &self.silhouette {
             let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
             let retained_coverage =
@@ -161,7 +161,7 @@ impl Prepared {
                 cancel,
             )?;
             let opacity = silhouette.intrinsic_opacity(
-                repair_source,
+                fill_source,
                 &source_coverage,
                 w as usize,
                 h as usize,

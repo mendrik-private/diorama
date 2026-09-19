@@ -131,7 +131,7 @@ window responsive while larger edits render.
 - Preview scaling fitted to the window or at actual output-pixel size, and hold
   a control to compare against the original.
 - Choose nearest-neighbor, bicubic, Lanczos, or contour-preserving Game Asset
-  scaling with biharmonic texture filling.
+  scaling with direct Lanczos3 source filling and bounded halo correction.
 - Game Asset uses final contour cores with conservative source support to
   separate transparent or confidently flat-canvas assets; opaque images with
   uncertain backgrounds stay on the normal filtering path rather than guessing

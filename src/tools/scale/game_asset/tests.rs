@@ -1,32 +1,6 @@
 use super::*;
 use crate::document::{Document, ImageSource, Metadata, Operation, Resampling};
 
-fn legacy_resize(
-    prepared: &Prepared,
-    source: &RgbaImage,
-    w: u32,
-    h: u32,
-    aa: GameAssetAa,
-    cancel: &CancellationToken,
-) -> RgbaImage {
-    let TargetContours { strokes, colors } = prepared
-        .target_contours(source, w, h, aa, cancel)
-        .expect("legacy contours");
-    let strength = opacity::calculate(&prepared.widths, &strokes.core, &strokes.owners);
-    let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
-    let scale = [
-        w as f64 / source.width() as f64,
-        h as f64 / source.height() as f64,
-    ];
-    let retained = prepared
-        .contours
-        .retained_ink_mask(&prepared.mask, scale, cancel)
-        .expect("legacy retained mask");
-    let repaired = biharmonic::repair(&prepared.linear, &retained, cancel).expect("legacy repair");
-    let base = project::area(&repaired, w as usize, h as usize, cancel).expect("legacy area");
-    paint::composite(&base, &colors, &paint)
-}
-
 fn outlined_fixture(transparent: bool) -> RgbaImage {
     RgbaImage::from_fn(64, 60, |x, y| {
         let inside = (17..47).contains(&x) && (14..48).contains(&y);
@@ -48,19 +22,12 @@ fn outlined_fixture(transparent: bool) -> RgbaImage {
     })
 }
 
-fn source_alpha_footprint(
-    source: &RgbaImage,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-) -> (bool, bool, f64, f64) {
+fn source_alpha_footprint(source: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> (bool, f64, f64) {
     let sx = source.width() as f64 / w as f64;
     let sy = source.height() as f64 / h as f64;
     let (left, right) = (x as f64 * sx, (x + 1) as f64 * sx);
     let (top, bottom) = (y as f64 * sy, (y + 1) as f64 * sy);
     let mut all_zero = true;
-    let mut all_solid = true;
     let mut alpha = 0.;
     let mut support = 0.;
     for yy in top.floor() as u32..(bottom.ceil() as u32).min(source.height()) {
@@ -69,16 +36,56 @@ fn source_alpha_footprint(
             let xw = (right.min((xx + 1) as f64) - left.max(xx as f64)) / sx;
             let sample = source.get_pixel(xx, yy)[3];
             all_zero &= sample == 0;
-            all_solid &= sample >= 128;
             alpha += f64::from(sample) / 255. * xw * yw;
             support += f64::from(sample != 0) * xw * yw;
         }
     }
-    (all_zero, all_solid, alpha, support)
+    (all_zero, alpha, support)
+}
+
+/// Independent test oracle for direct source sampling. This intentionally
+/// performs its own f32 premultiplied conversion and `image` Lanczos call,
+/// rather than invoking the production Game Asset helper.
+fn direct_source_lanczos_oracle(source: &color::LinearImage, w: u32, h: u32) -> RgbaImage {
+    let samples: Vec<f32> = source
+        .pixels
+        .iter()
+        .flat_map(|sample| {
+            let alpha = sample[3] as f32;
+            [
+                sample[0] as f32 * alpha,
+                sample[1] as f32 * alpha,
+                sample[2] as f32 * alpha,
+                alpha,
+            ]
+        })
+        .collect();
+    let premultiplied = image::ImageBuffer::<image::Rgba<f32>, Vec<f32>>::from_vec(
+        source.w as u32,
+        source.h as u32,
+        samples,
+    )
+    .expect("linear source dimensions match its samples");
+    let resized =
+        image::imageops::resize(&premultiplied, w, h, image::imageops::FilterType::Lanczos3);
+    RgbaImage::from_fn(w, h, |x, y| {
+        let sample = resized.get_pixel(x, y);
+        let alpha = f64::from(sample[3]).clamp(0., 1.);
+        color::rgba(if alpha <= 1e-8 {
+            [0.; 4]
+        } else {
+            [
+                (f64::from(sample[0]) / alpha).clamp(0., 1.),
+                (f64::from(sample[1]) / alpha).clamp(0., 1.),
+                (f64::from(sample[2]) / alpha).clamp(0., 1.),
+                alpha,
+            ]
+        })
+    })
 }
 
 #[test]
-fn silhouette_removes_legacy_exterior_halo_without_changing_deep_area_color() {
+fn silhouette_keeps_exterior_and_transparent_hidden_rgb_isolated() {
     let source = Arc::new(outlined_fixture(false));
     let cancel = CancellationToken::default();
     let session = Session::new(source.clone());
@@ -86,32 +93,19 @@ fn silhouette_removes_legacy_exterior_halo_without_changing_deep_area_color() {
         .resize(31, 29, GameAssetAa::new(0), &cancel)
         .unwrap();
     let prepared = session.cache.lock().unwrap().prepared.clone().unwrap();
-    let legacy = legacy_resize(&prepared, &source, 31, 29, GameAssetAa::new(0), &cancel);
     let silhouette = prepared.silhouette.as_ref().unwrap();
     let coverage = silhouette.coverage(31, 29, &cancel).unwrap();
     let target = prepared
         .target_contours(&source, 31, 29, GameAssetAa::new(0), &cancel)
         .unwrap();
-    let background = image::Rgba([37, 83, 149, 255]);
-    let halo = (0..coverage.len()).find(|&i| {
-        coverage[i] < 0.5
-            && target.strokes.coverage.as_raw()[i] == 0
-            && *current.get_pixel((i % 31) as u32, (i / 31) as u32) == background
-            && current.get_pixel((i % 31) as u32, (i / 31) as u32)
-                != legacy.get_pixel((i % 31) as u32, (i / 31) as u32)
-    });
     assert!(
-        halo.is_some(),
-        "fixture must reproduce a legacy exterior halo"
+        (0..coverage.len()).any(|i| {
+            coverage[i] < 0.5
+                && target.strokes.coverage.as_raw()[i] == 0
+                && current.as_raw()[i * 4..i * 4 + 4] == [37, 83, 149, 255]
+        }),
+        "fixture must preserve an unpainted opaque exterior"
     );
-
-    // This target cell maps entirely inside the smooth fill, away from its
-    // outline.  The support path must retain the established AREA interior.
-    let old_area = project::area(&prepared.linear, 31, 29, &cancel).unwrap();
-    let i = 21 * 31 + 19;
-    let expected = color::rgba(old_area.pixels[i]);
-    assert_eq!(*current.get_pixel(19, 21), expected);
-
     let transparent = Arc::new(outlined_fixture(true));
     let transparent_session = Session::new(transparent);
     let transparent_result = transparent_session
@@ -238,191 +232,47 @@ fn elf_bow_connection_survives_silhouette_clipping_at_all_aa_levels() {
     }
 }
 
-/// Opt-in visual harness for the real reported asset.  It deliberately has no
-/// fixture dependency in the normal test suite; set both variables to write
-/// directly comparable legacy and candidate images.
 #[test]
-#[ignore = "manual external-asset verification"]
-fn writes_wizard_halo_artifacts_when_requested() {
-    let Ok(input) = std::env::var("DIORAMA_GAME_ASSET_HALO_INPUT") else {
-        return;
-    };
-    let directory = std::env::var("DIORAMA_GAME_ASSET_HALO_ARTIFACTS")
-        .expect("artifact directory is required with halo input");
-    std::fs::create_dir_all(&directory).unwrap();
-    let source = Arc::new(image::open(input).unwrap().into_rgba8());
-    let session = Session::new(source.clone());
-    let cancel = CancellationToken::default();
-    for size in [159, 160, 161] {
-        let after = session
-            .resize(size, size, GameAssetAa::new(0), &cancel)
-            .unwrap();
-        let prepared = session.cache.lock().unwrap().prepared.clone().unwrap();
-        let before = legacy_resize(&prepared, &source, size, size, GameAssetAa::new(0), &cancel);
-        before
-            .save(format!("{directory}/wizard-{size}-aa0-before.png"))
-            .unwrap();
-        after
-            .save(format!("{directory}/wizard-{size}-aa0-after.png"))
-            .unwrap();
-        let x = 70.min(size - 1);
-        let y = 12.min(size - 1);
-        let width = 55.min(size - x);
-        let height = 55.min(size - y);
-        for (name, image) in [("before", &before), ("after", &after)] {
-            let crop = image::imageops::crop_imm(image, x, y, width, height).to_image();
-            image::imageops::resize(
-                &crop,
-                width * 8,
-                height * 8,
-                image::imageops::FilterType::Nearest,
-            )
-            .save(format!("{directory}/wizard-{size}-aa0-{name}-hood-x8.png"))
-            .unwrap();
-        }
-    }
-    for &(w, h) in &[
-        (32, 32),
-        (64, 64),
-        (96, 96),
-        (128, 128),
-        (159, 159),
-        (160, 160),
-        (161, 161),
-        (200, 200),
-        (256, 256),
-        (512, 512),
-        (1253, 1253),
-        (1254, 1254),
-        (160, 97),
-        (97, 160),
-    ] {
-        assert_eq!(
-            session
-                .resize(w, h, GameAssetAa::new(0), &cancel)
-                .unwrap()
-                .dimensions(),
-            (w, h)
-        );
-    }
-    let elf = Arc::new(
-        image::load_from_memory(include_bytes!("fixtures/elf.png"))
-            .unwrap()
-            .into_rgba8(),
-    );
-    let elf_session = Session::new(elf);
-    for size in [128, 160, 200] {
-        for aa in [GameAssetAa::new(0), GameAssetAa::default()] {
-            elf_session
-                .resize(size, size, aa, &cancel)
-                .unwrap()
-                .save(format!(
-                    "{directory}/elf-transparent-{size}-aa{}-after.png",
-                    aa.percent()
-                ))
-                .unwrap();
-        }
-    }
-}
-#[test]
-fn reviewed_manual_aa_and_independent_background_at_all_sizes() {
+fn direct_lanczos_source_oracle_and_silhouette_support_hold_at_all_sizes() {
     let source = Arc::new(
         image::load_from_memory(include_bytes!("fixtures/elf.png"))
             .unwrap()
             .into_rgba8(),
     );
     let session = Session::new(source.clone());
-    for (size, bytes, legacy) in [
-        (
-            128,
-            include_bytes!("fixtures/elf-aa-128.png").as_slice(),
-            include_bytes!("fixtures/elf-128.png").as_slice(),
-        ),
-        (
-            160,
-            include_bytes!("fixtures/elf-aa-160.png").as_slice(),
-            include_bytes!("fixtures/elf-160.png").as_slice(),
-        ),
-        (
-            200,
-            include_bytes!("fixtures/elf-aa-200.png").as_slice(),
-            include_bytes!("fixtures/elf-200.png").as_slice(),
-        ),
-    ] {
-        let expected = image::load_from_memory(bytes).unwrap().into_rgba8();
+    for size in [128, 160, 200] {
+        let cancel = CancellationToken::default();
         let result = session
-            .resize(
-                size,
-                size,
-                GameAssetAa::default(),
-                &CancellationToken::default(),
-            )
+            .resize(size, size, GameAssetAa::default(), &cancel)
             .unwrap();
-        if let Ok(directory) = std::env::var("DIORAMA_SCALING_ARTIFACTS") {
-            std::fs::create_dir_all(&directory).unwrap();
-            result.save(format!("{directory}/elf-{size}.png")).unwrap();
-        }
-        let differences: Vec<_> = result
-            .as_raw()
-            .iter()
-            .zip(expected.as_raw())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .collect();
-        assert!(
-            differences.is_empty(),
-            "{size}px: {} changed channels; first {:?}",
-            differences.len(),
-            differences.first()
-        );
-        // The reviewed images are visual snapshots, not independent math
-        // oracles. Check source alpha footprints directly: solid (all source
-        // samples alpha >= 128),
-        // unpainted pixels retain legacy parity; empty footprints are exactly
-        // transparent; partial support may change at the silhouette edge but
-        // must not exceed its independently projected intrinsic alpha.
-        let legacy = image::load_from_memory(legacy).unwrap().into_rgba8();
         let prepared = session.cache.lock().unwrap().prepared.clone().unwrap();
+        let fill_source = prepared
+            .silhouette
+            .as_ref()
+            .map(|silhouette| silhouette.isolated(&prepared.linear, &cancel).unwrap())
+            .unwrap_or_else(|| prepared.linear.clone());
+        let base = lanczos::resize(&fill_source, size as usize, size as usize, &cancel).unwrap();
+        let actual = RgbaImage::from_fn(size, size, |x, y| {
+            color::rgba(base.pixels[y as usize * base.w + x as usize])
+        });
+        assert_eq!(
+            actual,
+            direct_source_lanczos_oracle(&fill_source, size, size),
+            "independent direct source Lanczos oracle at {size}px"
+        );
+
         let target = prepared
-            .target_contours(
-                &source,
-                size,
-                size,
-                GameAssetAa::default(),
-                &CancellationToken::default(),
-            )
+            .target_contours(&source, size, size, GameAssetAa::default(), &cancel)
             .unwrap();
-        let core = raster::Mask {
-            w: size as usize,
-            h: size as usize,
-            data: target
-                .strokes
-                .core
-                .as_raw()
-                .iter()
-                .map(|&v| v != 0)
-                .collect(),
-        };
-        let mut checked = 0;
-        let mut full_support_checked = 0;
+        let mut unpainted = 0;
         for y in 0..size {
             for x in 0..size {
                 let i = (y * size + x) as usize;
                 if target.strokes.coverage.as_raw()[i] == 0 {
-                    let (all_zero, all_solid, alpha, support) =
+                    let (all_zero, alpha, support) =
                         source_alpha_footprint(&source, x, y, size, size);
                     if all_zero {
                         assert_eq!(result.get_pixel(x, y), &image::Rgba([0; 4]));
-                    } else if all_solid
-                        && !(-2..=2)
-                            .any(|dy| (-2..=2).any(|dx| core.at(x as isize + dx, y as isize + dy)))
-                    {
-                        assert_eq!(
-                            result.get_pixel(x, y),
-                            legacy.get_pixel(x, y),
-                            "full-support pixel changed at {size}px ({x},{y})"
-                        );
-                        full_support_checked += 1;
                     } else {
                         assert!(
                             f64::from(result.get_pixel(x, y)[3]) / 255.
@@ -430,18 +280,14 @@ fn reviewed_manual_aa_and_independent_background_at_all_sizes() {
                             "partial-support alpha grew at {size}px ({x},{y})"
                         );
                     }
-                    checked += 1;
+                    unpainted += 1;
                 }
                 if target.strokes.core.get_pixel(x, y)[0] != 0 {
                     assert!(target.strokes.coverage.get_pixel(x, y)[0] >= 243);
                 }
             }
         }
-        assert!(checked > size * size / 2);
-        assert!(
-            full_support_checked > 0,
-            "{size}px must exercise full-support legacy parity"
-        );
+        assert!(unpainted > size * size / 2);
     }
 }
 #[test]

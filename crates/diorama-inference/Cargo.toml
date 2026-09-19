@@ -1,0 +1,14 @@
+[package]
+name = "diorama-inference"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+# Keep the CPU fallback usable: Burn's defaults enable SIMD and its bounded
+# CPU threading, which would otherwise be lost with `default-features = false`.
+burn = { version = "0.20.1", default-features = false, features = ["std", "ndarray", "wgpu", "simd"] }
+burn-ndarray = { version = "0.20.1", default-features = false, features = ["simd", "multi-threads"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }

@@ -1,0 +1,6 @@
+option(
+  'native_model_bundle',
+  type: 'string',
+  value: '',
+  description: 'Verified native BiRefNet model bundle directory to install',
+)

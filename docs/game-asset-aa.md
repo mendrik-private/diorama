@@ -58,7 +58,7 @@ between distinct paths. See [the rendering contract](game-asset-scaling.md).
   written 64-by-64 distance oracle checks slopes, phases, caps, clipping and point
   strokes against the 8-by-8 sampler, with a preselected 1/8 coverage tolerance.
 - Cancellation, transparent donors, empty contours, rectangular outputs, cache
-  behavior, the numerical biharmonic solver and linear-light composition remain
+  behavior, direct Lanczos fill, bounded halo correction and linear-light composition remain
   covered by separate tests.
 
 The original targeted regression failed with `selected core has only 166/255 AA
@@ -149,8 +149,9 @@ Hypothesis: bounding supersampling to the contour band and reusing immutable
 topology tables keeps the new AA's end-to-end overhead modest. A material median
 latency increase beyond observed IQR would falsify that expectation. An exploratory
 drake profile (including extra diagnostic contour renders) attributes about 1.2%
-of samples to coverage rasterization; smoothing/spatial queries and the unchanged
-biharmonic solve dominate. This is a profile observation, not a standalone AA timing.
+of samples to coverage rasterization; smoothing/spatial queries and the then-current
+biharmonic solve dominate. This is a historical profile observation, not a standalone
+AA timing for the current Lanczos fill.
 
 Release comparison uses seven measured iterations per version in ABBA blocks of
 3, 3, 4 and 4, with the benchmark's untimed warm-up at each invocation. No local

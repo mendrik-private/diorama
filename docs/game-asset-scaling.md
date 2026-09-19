@@ -92,38 +92,21 @@ compensate. A full-strength contour has at most 10% AA opacity loss at maximum A
 weaker contours retain their separate intrinsic weighting. The bound is on ink
 coverage, not encoded RGB brightness or the alpha of an opaque composited image.
 
-## Biharmonic fill and composition
+## Lanczos fill and composition
 
-The source ink footprint is assigned to its nearest traces. Only ink belonging to
-contours retained at the target size is removed. Discarded traces and ownership
-ties involving a discarded trace keep their source samples. All retained ink is
-removed before shrinking, including the color beneath partially opaque contours.
+The pipeline directly resamples the isolated source once with Lanczos3. It converts
+straight linear RGBA to premultiplied linear RGBA before filtering, then unpremultiplies
+only guarded target pixels. Transparent source pixels therefore contribute no hidden
+RGB. The retained-ink mask is not subtracted from this base.
 
-Repair solves the biharmonic equation on the masked source pixels in premultiplied
-linear RGBA. Its operator is the square of the four-neighbor graph Laplacian, with
-reflecting image boundaries. Known samples form fixed boundary conditions; known
-transparent pixels contribute transparent RGBA, never their hidden RGB. The
-original values of masked pixels are unavailable to the solver.
+A bounded halo pass can tone down dark retained-ink bleed immediately adjacent to a
+drawn contour core. It estimates nearby fill from non-ink samples with a positive
+triangle filter; it never changes core pixels or alpha, only operates in the one-pixel
+core neighborhood, and caps the encoded RGB correction at 12/255.
 
-A sparse system with at most thirteen coefficients per row is solved by
-Jacobi-preconditioned conjugate gradients. RGBA channels share matrix reads while
-retaining independent step sizes, restarts and convergence checks. The Euclidean
-residual must be at most
-`max(1e-12, 1e-12 * ||rhs||)` for each channel, checked with an explicit matrix
-product before accepting convergence. Work is limited to 4,096 iterations per
-channel. Missing boundary data or a failed solve produces an application error;
-no alternative fill is silently substituted.
-
-Repaired channels are clipped to the known source range, then into valid
-premultiplied RGBA. All unmasked source samples remain unchanged. This follows
-[scikit-image's biharmonic reference](https://scikit-image.org/docs/stable/api/skimage.restoration.html#skimage.restoration.inpaint_biharmonic),
-including its channel-range clipping, with an additional premultiplied-alpha
-constraint. Python and scikit-image are not application dependencies.
-
-Two separable passes perform exact fractional rectangular area integration before
-linear-light source-over composition with the unchanged opacity contours. Alpha
-is repaired and projected together with color. Fully transparent output pixels
-encode as transparent black. Game Asset has one recipe with adjustable AA, no RGB
+Silhouette support and intrinsic alpha then compose the fill in linear light before
+the unchanged opacity contours. Fully transparent output pixels encode as transparent
+black. Game Asset has one recipe with adjustable AA, no RGB
 palette quantization and no alternate fill path. The bounded `GameAssetAa` value
 belongs to `Resampling::GameAsset`, so preview, Apply, export and undo/redo carry
 the same setting. The last selected percentage is stored in `game-asset-aa`
@@ -133,30 +116,29 @@ to 50%. Switching to another method hides AA without forgetting the window's val
 ## Bounds and validation
 
 Source analysis and target work check cancellation throughout Gaussian rows, curve
-fitting, tracing, merging, thinning, sparse-system construction, solver iterations and area sampling. Cancelled
+fitting, tracing, merging, thinning, source conversion, resampling, halo correction,
+and composition. Cancelled
 work is never committed as a target result. Heavy work stays outside the session lock.
 A conservative one-GiB working-set envelope and a 500,000 detector-candidate limit reject
 unbounded inputs with application errors instead of silently selecting another method.
 The renderer processes one contour bounding box and one quadratic's flattened
 segments at a time. The immutable topology lookup tables are shared across calls.
 
-The reviewed 800×800 source and 128/160/200 target images in `game_asset/fixtures/`
-are regression fixtures. Original `elf-{size}.png` targets remain the independent
-Python comparison's selected biharmonic outputs; tests require exact RGBA parity
-outside the changed contour neighborhood. `elf-aa-{size}.png` are explicitly
-reviewed snapshots of the new renderer, not independent mathematical oracles.
-Their provenance and the drake check are recorded in [Manual AA validation](game-asset-aa.md).
+The reviewed 800×800 source in `game_asset/fixtures/` remains a regression input.
+The older `elf-{size}.png` and `elf-aa-{size}.png` targets are historical comparison
+artifacts from the prior fill and are not production-output oracles. Their provenance
+and the drake check are recorded in [Manual AA validation](game-asset-aa.md).
 Independent tests cover analytic horizontal coverage, a separate dense distance
 oracle, the 243 core floor, half-opacity fringe thresholds, clean digital runs, duplicate/reversed patches,
-neighboring-contour protection and locked color donors. Numerical tests cover source/image boundary behavior against
-scikit-image, cubic texture continuation, masked-source poisoning, transparency,
-fractional area conservation, rectangular preview/document equivalence, cache
-reuse, cancellation and dimensions.
+neighboring-contour protection and locked color donors. Fill tests independently
+reproduce premultiplied Lanczos sampling and cover transparent RGB, finite output,
+halo locality/core/alpha/cap, rectangular preview/document equivalence, cache reuse,
+cancellation and dimensions.
 
 The Gaussian derivatives share identical vertical passes, use contiguous SIMD
 loops and precompute reflected row indices. An exact 256-entry sRGB decode table
-avoids repeated transfer-function evaluation. Scalar reference tests check both
-the Gaussian results and batched solver bit for bit. Reproducible release
+avoids repeated transfer-function evaluation. Scalar reference tests check the
+Gaussian results bit for bit. Reproducible release
 benchmarks and tradeoffs are documented in [Game Asset performance](game-asset-performance.md).
 
 Historical fill methods, settings UI, and comparison artifacts are preserved on
