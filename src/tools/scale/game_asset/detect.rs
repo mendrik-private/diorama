@@ -62,7 +62,7 @@ pub fn detect(image: &RgbaImage, cancel: &CancellationToken) -> Result<Vec<Sampl
                     let score = contrast * (0.5 + 0.5 * ratio) * (1. - center);
                     if contrast > 0.012 && strongside > 0.055 && ratio > 0.075 {
                         if records.len() >= 500_000 {
-                            return Err(crate::error::AppError::MemoryLimit {
+                            return Err(crate::error::AppError::GameAssetMemoryLimit {
                                 limit_bytes: super::MEMORY_BUDGET,
                             });
                         }

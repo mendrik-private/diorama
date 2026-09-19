@@ -119,7 +119,7 @@ Source analysis and target work check cancellation throughout Gaussian rows, cur
 fitting, tracing, merging, thinning, source conversion, resampling, halo correction,
 and composition. Cancelled
 work is never committed as a target result. Heavy work stays outside the session lock.
-A conservative one-GiB working-set envelope and a 500,000 detector-candidate limit reject
+A conservative four-GiB working-set envelope and a 500,000 detector-candidate limit reject
 unbounded inputs with application errors instead of silently selecting another method.
 The renderer processes one contour bounding box and one quadratic's flattened
 segments at a time. The immutable topology lookup tables are shared across calls.

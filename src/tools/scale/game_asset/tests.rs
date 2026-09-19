@@ -475,7 +475,7 @@ fn retained_ink_excludes_short_neighbors() {
 }
 
 #[test]
-fn cancelled_cached_requests_and_oversized_analysis_are_rejected() {
+fn cancelled_cached_requests_and_working_set_preflight_are_rejected() {
     let session = Session::new(Arc::new(RgbaImage::new(12, 8)));
     session
         .resize(6, 4, GameAssetAa::default(), &CancellationToken::default())
@@ -486,15 +486,26 @@ fn cancelled_cached_requests_and_oversized_analysis_are_rejected() {
         session.resize(6, 4, GameAssetAa::default(), &cancel),
         Err(AppError::Cancelled)
     ));
-    let large = Session::new(Arc::new(RgbaImage::new(2048, 2048)));
-    assert!(matches!(
-        large.resize(
+    assert_eq!(working_set_estimate(2560, 1440, 1280, 720), 2_034_892_800);
+    assert!(check_working_set_budget(2560, 1440, 1280, 720).is_ok());
+    let large = Session::new(Arc::new(RgbaImage::new(4096, 4096)));
+    let error = large
+        .resize(
             128,
             128,
             GameAssetAa::default(),
-            &CancellationToken::default()
-        ),
-        Err(AppError::MemoryLimit { .. })
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Game Asset scaling would exceed the configured 4294967296 byte working-memory limit"
+    );
+    assert!(matches!(
+        error,
+        AppError::GameAssetMemoryLimit {
+            limit_bytes: MEMORY_BUDGET
+        }
     ));
     assert!(large.cache.lock().unwrap().prepared.is_none());
 }

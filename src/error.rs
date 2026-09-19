@@ -12,6 +12,10 @@ pub enum AppError {
     DimensionsTooLarge { width: u32, height: u32 },
     #[error("The decoded image would exceed the configured {limit_bytes} byte memory limit")]
     MemoryLimit { limit_bytes: u64 },
+    #[error(
+        "Game Asset scaling would exceed the configured {limit_bytes} byte working-memory limit"
+    )]
+    GameAssetMemoryLimit { limit_bytes: u64 },
     #[error("The operation was cancelled")]
     Cancelled,
     #[error("The image has no visible content at the selected threshold")]

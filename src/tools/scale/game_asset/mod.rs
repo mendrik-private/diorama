@@ -27,15 +27,35 @@ mod source;
 mod strokes;
 #[cfg(test)]
 mod tests;
-const MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+const MEMORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 // The source phase keeps the established 512 B/pixel allowance for analysis,
 // contour storage and source resampling. Target data is not concurrent
 // with analysis, but can contain two linear images, contour ownership/colors,
 // support/opacity projections, the output and cache; 160 B/pixel conservatively
-// accounts for that composition peak.  This is phase-aware without weakening
-// the explicit 1 GiB source safety limit.
+// accounts for that composition peak. This phase-aware estimate is capped at
+// four GiB, independently of the decoder and canvas safety limits.
 const SOURCE_PHASE_BYTES: u64 = 512;
 const TARGET_PHASE_BYTES: u64 = 160;
+
+fn working_set_estimate(sw: u32, sh: u32, w: u32, h: u32) -> u64 {
+    u64::from(sw)
+        .saturating_mul(u64::from(sh))
+        .saturating_mul(SOURCE_PHASE_BYTES)
+        .saturating_add(
+            u64::from(w)
+                .saturating_mul(u64::from(h))
+                .saturating_mul(TARGET_PHASE_BYTES),
+        )
+}
+
+fn check_working_set_budget(sw: u32, sh: u32, w: u32, h: u32) -> Result<()> {
+    if working_set_estimate(sw, sh, w, h) > MEMORY_BUDGET {
+        return Err(AppError::GameAssetMemoryLimit {
+            limit_bytes: MEMORY_BUDGET,
+        });
+    }
+    Ok(())
+}
 struct Prepared {
     models: Vec<detect::Model>,
     widths: Vec<f64>,
@@ -234,13 +254,7 @@ impl Session {
         if (w, h) == (sw, sh) {
             return Ok((*self.source).clone());
         }
-        let estimate = u64::from(sw) * u64::from(sh) * SOURCE_PHASE_BYTES
-            + u64::from(w) * u64::from(h) * TARGET_PHASE_BYTES;
-        if estimate > MEMORY_BUDGET {
-            return Err(AppError::MemoryLimit {
-                limit_bytes: MEMORY_BUDGET,
-            });
-        }
+        check_working_set_budget(sw, sh, w, h)?;
         let prepared = {
             let cache = self.cache.lock().expect("Game Asset cache poisoned");
             if let Some((key, result)) = &cache.target
