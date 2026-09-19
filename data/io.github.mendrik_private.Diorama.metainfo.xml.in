@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.18" date="2026-09-19">
+      <description>
+        <p>Adds native bundled BiRefNet inference for selection cutouts. Released Flatpaks include the verified model so foreground masks are created without a host-installed Python runtime or inference executable.</p>
+      </description>
+    </release>
     <release version="0.3.17" date="2026-09-19">
       <description>
         <p>Adds opt-in embedded Python runtime packaging for local LaMa inpainting: archives are validated at build and extraction, cached by hash, and run the packaged worker in isolated mode. Published Flatpak releases retain the configured host-Python fallback.</p>
