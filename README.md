@@ -322,9 +322,9 @@ python3 build-aux/setup-lama.py
 
 The worker requires Python with `torch`, `numpy`, and `Pillow`. It runs offline
 and defaults to CPU inference. The setup command records the Python executable
-that has those packages in `~/.config/diorama/lama-runtime.conf`; Flatpak uses
-that host interpreter and the existing host model through its local host-launch
-permission. `DIORAMA_LAMA_PYTHON` selects a Python executable,
+that has those packages in `~/.config/diorama/lama-runtime.conf`; unbundled
+Flatpak builds use that host interpreter and the existing host model through
+their local host-launch permission. `DIORAMA_LAMA_PYTHON` selects a Python executable,
 `DIORAMA_LAMA_MODEL` selects a trusted TorchScript LaMa model, and
 `DIORAMA_LAMA_DEVICE=cuda` selects a supported PyTorch GPU.
 The default model location is `$XDG_CACHE_HOME/diorama/big-lama.pt`, or
@@ -332,6 +332,34 @@ The default model location is `$XDG_CACHE_HOME/diorama/big-lama.pt`, or
 an app-cache model if present, then reuses this host-cache model, so it does not
 download a second copy. The setup script verifies the checksum published by the
 [IOPaint LaMa integration](https://github.com/Sanster/IOPaint/blob/main/iopaint/model/lama.py).
+
+### Optional embedded Python runtime
+
+`DIORAMA_LAMA_PYTHON` takes precedence, followed by an embedded runtime, the
+setup-lama configuration, and finally `python3` on `PATH`. A bundled interpreter
+runs directly inside Flatpak, in isolated Python mode, with its packaged worker.
+The published Flatpak release currently supplies no runtime archive, so it uses
+the configured host Python; embedding is opt-in for builders.
+
+```sh
+# Prepare a relocatable, target-matched CPython prefix first, then install CPU
+# torch, numpy, and Pillow from an audited local wheelhouse into that prefix.
+python3 build-aux/package-python-runtime.py /opt/diorama-python runtime.tar.gz \
+  --target "$(rustc -vV | sed -n 's/^host: //p')"
+DIORAMA_PYTHON_RUNTIME=$PWD/runtime.tar.gz cargo build --release
+# The packer itself has only small, no-download fixtures:
+python3 build-aux/test-package-python-runtime.py
+```
+
+The packer rejects virtualenvs, external standard libraries/dependencies,
+escaping symlinks, special files, and an output inside the prefix. It
+dereferences safe internal symlinks. The archive includes the exact LaMa worker,
+and the build rejects a stale worker archive. Diorama unpacks it once under its
+cache by archive hash; model weights remain externally configured.
+
+CPython extensions and torch wheels are platform/ABI specific. Build the prefix
+for the same Cargo target and libc family as the executable. The embedded runtime
+is large; `--skip-dependency-check` is for fixtures only, never release builds.
 
 Inference uses surrounding image context, a slightly expanded removal mask, and
 at most 1024 pixels on its longest input side to bound laptop memory usage. Only

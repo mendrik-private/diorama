@@ -13,7 +13,7 @@ use image::{GrayImage, Luma, RgbaImage};
 
 use crate::document::CancellationToken;
 use crate::error::{AppError, Result};
-use crate::tools::{crop::CropBounds, selection};
+use crate::tools::{crop::CropBounds, python_runtime, selection};
 
 const WORKER: &str = include_str!("lama_worker.py");
 static INFERENCE: Mutex<()> = Mutex::new(());
@@ -26,6 +26,7 @@ struct Runtime {
     launch: Launch,
     temporary_root: PathBuf,
     host_library_path: Option<String>,
+    bundled: bool,
 }
 
 impl Runtime {
@@ -33,21 +34,39 @@ impl Runtime {
         let launch = launch_mode_from(Path::new("/.flatpak-info"));
         let cache = cache_directory()?;
         let configuration = runtime_configuration(&launch);
+        let explicit_python = std::env::var_os("DIORAMA_LAMA_PYTHON").map(PathBuf::from);
+        let (python, bundled) = python_selection(
+            explicit_python,
+            configuration.python,
+            python_runtime::bundled_runtime_available(),
+        );
         Ok(Self {
-            python: std::env::var_os("DIORAMA_LAMA_PYTHON")
-                .map(PathBuf::from)
-                .or(configuration.python)
-                .unwrap_or_else(|| "python3".into()),
+            python,
             model: std::env::var_os("DIORAMA_LAMA_MODEL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_model_path(&cache)),
             device: std::env::var("DIORAMA_LAMA_DEVICE").unwrap_or_else(|_| "cpu".into()),
             timeout: Duration::from_secs(120),
-            launch,
+            launch: if bundled { Launch::Direct } else { launch },
             temporary_root: cache.join("diorama/inpainting"),
             host_library_path: configuration.library_path,
+            bundled,
         })
     }
+}
+
+fn python_selection(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    bundled_available: bool,
+) -> (PathBuf, bool) {
+    if let Some(python) = explicit {
+        return (python, false);
+    }
+    if bundled_available {
+        return ("python3".into(), true);
+    }
+    (configured.unwrap_or_else(|| "python3".into()), false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,13 +169,7 @@ pub fn clean_background(
     mask: &GrayImage,
     cancellation: &CancellationToken,
 ) -> Result<RgbaImage> {
-    clean_background_with_runtime(
-        image,
-        bounds,
-        mask,
-        cancellation,
-        &Runtime::from_environment()?,
-    )
+    clean_background_with_runtime(image, bounds, mask, cancellation, None)
 }
 
 fn clean_background_with_runtime(
@@ -164,7 +177,7 @@ fn clean_background_with_runtime(
     bounds: CropBounds,
     mask: &GrayImage,
     cancellation: &CancellationToken,
-    runtime: &Runtime,
+    supplied_runtime: Option<&Runtime>,
 ) -> Result<RgbaImage> {
     cancellation.check()?;
     // Validate all bounds before cropping or modifying any pixels.
@@ -193,6 +206,16 @@ fn clean_background_with_runtime(
     }
     let (context, removal) = context_mask(image.dimensions(), bounds, mask);
     let fragment = selection::crop(image, context)?;
+    // Do not resolve or unpack a bundled interpreter until a selection really
+    // requires model inference.
+    let loaded_runtime;
+    let runtime = match supplied_runtime {
+        Some(runtime) => runtime,
+        None => {
+            loaded_runtime = Runtime::from_environment()?;
+            &loaded_runtime
+        }
+    };
     let repaired = run_lama(&fragment, &removal, cancellation, runtime)?;
     cancellation.check()?;
     // Model input is dilated to exclude fringe contamination, but replacement
@@ -274,6 +297,11 @@ fn run_lama(
                 .into(),
         ));
     }
+    cancellation.check()?;
+    let bundled = runtime
+        .bundled
+        .then(|| python_runtime::materialize(&cache_directory()?, cancellation))
+        .transpose()?;
     fs::create_dir_all(&runtime.temporary_root)?;
     // A host-launched worker cannot see Flatpak's private /tmp. App cache is
     // explicitly shared with the host and TempDir removes every input/output
@@ -289,7 +317,7 @@ fn run_lama(
     mask.save(&matte)?;
     let log_file = File::create(&log)?;
     cancellation.check()?;
-    let mut child = lama_command(runtime, &input, &matte, &output)
+    let mut child = lama_command(runtime, bundled.as_ref(), &input, &matte, &output)
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file)
@@ -336,29 +364,52 @@ fn run_lama(
     Ok(repaired)
 }
 
-fn lama_command(runtime: &Runtime, input: &Path, matte: &Path, output: &Path) -> Command {
-    let mut command = match &runtime.launch {
-        Launch::Direct => Command::new(&runtime.python),
-        Launch::FlatpakHost { launcher } => {
-            let mut command = Command::new(launcher);
-            command.args([
-                "--host",
-                "--watch-bus",
-                "--unset-env=LD_LIBRARY_PATH",
-                "--unset-env=LD_PRELOAD",
-            ]);
-            if let Some(library_path) = &runtime.host_library_path {
-                // Restore only the host loader path verified by setup-lama.py,
-                // after stripping the sandbox's loader environment.
-                command.arg(format!("--env=LD_LIBRARY_PATH={library_path}"));
-            }
-            command.arg(&runtime.python);
+fn lama_command(
+    runtime: &Runtime,
+    bundled: Option<&python_runtime::MaterializedRuntime>,
+    input: &Path,
+    matte: &Path,
+    output: &Path,
+) -> Command {
+    let mut command = match bundled {
+        Some(bundled) => {
+            let mut command = Command::new(&bundled.python);
+            command
+                .env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH")
+                .env_remove("PYTHONUSERBASE")
+                .env_remove("LD_LIBRARY_PATH")
+                .env_remove("LD_PRELOAD")
+                .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONSAFEPATH", "1")
+                .arg("-I")
+                .arg(&bundled.worker);
             command
         }
+        None => match &runtime.launch {
+            Launch::Direct => Command::new(&runtime.python),
+            Launch::FlatpakHost { launcher } => {
+                let mut command = Command::new(launcher);
+                command.args([
+                    "--host",
+                    "--watch-bus",
+                    "--unset-env=LD_LIBRARY_PATH",
+                    "--unset-env=LD_PRELOAD",
+                ]);
+                if let Some(library_path) = &runtime.host_library_path {
+                    // Restore only the host loader path verified by setup-lama.py,
+                    // after stripping the sandbox's loader environment.
+                    command.arg(format!("--env=LD_LIBRARY_PATH={library_path}"));
+                }
+                command.arg(&runtime.python);
+                command
+            }
+        },
     };
+    if bundled.is_none() {
+        command.arg("-c").arg(WORKER);
+    }
     command
-        .arg("-c")
-        .arg(WORKER)
         .arg("--model")
         .arg(&runtime.model)
         .arg("--image")
@@ -411,6 +462,7 @@ mod tests {
             launch: Launch::Direct,
             temporary_root: root.join("cache with spaces"),
             host_library_path: None,
+            bundled: false,
         }
     }
 
@@ -469,6 +521,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_selection_prefers_explicit_then_bundle_then_legacy_configuration() {
+        let explicit = PathBuf::from("/explicit/python");
+        let configured = PathBuf::from("/configured/python");
+        assert_eq!(
+            python_selection(Some(explicit.clone()), Some(configured.clone()), true),
+            (explicit, false)
+        );
+        assert_eq!(
+            python_selection(None, Some(configured.clone()), true),
+            (PathBuf::from("python3"), true)
+        );
+        assert_eq!(
+            python_selection(None, Some(configured), false),
+            (PathBuf::from("/configured/python"), false)
+        );
+        assert_eq!(
+            python_selection(None, None, false),
+            (PathBuf::from("python3"), false)
+        );
+    }
+
+    #[test]
     fn host_launcher_preserves_lama_arguments_and_spaced_paths() {
         let runtime = Runtime {
             python: PathBuf::from("/host/python with deps"),
@@ -480,9 +554,11 @@ mod tests {
             },
             temporary_root: PathBuf::from("/host/cache/diorama/inpainting"),
             host_library_path: Some("/host/lib with spaces:/host/rocm/lib".into()),
+            bundled: false,
         };
         let command = lama_command(
             &runtime,
+            None,
             Path::new("/host/cache/input image.png"),
             Path::new("/host/cache/mask image.png"),
             Path::new("/host/cache/output image.png"),
@@ -565,7 +641,7 @@ mod tests {
             bounds(),
             &mask(),
             &CancellationToken::default(),
-            &runtime,
+            Some(&runtime),
         )
         .unwrap();
         assert_eq!(
@@ -600,7 +676,7 @@ mod tests {
             bounds(),
             &mask(),
             &CancellationToken::default(),
-            &runtime,
+            Some(&runtime),
         )
         .unwrap();
         assert!(cleaned.pixels().all(|pixel| pixel[3] == 0));
@@ -617,7 +693,7 @@ mod tests {
             bounds(),
             &mask(),
             &CancellationToken::default(),
-            &runtime,
+            Some(&runtime),
         )
         .unwrap_err();
         assert!(error.to_string().contains("test-lama-failure"));
@@ -634,7 +710,7 @@ mod tests {
                 bounds(),
                 &mask(),
                 &CancellationToken::default(),
-                &runtime
+                Some(&runtime)
             ),
             Err(AppError::InvalidDimensions)
         ));
@@ -653,7 +729,7 @@ mod tests {
         let started = root.path().join("started");
         thread::scope(|scope| {
             let worker = scope.spawn(|| {
-                clean_background_with_runtime(&image, bounds(), &mask(), &token, &runtime)
+                clean_background_with_runtime(&image, bounds(), &mask(), &token, Some(&runtime))
             });
             let deadline = Instant::now() + Duration::from_secs(3);
             while !started.exists() && Instant::now() < deadline {
@@ -669,7 +745,7 @@ mod tests {
             bounds(),
             &mask(),
             &CancellationToken::default(),
-            &runtime,
+            Some(&runtime),
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -690,7 +766,7 @@ mod tests {
         let token = CancellationToken::default();
         let worker_token = token.clone();
         let worker = thread::spawn(move || {
-            clean_background_with_runtime(&image, bounds(), &mask(), &worker_token, &runtime)
+            clean_background_with_runtime(&image, bounds(), &mask(), &worker_token, Some(&runtime))
         });
         thread::sleep(Duration::from_millis(60));
         token.cancel();

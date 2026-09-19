@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.17" date="2026-09-19">
+      <description>
+        <p>Adds opt-in embedded Python runtime packaging for local LaMa inpainting: archives are validated at build and extraction, cached by hash, and run the packaged worker in isolated mode. Published Flatpak releases retain the configured host-Python fallback.</p>
+      </description>
+    </release>
     <release version="0.3.16" date="2026-09-17">
       <description>
         <p>Adds eager local foreground cutouts for rectangle selections: click to activate a contour-following lasso, including holes, then drag it anywhere, including beyond the image. The original area receives cached local LaMa content-aware fill or the detected background or transparency fallback, and every cut, move, and Delete fill can be undone.</p>
