@@ -9,7 +9,7 @@ locale_dir=${MESON_INSTALL_PREFIX:-/usr}/share/locale
 
 if [ "$build_type" = "test" ]; then
   exec env CARGO_TARGET_DIR="$target_dir" DIORAMA_LOCALEDIR="$locale_dir" \
-    cargo test --manifest-path "$source_dir/Cargo.toml"
+    cargo test --manifest-path "$source_dir/Cargo.toml" -- --test-threads=1
 fi
 
 profile=
