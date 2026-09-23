@@ -67,6 +67,13 @@ pub(super) fn resampling_at(index: u32) -> Resampling {
 mod tests {
     use super::super::*;
 
+    fn identity_background_remover(
+        image: &image::RgbaImage,
+        _: &CancellationToken,
+    ) -> crate::error::Result<image::RgbaImage> {
+        Ok(image.clone())
+    }
+
     #[test]
     #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
     fn game_asset_aa_control_updates_preview_and_committed_operation() {
@@ -100,6 +107,13 @@ mod tests {
         window.0.rendered.replace(Some((*source).clone()));
         window.0.content_stack.set_visible_child_name("viewer");
         window.update_action_states();
+        let remove_background = Arc::new(identity_background_remover);
+        let session = Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_background_remover(
+                source.clone(),
+                remove_background,
+            ),
+        );
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(0);
         assert!(!window.0.scale_aa_controls.get_visible());
@@ -122,6 +136,7 @@ mod tests {
         assert_eq!(window.0.scale_aa.value(), 50.);
         assert_eq!(window.0.scale_aa.adjustment().lower(), 0.);
         assert_eq!(window.0.scale_aa.adjustment().upper(), 100.);
+        window.0.scale_game_asset.replace(Some(session.clone()));
         window.0.scale_width.set_value(32.);
         window.present();
         let context = glib::MainContext::default();
@@ -136,16 +151,18 @@ mod tests {
         wait_for_preview();
         let preserved_zoom = 1.375;
         window.set_scale_preview_zoom(preserved_zoom);
-        let session = crate::tools::scale::game_asset::Session::new(source);
         for percent in [0, 100, 50] {
             window.0.scale_aa.set_value(f64::from(percent));
             assert_eq!(window.0.scale_aa.value(), f64::from(percent));
-            let aa = GameAssetAa::new(percent);
-            assert_eq!(window.0.scale_resampling.get(), Resampling::GameAsset(aa));
+            let options = GameAssetOptions::new(GameAssetAa::new(percent), 20);
+            assert_eq!(
+                window.0.scale_resampling.get(),
+                Resampling::GameAsset(options)
+            );
             wait_for_preview();
-            assert_eq!(window.0.settings.game_asset_aa(), aa);
+            assert_eq!(window.0.settings.game_asset_options(), options);
             let expected = session
-                .resize(32, 27, aa, &CancellationToken::default())
+                .resize(32, 27, options, &CancellationToken::default())
                 .unwrap();
             assert_eq!(
                 window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
@@ -153,15 +170,17 @@ mod tests {
             );
             assert_eq!(window.0.canvas.zoom(), preserved_zoom);
         }
-        // Switching methods hides AA without forgetting it or contaminating
-        // another method. Rapid AA changes must publish only the latest value.
+        // Switching methods hides the paired controls without forgetting them
+        // or contaminating another method. Rapid changes publish only the latest value.
         window.0.scale_aa.set_value(75.);
+        window.0.scale_contour_darkening.set_value(40.);
         for method in [0, 1, 3] {
             window.0.scale_method.set_selected(method);
             assert!(!window.0.scale_aa_controls.get_visible());
         }
         window.0.scale_method.set_selected(2);
         assert_eq!(window.0.scale_aa.value(), 75.);
+        assert_eq!(window.0.scale_contour_darkening.value(), 40.);
         window.0.scale_aa.set_value(0.);
         let obsolete = window
             .0
@@ -174,7 +193,12 @@ mod tests {
         assert!(obsolete.check().is_err());
         wait_for_preview();
         let expected = session
-            .resize(32, 27, GameAssetAa::new(100), &CancellationToken::default())
+            .resize(
+                32,
+                27,
+                GameAssetOptions::new(GameAssetAa::new(100), 40),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert_eq!(
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
@@ -182,12 +206,12 @@ mod tests {
         );
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
-        window.0.scale_aa.grab_focus();
+        window.0.scale_contour_darkening.grab_focus();
         while context.pending() {
             context.iteration(false);
         }
         assert!(application.accels_for_action("win.zoom-100").is_empty());
-        let controllers = window.0.scale_aa.observe_controllers();
+        let controllers = window.0.scale_contour_darkening.observe_controllers();
         assert!(
             (0..controllers.n_items())
                 .filter_map(|i| controllers.item(i))
@@ -215,7 +239,11 @@ mod tests {
             .scale_controls
             .measure(gtk::Orientation::Horizontal, -1)
             .0;
-        for width in [minimum, minimum.max(700), minimum.max(1000)] {
+        assert!(
+            minimum <= 1000,
+            "paired Game Asset spins stay usable at 1000px"
+        );
+        for width in [minimum, minimum.max(700), 1000] {
             window.0.canvas_overlay.allocate(width, 600, -1, None);
             let row = &window.0.scale_aa_controls;
             assert!(
@@ -230,6 +258,12 @@ mod tests {
                     .measure(gtk::Orientation::Horizontal, -1)
             );
             let bounds = window.0.scale_aa.compute_bounds(row).unwrap();
+            assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
+            let bounds = window
+                .0
+                .scale_contour_darkening
+                .compute_bounds(row)
+                .unwrap();
             assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
             let bounds = row.compute_bounds(&top_row).unwrap();
             assert_eq!(bounds.y(), 0., "AA stays on the first row");
@@ -272,7 +306,9 @@ mod tests {
             &[Operation::Scale {
                 width: 32,
                 height: 27,
-                resampling: Resampling::GameAsset(GameAssetAa::new(100))
+                resampling: Resampling::GameAsset(
+                    GameAssetOptions::new(GameAssetAa::new(100), 40,)
+                )
             }]
         );
         window.0.window.close();

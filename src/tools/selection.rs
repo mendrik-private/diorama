@@ -100,7 +100,8 @@ pub fn detected_background(image: &RgbaImage) -> Option<[u8; 4]> {
     (total > 0 && matching * 100 >= total * 80).then_some(estimate)
 }
 
-/// Applies a BiRefNet alpha mask exactly as Sprite Studio does.
+/// Applies a BiRefNet alpha mask, preserving the source's existing alpha.
+#[cfg(test)]
 pub fn apply_alpha_mask(image: &mut RgbaImage, mask: &GrayImage) -> Result<()> {
     if image.dimensions() != mask.dimensions() {
         return Err(AppError::InvalidDimensions);
@@ -114,18 +115,24 @@ pub fn apply_alpha_mask(image: &mut RgbaImage, mask: &GrayImage) -> Result<()> {
     Ok(())
 }
 
-/// Runs the same local vision.cpp BiRefNet entrypoint used by Sprite Studio.
-/// This deliberately has no network fallback: a missing runtime is surfaced to
-/// the caller, which can leave the rectangular selection usable.
-pub fn birefnet_mask(
+/// Returns BiRefNet's foreground estimate with the original source alpha
+/// applied.  The foreground estimate removes the background colour embedded
+/// in soft source pixels, which prevents pale source backgrounds from showing
+/// as a fringe when the cutout is composited on a dark canvas.
+pub fn birefnet_cutout(
     image: &RgbaImage,
     cancellation: &crate::document::CancellationToken,
-) -> Result<GrayImage> {
+) -> Result<RgbaImage> {
     cancellation.check()?;
+    let runtime = birefnet_runtime()?;
+    birefnet_cutout_with_runtime(image, cancellation, &runtime)
+}
+
+fn birefnet_runtime() -> Result<BiRefNetRuntime> {
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
         AppError::BackgroundRemoval("HOME is unavailable; configure vision.cpp".into())
     })?;
-    let runtime = BiRefNetRuntime {
+    Ok(BiRefNetRuntime {
         executable: std::env::var_os("SPRITE_STUDIO_VISION_CLI")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("vision.cpp/build/bin/vision-cli")),
@@ -137,8 +144,7 @@ pub fn birefnet_mask(
         poll_interval: Duration::from_millis(20),
         launch: launch_mode_from(Path::new("/.flatpak-info")),
         temporary_root: shared_cache_directory()?,
-    };
-    birefnet_mask_with_runtime(image, cancellation, &runtime)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +225,12 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn birefnet_command(runtime: &BiRefNetRuntime, input: &Path, output: &Path) -> Command {
+fn birefnet_command(
+    runtime: &BiRefNetRuntime,
+    input: &Path,
+    output: &Path,
+    foreground: Option<&Path>,
+) -> Command {
     let mut command = match &runtime.launch {
         BiRefNetLaunch::Direct => Command::new(&runtime.executable),
         BiRefNetLaunch::FlatpakHost { launcher } => {
@@ -242,14 +253,61 @@ fn birefnet_command(runtime: &BiRefNetRuntime, input: &Path, output: &Path) -> C
         .arg(input)
         .args(["-o"])
         .arg(output);
+    if let Some(foreground) = foreground {
+        command.args(["--composite"]).arg(foreground);
+    }
     command
 }
 
+struct BiRefNetOutput {
+    mask: GrayImage,
+    foreground: Option<RgbaImage>,
+}
+
+#[cfg(test)]
 fn birefnet_mask_with_runtime(
     image: &RgbaImage,
     cancellation: &crate::document::CancellationToken,
     runtime: &BiRefNetRuntime,
 ) -> Result<GrayImage> {
+    Ok(birefnet_with_runtime(image, cancellation, runtime, false)?.mask)
+}
+
+fn birefnet_cutout_with_runtime(
+    image: &RgbaImage,
+    cancellation: &crate::document::CancellationToken,
+    runtime: &BiRefNetRuntime,
+) -> Result<RgbaImage> {
+    let output = birefnet_with_runtime(image, cancellation, runtime, true)?;
+    let mut cutout = output
+        .foreground
+        .expect("foreground output is requested when preparing a BiRefNet cutout");
+    if cutout.dimensions() != output.mask.dimensions() {
+        return Err(AppError::InvalidDimensions);
+    }
+    apply_source_alpha(&mut cutout, image)?;
+    Ok(cutout)
+}
+
+fn apply_source_alpha(cutout: &mut RgbaImage, source: &RgbaImage) -> Result<()> {
+    if cutout.dimensions() != source.dimensions() {
+        return Err(AppError::InvalidDimensions);
+    }
+    for (pixel, source_pixel) in cutout.pixels_mut().zip(source.pixels()) {
+        pixel[3] = ((u16::from(pixel[3]) * u16::from(source_pixel[3]) + 127) / 255) as u8;
+        if pixel[3] == 0 {
+            pixel.0 = [0; 4];
+        }
+    }
+    Ok(())
+}
+
+fn birefnet_with_runtime(
+    image: &RgbaImage,
+    cancellation: &crate::document::CancellationToken,
+    runtime: &BiRefNetRuntime,
+    estimate_foreground: bool,
+) -> Result<BiRefNetOutput> {
     cancellation.check()?;
     let executable = &runtime.executable;
     let model = &runtime.model;
@@ -266,17 +324,23 @@ fn birefnet_mask_with_runtime(
         .tempdir_in(&runtime.temporary_root)?;
     let input = directory.path().join("selection.png");
     let output = directory.path().join("mask.png");
+    let foreground = directory.path().join("foreground.png");
     let log = directory.path().join("birefnet.log");
     image.save(&input)?;
     let log_file = File::create(&log)?;
-    let mut child = birefnet_command(runtime, &input, &output)
-        .stdin(Stdio::null())
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .spawn()
-        .map_err(|error| {
-            AppError::BackgroundRemoval(format!("Could not launch vision.cpp: {error}"))
-        })?;
+    let mut child = birefnet_command(
+        runtime,
+        &input,
+        &output,
+        estimate_foreground.then_some(foreground.as_path()),
+    )
+    .stdin(Stdio::null())
+    .stdout(log_file.try_clone()?)
+    .stderr(log_file)
+    .spawn()
+    .map_err(|error| {
+        AppError::BackgroundRemoval(format!("Could not launch vision.cpp: {error}"))
+    })?;
     let started = Instant::now();
     loop {
         if let Err(error) = cancellation.check() {
@@ -309,8 +373,17 @@ fn birefnet_mask_with_runtime(
     if mask.dimensions() != image.dimensions() {
         return Err(AppError::InvalidDimensions);
     }
+    let foreground = if estimate_foreground {
+        let foreground = image::open(foreground)?.into_rgba8();
+        if foreground.dimensions() != image.dimensions() {
+            return Err(AppError::InvalidDimensions);
+        }
+        Some(foreground)
+    } else {
+        None
+    };
     cancellation.check()?;
-    Ok(mask)
+    Ok(BiRefNetOutput { mask, foreground })
 }
 
 pub fn clear_masked(
@@ -637,6 +710,7 @@ mod tests {
             &runtime,
             Path::new("/host/cache/input image.png"),
             Path::new("/host/cache/output mask.png"),
+            None,
         );
         assert_eq!(
             command.get_program(),
@@ -690,6 +764,79 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn birefnet_cutout_uses_foreground_estimate_and_preserves_source_alpha() {
+        let root = tempfile::tempdir().unwrap();
+        let mask = GrayImage::from_fn(3, 1, |x, _| Luma([[255, 128, 255][x as usize]]));
+        mask.save(root.path().join("mask.png")).unwrap();
+        RgbaImage::from_fn(3, 1, |x, _| {
+            Rgba([[20, 30, 40, 255], [50, 60, 70, 128], [80, 90, 100, 255]][x as usize])
+        })
+        .save(root.path().join("foreground.png"))
+        .unwrap();
+        let runtime = fake_runtime(
+            root.path(),
+            "foreground-cli",
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) output=\"$2\"; shift 2 ;;\n    --composite) foreground=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncp \"$(dirname \"$0\")/mask.png\" \"$output\"\ncp \"$(dirname \"$0\")/foreground.png\" \"$foreground\"\n",
+            std::time::Duration::from_secs(1),
+        );
+        let source = RgbaImage::from_fn(3, 1, |x, _| {
+            Rgba(
+                [
+                    [220, 220, 220, 255],
+                    [220, 220, 220, 128],
+                    [220, 220, 220, 0],
+                ][x as usize],
+            )
+        });
+
+        let cutout = super::birefnet_cutout_with_runtime(
+            &source,
+            &crate::document::CancellationToken::default(),
+            &runtime,
+        )
+        .unwrap();
+
+        assert_eq!(cutout.get_pixel(0, 0).0, [20, 30, 40, 255]);
+        assert_eq!(cutout.get_pixel(1, 0).0, [50, 60, 70, 64]);
+        assert_eq!(cutout.get_pixel(2, 0).0, [0; 4]);
+        assert!(
+            std::fs::read_dir(&runtime.temporary_root)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn birefnet_cutout_rejects_a_mismatched_foreground_estimate() {
+        let root = tempfile::tempdir().unwrap();
+        GrayImage::from_pixel(2, 2, Luma([255]))
+            .save(root.path().join("mask.png"))
+            .unwrap();
+        RgbaImage::from_pixel(1, 1, Rgba([20, 30, 40, 255]))
+            .save(root.path().join("foreground.png"))
+            .unwrap();
+        let runtime = fake_runtime(
+            root.path(),
+            "mismatched-foreground-cli",
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) output=\"$2\"; shift 2 ;;\n    --composite) foreground=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\ncp \"$(dirname \"$0\")/mask.png\" \"$output\"\ncp \"$(dirname \"$0\")/foreground.png\" \"$foreground\"\n",
+            std::time::Duration::from_secs(1),
+        );
+        let source = RgbaImage::from_pixel(2, 2, Rgba([220, 220, 220, 255]));
+
+        assert!(matches!(
+            super::birefnet_cutout_with_runtime(
+                &source,
+                &crate::document::CancellationToken::default(),
+                &runtime,
+            ),
+            Err(crate::error::AppError::InvalidDimensions)
+        ));
     }
 
     #[cfg(unix)]

@@ -4,8 +4,35 @@ The shared [`asset-scaler`](https://github.com/mendrik-private/asset-scaler) cra
 owns the production algorithm. `src/tools/scale/game_asset` adapts application
 cancellation and errors: live previews use its cached `Session`, while document
 rendering calls the same algorithm through the borrowed `resize` API. Diorama
-selects `ResizeOptions::preserve_opaque_background()` for both paths, so an
-opaque source canvas stays opaque while explicit source alpha is preserved.
+first prepares contour analysis from the untouched source, then asks BiRefNet
+for a foreground estimate. It scales that background-removed foreground as the
+fill, then paints the original-source contour geometry last with foreground
+donor colors. A live preview session
+caches its successful foreground estimate across AA changes; document rendering
+takes the same sequence. Its separate BiRefNet run can vary slightly from the
+preview model output, so the two results are not promised to be byte-identical.
+BiRefNet's foreground alpha is multiplied by explicit source alpha, which stays
+authoritative.
+For an originally opaque source, AA 0% is a final hard half-coverage cutout:
+it clears lower model-alpha pixels and makes retained pixels opaque. AA 100%
+is the full soft-alpha render. Diorama renders and caches those two endpoints
+for the active target size, then every intermediate integer percentage blends
+their premultiplied linear RGBA values. The endpoints remain byte-exact, while
+each one-percent change is gradual rather than restoring the model's full soft
+edge at 1%. This happens after contour painting, without resampling, and
+the AA 0% retained pixels keep their RGB, so the hard foreground remains
+halo-free and its contours retain their Bresenham pixel edge. Intermediate
+settings blend RGB together with alpha. Sources with explicit transparency
+are never binarized at AA 0%; their endpoint alpha and intermediate blending
+remain fractional.
+
+For the Game Asset foreground-ink path, AA 0% also reaches a contour out by at
+most one target pixel where an original core touches the four-connected
+foreground silhouette rim. The added pixel inherits its adjacent original
+contour's foreground donor; it never samples exterior background. Existing
+core coverage, contour owners, colors, and the finished silhouette remain
+unchanged. The full-AA endpoint has no added rim coverage, so the cached
+endpoint blend progressively tapers this AA-0 edge reach as AA increases.
 When changing the Git pin, update `build-aux/cargo-sources.json` for offline
 Flatpak builds. The scaler accepts positive dimensions no
 larger than the source, including rectangular images and independent axis reductions.
@@ -14,7 +41,7 @@ Lanczos resampling remain separate methods.
 
 ## Source analysis
 
-Four Gaussian scales and four scan directions find dark ridges. Supported local
+Five Gaussian scales and four scan directions find dark ridges. Supported local
 samples fit quadratic patches. Source rasterization and topology-preserving thinning
 provide a trace graph. Direction-compatible continuations merge across small junction
 loops; supported endpoints bridge small gaps. Ambiguous branches remain separate.
@@ -23,16 +50,21 @@ Source ink is the detected shoulder-supported footprint plus the thinned centerl
 Each visible detector sample near a trace measures the contiguous ink span along its
 normal in quarter-pixel steps, capped at 32 source pixels on each side. The mean of
 all supported measurements gives that contour's source thickness. Analysis and widths
-are cached once per immutable source; one target result is cached per session,
-keyed by dimensions and AA intensity. Changing AA reuses source analysis, but
-rebuilds target contours and fill; the existing preview debounce and cancellation
-discard superseded work.
+are cached once per immutable source. A live Diorama session also caches one successful
+BiRefNet foreground estimate, keyed by that immutable source. It keeps two completed
+renders for the active target size and Darken setting at AA 0% and 100%; changing
+AA blends that pair without rerunning contours, fill, or BiRefNet. The existing preview debounce and
+cancellation discard superseded work. Changing Darken rebuilds that endpoint pair
+for its new contour RGB, while retaining the prepared contours and cached foreground.
 
 ## Target contours
 
-A contour must project to more than three distinct target Bresenham pixels. Target
-coordinates use pixel-center alignment independently on each axis. Local robust
-quadratic smoothing uses a 6.4-target-pixel sigma tapered toward zero at source scale;
+A contour must project to more than three distinct target Bresenham pixels; one,
+two, and three projected pixels are rejected. The same source trace can therefore
+drop as the target becomes smaller. Rejection removes its explicit contour redraw
+and its halo evidence, while its original pixels can still contribute to the ordinary
+resampled Lanczos fill. Target coordinates use pixel-center alignment independently on each axis.
+Local robust quadratic smoothing uses a 6.4-target-pixel sigma tapered toward zero at source scale;
 for unequal scale factors it uses the smaller factor. Each retained source contour
 is rasterized with canonical-direction Zingl/Bresenham quadratics and thinned in
 its own target bounding box. Cleanup cannot replace a black contour connection
@@ -48,16 +80,30 @@ Colors come from the nearest visible original-source donor of the selected conto
 never from an unconstrained nearest neighbor. Shared model assignments still choose
 the longest retained source trace. Overlapping patches never stack opacity.
 
+The foreground-ink rendering path can extend only a zero-coverage target pixel
+that is both on the four-connected foreground rim and eight-neighbor adjacent to
+an original supported core. It propagates that core's owner and supported
+foreground donor. The normal AA-0 hard cutout must already retain the destination,
+which prevents this bounded coverage change from enlarging the finished silhouette
+or moving internal contours. This is a rendering coverage adjustment; it does not
+alter detector samples, fitted curves, source widths, or color selection.
+
 Let `L` be the contour's final owned core-pixel count and `T` its mean source width:
 
 ```text
-opacity = 0.6 + 0.4 * sqrt(clamp((L - 4) / 28, 0, 1) * clamp((T - 1) / 5, 0, 1))
+opacity = 0.95 + 0.05 * sqrt(clamp((L - 4) / 28, 0, 1) * clamp((T - 1) / 5, 0, 1))
 ```
 
-The result ranges from 60% to 100%, reaching full opacity at 32 final pixels and six
-source pixels of average thickness. Without width measurements the contour uses 60%.
+The result ranges from 95% to 100%, reaching full opacity at 32 final pixels and six
+source pixels of average thickness. Without width measurements the contour uses 95%.
 Intrinsic opacity multiplies AA coverage once, after final ownership and core-length
 measurement. It is separate from the per-pixel AA allowance below.
+
+That intrinsic weighting remains the full-AA contour behavior. In the Game Asset
+foreground-ink path, AA 0% instead uses unit strength for owned core paint, then
+smoothly restores the calculated 95%–100% intrinsic strength toward AA 100%. Thus a fully
+covered AA-0 core is solid; previously its 255 coverage could still become soft
+when the later intrinsic multiplier was below one.
 
 ### Core-preserving manual antialiasing
 
@@ -69,9 +115,15 @@ Local contiguous row/column coverage sums estimate apparent thickness; the small
 sum normalizes each sample. A disconnected piece or the opposite side of a loop
 does not contribute merely because it occupies the same row or column.
 
-The **AA** numeric spinner appears at the right of the first control row, only
-for Game Asset. It defaults to **50%** and has no AA slider. One intensity
-controls both core attenuation and the geometric outer fringe:
+The **AA** and **Darken** numeric spinners appear together at the right of the
+first control row, only for Game Asset. AA defaults to **50%** and Darken to
+**20%**; neither uses a slider. Darken scales only painted contour RGB in
+displayed sRGB: 0% retains the detected foreground donor color and 100% uses
+black, without changing fill or alpha. At AA 0%, a fully covered painted core is
+opaque, so Darken 100% produces solid black ink. Both values are captured in each scale
+operation, so Apply, undo/redo, export, and replay do not depend on later
+preference changes. One AA intensity controls both core attenuation and the
+geometric outer fringe:
 
 | AA setting | Minimum core coverage | Outer smoothing intensity |
 |---|---|---|
@@ -95,15 +147,30 @@ This is an adaptation, not a literal implementation of the paper's global opacit
 normalization, shape realignment or partial sorting. The protected core and bounded
 fringe can add apparent thickness; we do not dim the core below its agreed floor to
 compensate. A full-strength contour has at most 10% AA opacity loss at maximum AA; deliberately
-weaker contours retain their separate intrinsic weighting. The bound is on ink
+shorter or thinner contours retain their separate intrinsic weighting. The bound is on ink
 coverage, not encoded RGB brightness or the alpha of an opaque composited image.
 
 ## Lanczos fill and composition
 
-The pipeline directly resamples the isolated source once with Lanczos3. It converts
-straight linear RGBA to premultiplied linear RGBA before filtering, then unpremultiplies
-only guarded target pixels. Transparent source pixels therefore contribute no hidden
-RGB. The retained-ink mask is not subtracted from this base.
+The pipeline first obtains BiRefNet's foreground estimate, then directly resamples
+that isolated source once with Lanczos3. Contour geometry and source-width measurements
+are prepared before foreground removal. The painted contours retain that original
+geometry, while their colors come only from alpha-supported aligned foreground donors
+and use the operation's displayed-sRGB Darken setting (80% brightness at the default
+20% darkening). Contours without a supported donor are not painted, so transparent-model
+background RGB cannot reappear as white fringe. The
+fill converts straight linear RGBA to premultiplied linear RGBA before filtering, then
+unpremultiplies only guarded target pixels. Transparent source pixels therefore
+contribute no hidden RGB. The retained-ink mask is not subtracted from this base.
+
+For an originally opaque source in the foreground-ink path, a narrow post-composite
+fringe repair can replace RGB only on an unsupported, non-core target pixel whose
+pre-repair foreground alpha is above zero and below 25%, and which is within two
+target pixels of an original core donor. This reaches fringe just outside the
+existing one-pixel rim while still using frozen original-core donors. It preserves every nonzero baseline alpha
+byte, clears accidental RGB where that byte is zero, and leaves transparent originals
+alone. This does not remove halos generally or change the fill, contour geometry,
+ownership, or silhouette.
 
 A bounded halo pass can tone down dark retained-ink bleed immediately adjacent to a
 drawn contour core. It estimates nearby fill from non-ink samples with a positive

@@ -18,8 +18,8 @@ pub fn resize(
     if target_width == 0 || target_height == 0 {
         return Err(AppError::InvalidDimensions);
     }
-    if let Resampling::GameAsset(aa) = resampling {
-        return game_asset::resize(image, target_width, target_height, aa, cancellation);
+    if let Resampling::GameAsset(options) = resampling {
+        return game_asset::resize(image, target_width, target_height, options, cancellation);
     }
     cancellation.check()?;
     if image.dimensions() == (target_width, target_height) {

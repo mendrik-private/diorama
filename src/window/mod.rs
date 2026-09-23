@@ -13,8 +13,9 @@ use crate::compare::{SplitOrientation, choose_split};
 use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
-    GameAssetAa, HIGHLIGHT_STROKE_WIDTH, LineLink, LineVertex, MEASUREMENT_STROKE_WIDTH, Operation,
-    PencilGeometry, Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
+    GameAssetAa, GameAssetOptions, HIGHLIGHT_STROKE_WIDTH, LineLink, LineVertex,
+    MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect, Resampling, Rotation, Shape,
+    StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -780,6 +781,7 @@ struct WindowState {
     scale_method: gtk::DropDown,
     scale_aa_controls: gtk::Box,
     scale_aa: gtk::SpinButton,
+    scale_contour_darkening: gtk::SpinButton,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
@@ -1047,9 +1049,8 @@ impl ViewerWindow {
         let scale_aa = spin(0.0, 100.0, f64::from(settings.game_asset_aa().percent()));
         scale_aa.set_width_chars(3);
         scale_aa_label.set_mnemonic_widget(Some(&scale_aa));
-        let aa_description = gettext(
-            "Antialiasing: 0% keeps cores opaque with no outer smoothing; 100% allows up to 10% core opacity loss and full outer smoothing",
-        );
+        let aa_description =
+            gettext("Antialiasing: 0% keeps pixel edges crisp; 100% applies full smoothing");
         scale_aa.set_tooltip_text(Some(&aa_description));
         scale_aa.update_property(&[
             gtk::accessible::Property::Label(&gettext("Antialiasing (%)")),
@@ -1057,6 +1058,24 @@ impl ViewerWindow {
         ]);
         scale_aa_controls.append(&scale_aa_label);
         scale_aa_controls.append(&scale_aa);
+        scale_aa_controls.append(&gtk::Label::new(Some("%")));
+        let scale_contour_darkening_label = gtk::Label::with_mnemonic(&gettext("_Darken"));
+        let scale_contour_darkening = spin(
+            0.0,
+            100.0,
+            f64::from(settings.game_asset_contour_darkening()),
+        );
+        scale_contour_darkening.set_width_chars(3);
+        scale_contour_darkening_label.set_mnemonic_widget(Some(&scale_contour_darkening));
+        let darkening_description =
+            gettext("Contour darkening: 0% keeps the detected color; 100% uses black ink");
+        scale_contour_darkening.set_tooltip_text(Some(&darkening_description));
+        scale_contour_darkening.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Contour darkening (%)")),
+            gtk::accessible::Property::Description(&darkening_description),
+        ]);
+        scale_aa_controls.append(&scale_contour_darkening_label);
+        scale_aa_controls.append(&scale_contour_darkening);
         scale_aa_controls.append(&gtk::Label::new(Some("%")));
         let scale_top_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         scale_control_row.set_valign(gtk::Align::Start);
@@ -1305,6 +1324,7 @@ impl ViewerWindow {
             scale_method,
             scale_aa_controls,
             scale_aa,
+            scale_contour_darkening,
             scale_original_button,
             scale_source: RefCell::new(None),
             scale_gpu: RefCell::new(None),
@@ -3059,6 +3079,7 @@ impl ViewerWindow {
             self.0.scale_width.clone().upcast::<gtk::Widget>(),
             self.0.scale_height.clone().upcast(),
             self.0.scale_aa.clone().upcast(),
+            self.0.scale_contour_darkening.clone().upcast(),
         ] {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3100,8 +3121,9 @@ impl ViewerWindow {
             let this = self.clone();
             move |dropdown| {
                 let resampling = match resampling_at(dropdown.selected()) {
-                    Resampling::GameAsset(_) => Resampling::GameAsset(GameAssetAa::new(
-                        this.0.scale_aa.value().round() as u8,
+                    Resampling::GameAsset(_) => Resampling::GameAsset(GameAssetOptions::new(
+                        GameAssetAa::new(this.0.scale_aa.value().round() as u8),
+                        this.0.scale_contour_darkening.value().round() as u8,
                     )),
                     method => method,
                 };
@@ -3120,10 +3142,30 @@ impl ViewerWindow {
                 if this.0.scale_updating_controls.get() {
                     return;
                 }
-                let aa = GameAssetAa::new(spin.value().round() as u8);
-                this.0.settings.set_game_asset_aa(aa);
+                let options = GameAssetOptions::new(
+                    GameAssetAa::new(spin.value().round() as u8),
+                    this.0.scale_contour_darkening.value().round() as u8,
+                );
+                this.0.settings.set_game_asset_options(options);
                 if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
-                    this.0.scale_resampling.set(Resampling::GameAsset(aa));
+                    this.0.scale_resampling.set(Resampling::GameAsset(options));
+                    this.refresh_scale_controls();
+                }
+            }
+        });
+        self.0.scale_contour_darkening.connect_value_changed({
+            let this = self.clone();
+            move |spin| {
+                if this.0.scale_updating_controls.get() {
+                    return;
+                }
+                let options = GameAssetOptions::new(
+                    GameAssetAa::new(this.0.scale_aa.value().round() as u8),
+                    spin.value().round() as u8,
+                );
+                this.0.settings.set_game_asset_options(options);
+                if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
+                    this.0.scale_resampling.set(Resampling::GameAsset(options));
                     this.refresh_scale_controls();
                 }
             }
@@ -3430,7 +3472,7 @@ impl ViewerWindow {
         self.0.scale_original_button.set_sensitive(false);
         let resampling = self.0.scale_resampling.get();
         let gpu = self.0.scale_gpu.borrow().clone();
-        let game_asset = if let Resampling::GameAsset(aa) = resampling {
+        let game_asset = if let Resampling::GameAsset(options) = resampling {
             let mut session = self.0.scale_game_asset.borrow_mut();
             Some((
                 session
@@ -3440,7 +3482,7 @@ impl ViewerWindow {
                         ))
                     })
                     .clone(),
-                aa,
+                options,
             ))
         } else {
             None
@@ -3462,8 +3504,8 @@ impl ViewerWindow {
             let weak = Rc::downgrade(&state);
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
-                    if let Some((session, aa)) = game_asset {
-                        return session.resize(target_width, target_height, aa, &cancellation);
+                    if let Some((session, options)) = game_asset {
+                        return session.resize(target_width, target_height, options, &cancellation);
                     }
                     if let Some(gpu) = gpu
                         && let Some(preview) =
@@ -4041,9 +4083,7 @@ impl ViewerWindow {
         let weak = Rc::downgrade(&self.0);
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || {
-                let mask = crate::tools::selection::birefnet_mask(&fragment, &cancellation)?;
-                let mut cutout = fragment;
-                crate::tools::selection::apply_alpha_mask(&mut cutout, &mask)?;
+                let cutout = crate::tools::selection::birefnet_cutout(&fragment, &cancellation)?;
                 // The effective matte follows the actual post-multiplication
                 // alpha, so originally transparent pixels never become part of
                 // a cut, fill, or lasso contour.

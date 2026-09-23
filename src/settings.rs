@@ -2,7 +2,7 @@ use gio::prelude::*;
 
 use crate::APP_ID;
 use crate::canvas::{Background, ZoomFilter};
-use crate::document::{GameAssetAa, Resampling};
+use crate::document::{GameAssetAa, GameAssetOptions, Resampling};
 use crate::navigation::SortOrder;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -128,14 +128,14 @@ impl Settings {
         match self.string("scale-resampling").as_deref() {
             Some("nearest") => Resampling::Nearest,
             Some("lanczos") => Resampling::Lanczos,
-            Some("game-asset") => Resampling::GameAsset(self.game_asset_aa()),
+            Some("game-asset") => Resampling::GameAsset(self.game_asset_options()),
             _ => Resampling::Bicubic,
         }
     }
 
     pub fn set_scale_resampling(&self, resampling: Resampling) {
-        if let Resampling::GameAsset(aa) = resampling {
-            self.set_game_asset_aa(aa);
+        if let Resampling::GameAsset(options) = resampling {
+            self.set_game_asset_options(options);
         }
         self.set_string(
             "scale-resampling",
@@ -154,6 +154,28 @@ impl Settings {
 
     pub fn set_game_asset_aa(&self, aa: GameAssetAa) {
         self.set_integer("game-asset-aa", i32::from(aa.percent()));
+    }
+
+    pub fn game_asset_contour_darkening(&self) -> u8 {
+        self.integer("game-asset-contour-darkening")
+            .unwrap_or(20)
+            .clamp(0, 100) as u8
+    }
+
+    pub fn set_game_asset_contour_darkening(&self, darkening: u8) {
+        self.set_integer(
+            "game-asset-contour-darkening",
+            i32::from(darkening.min(100)),
+        );
+    }
+
+    pub fn game_asset_options(&self) -> GameAssetOptions {
+        GameAssetOptions::new(self.game_asset_aa(), self.game_asset_contour_darkening())
+    }
+
+    pub fn set_game_asset_options(&self, options: GameAssetOptions) {
+        self.set_game_asset_aa(options.aa());
+        self.set_game_asset_contour_darkening(options.contour_darkening());
     }
 
     pub fn color_picker_format(&self) -> ColorFormat {
@@ -393,6 +415,7 @@ fn has_key(settings: &gio::Settings, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ColorFormat, Settings, ZoomMode};
+    use crate::document::{GameAssetAa, GameAssetOptions};
 
     #[test]
     fn color_format_defaults_to_hex() {
@@ -409,11 +432,9 @@ mod tests {
         assert_eq!(settings.mesh_grid_size(), 32);
         assert_eq!(settings.mesh_grid_offset_x(), 0);
         assert_eq!(settings.mesh_grid_offset_y(), 0);
-        assert_eq!(
-            settings.game_asset_aa(),
-            crate::document::GameAssetAa::default()
-        );
-        settings.set_game_asset_aa(crate::document::GameAssetAa::new(100));
+        assert_eq!(settings.game_asset_options(), GameAssetOptions::default());
+        settings.set_game_asset_options(GameAssetOptions::new(GameAssetAa::new(100), 100));
+        assert_eq!(settings.game_asset_contour_darkening(), 20);
         settings.set_pencil_size(128);
         settings.set_pencil_antialiasing(true);
         settings.set_mesh_grid_size(100);

@@ -55,6 +55,7 @@
           "skip": [
             ".git",
             ".github",
+            ".cargo",
             ".flatpak-builder",
             "build",
             "target",

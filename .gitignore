@@ -1,4 +1,5 @@
 /target/
+/.cargo/config.toml
 /build/
 /build-local*/
 /build-property-fix/
