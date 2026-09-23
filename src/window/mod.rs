@@ -782,6 +782,7 @@ struct WindowState {
     scale_aa_controls: gtk::Box,
     scale_aa: gtk::SpinButton,
     scale_contour_darkening: gtk::SpinButton,
+    scale_show_contours: gtk::ToggleButton,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
@@ -1042,6 +1043,18 @@ impl ViewerWindow {
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
         scale_slider_row.append(&scale_slider);
+        let scale_show_contours = gtk::ToggleButton::builder()
+            .label(gettext("Show contours"))
+            .tooltip_text(gettext("Preview the detected contour mask"))
+            .visible(matches!(scale_resampling, Resampling::GameAsset(_)))
+            .build();
+        scale_show_contours.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Show contours")),
+            gtk::accessible::Property::Description(&gettext(
+                "Preview the binary contour mask used for Game Asset scaling",
+            )),
+        ]);
+        scale_slider_row.append(&scale_show_contours);
         let scale_aa_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         scale_aa_controls.set_valign(gtk::Align::Start);
         scale_aa_controls.set_visible(matches!(scale_resampling, Resampling::GameAsset(_)));
@@ -1325,6 +1338,7 @@ impl ViewerWindow {
             scale_aa_controls,
             scale_aa,
             scale_contour_darkening,
+            scale_show_contours,
             scale_original_button,
             scale_source: RefCell::new(None),
             scale_gpu: RefCell::new(None),
@@ -3170,6 +3184,20 @@ impl ViewerWindow {
                 }
             }
         });
+        self.0.scale_show_contours.connect_toggled({
+            let this = self.clone();
+            move |_| {
+                if this.0.scale_updating_controls.get()
+                    || this.0.tool.get() != Tool::Scale
+                    || !matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_))
+                {
+                    return;
+                }
+                this.refresh_scale_controls_with_preserved_zoom(
+                    this.scale_preview_zoom_to_preserve(),
+                );
+            }
+        });
         let original = gtk::GestureClick::new();
         original.set_button(1);
         original.connect_pressed({
@@ -3255,6 +3283,9 @@ impl ViewerWindow {
             return;
         }
         self.0.pending_scale_activation.set(false);
+        let was_updating = self.0.scale_updating_controls.replace(true);
+        self.0.scale_show_contours.set_active(false);
+        self.0.scale_updating_controls.set(was_updating);
         self.0
             .scale_preview_generation
             .set(self.0.scale_preview_generation.get().wrapping_add(1));
@@ -3429,10 +3460,12 @@ impl ViewerWindow {
     }
 
     fn refresh_scale_method(&self) {
-        self.0.scale_aa_controls.set_visible(matches!(
-            self.0.scale_resampling.get(),
-            Resampling::GameAsset(_)
-        ));
+        let game_asset = matches!(self.0.scale_resampling.get(), Resampling::GameAsset(_));
+        self.0.scale_aa_controls.set_visible(game_asset);
+        self.0.scale_show_contours.set_visible(game_asset);
+        if !game_asset {
+            self.0.scale_show_contours.set_active(false);
+        }
         self.0
             .scale_method
             .set_selected(resampling_index(self.0.scale_resampling.get()));
@@ -3463,14 +3496,14 @@ impl ViewerWindow {
         if let Some(cancellation) = self.0.scale_preview_cancellation.borrow_mut().take() {
             cancellation.cancel();
         }
-        if (target_width, target_height) == source.dimensions() {
+        let resampling = self.0.scale_resampling.get();
+        let show_contours = self.0.scale_show_contours.is_active()
+            && matches!(resampling, Resampling::GameAsset(_));
+        if (target_width, target_height) == source.dimensions() && !show_contours {
             self.0.scale_spinner.set_visible(false);
             self.display_scale_preview(source, preserved_zoom);
             return;
         }
-        self.0.scale_spinner.set_visible(true);
-        self.0.scale_original_button.set_sensitive(false);
-        let resampling = self.0.scale_resampling.get();
         let gpu = self.0.scale_gpu.borrow().clone();
         let game_asset = if let Resampling::GameAsset(options) = resampling {
             let mut session = self.0.scale_game_asset.borrow_mut();
@@ -3487,6 +3520,8 @@ impl ViewerWindow {
         } else {
             None
         };
+        self.0.scale_spinner.set_visible(true);
+        self.0.scale_original_button.set_sensitive(false);
         let cancellation = CancellationToken::default();
         self.0
             .scale_preview_cancellation
@@ -3505,6 +3540,9 @@ impl ViewerWindow {
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
                     if let Some((session, options)) = game_asset {
+                        if show_contours {
+                            return session.contours(target_width, target_height, &cancellation);
+                        }
                         return session.resize(target_width, target_height, options, &cancellation);
                     }
                     if let Some(gpu) = gpu

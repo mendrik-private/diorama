@@ -313,4 +313,158 @@ mod tests {
         );
         window.0.window.close();
     }
+
+    #[test]
+    #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
+    fn game_asset_contour_toggle_uses_the_preview_worker_without_committing_the_mask() {
+        adw::init().expect("GTK initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ContourPreviewTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let source = Arc::new(image::RgbaImage::from_fn(96, 80, |x, y| {
+            image::Rgba(if (y as f64 - (0.57 * x as f64 + 10.)).abs() < 3. {
+                [8, 10, 4, 255]
+            } else {
+                [130, 170, 90, 255]
+            })
+        }));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: source.clone(),
+                path: None,
+                metadata: Default::default(),
+            })));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&source).unwrap()));
+        window.0.rendered.replace(Some((*source).clone()));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        let session = Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_background_remover(
+                source.clone(),
+                Arc::new(identity_background_remover),
+            ),
+        );
+        window.0.scale_button.set_active(true);
+        window.0.scale_method.set_selected(2);
+        window.0.scale_game_asset.replace(Some(session.clone()));
+        window.0.scale_width.set_value(32.);
+        window.present();
+
+        let context = glib::MainContext::default();
+        let wait_for_preview = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while window.0.scale_spinner.get_visible() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::yield_now();
+            }
+            assert!(!window.0.scale_spinner.get_visible(), "preview completed");
+        };
+        wait_for_preview();
+        assert!(window.0.scale_show_contours.get_visible());
+        let preserved_zoom = 1.375;
+        window.set_scale_preview_zoom(preserved_zoom);
+
+        window.0.scale_show_contours.set_active(true);
+        wait_for_preview();
+        let target_contours = session
+            .contours(32, 27, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            &target_contours
+        );
+        assert!(
+            target_contours
+                .pixels()
+                .all(|pixel| pixel.0 == [0, 0, 0, 255] || pixel.0 == [255, 255, 255, 255])
+        );
+        assert_eq!(window.0.canvas.zoom(), preserved_zoom);
+
+        window.set_scale_original_visible(true);
+        assert_eq!(
+            (
+                window.0.canvas.texture().unwrap().width(),
+                window.0.canvas.texture().unwrap().height(),
+            ),
+            (96, 80)
+        );
+        window.set_scale_original_visible(false);
+        assert_eq!(
+            (
+                window.0.canvas.texture().unwrap().width(),
+                window.0.canvas.texture().unwrap().height(),
+            ),
+            (32, 27)
+        );
+
+        // A source-sized contour is diagnostic work too, instead of the
+        // normal immediate source preview shortcut.
+        window.0.scale_width.set_value(96.);
+        wait_for_preview();
+        let source_contours = session
+            .contours(96, 80, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            &source_contours
+        );
+        window.0.scale_show_contours.set_active(false);
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            source.as_ref()
+        );
+
+        window.0.scale_show_contours.set_active(true);
+        window.0.scale_method.set_selected(0);
+        assert!(!window.0.scale_show_contours.get_visible());
+        assert!(!window.0.scale_show_contours.is_active());
+        window.0.scale_method.set_selected(2);
+        assert!(window.0.scale_show_contours.get_visible());
+        window.0.scale_width.set_value(32.);
+        wait_for_preview();
+
+        let minimum = window
+            .0
+            .scale_controls
+            .measure(gtk::Orientation::Horizontal, -1)
+            .0;
+        assert!(minimum <= 1000, "contour toggle remains usable at 1000px");
+        for width in [minimum, minimum.max(700), 1000] {
+            window.0.canvas_overlay.allocate(width, 600, -1, None);
+            let slider_row = window.0.scale_show_contours.parent().unwrap();
+            let bounds = window
+                .0
+                .scale_show_contours
+                .compute_bounds(&slider_row)
+                .unwrap();
+            assert!(
+                bounds.x() >= 0. && bounds.x() + bounds.width() <= slider_row.width() as f32,
+                "contour toggle stays within the slider row at {width}px"
+            );
+        }
+
+        window.0.scale_show_contours.set_active(true);
+        wait_for_preview();
+        let resampling = window.0.scale_resampling.get();
+        window.confirm_scale_preview();
+        assert!(!window.0.scale_show_contours.is_active());
+        assert_eq!(
+            window.0.document.borrow().as_ref().unwrap().operations(),
+            &[Operation::Scale {
+                width: 32,
+                height: 27,
+                resampling,
+            }],
+            "applying from diagnostics records normal Game Asset scaling"
+        );
+        window.0.window.close();
+    }
 }

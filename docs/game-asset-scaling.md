@@ -13,6 +13,12 @@ takes the same sequence. Its separate BiRefNet run can vary slightly from the
 preview model output, so the two results are not promised to be byte-identical.
 BiRefNet's foreground alpha is multiplied by explicit source alpha, which stays
 authoritative.
+The **Show contours** inspection preview at source size draws bounded fitted
+cubic source traces, so long curves are shown as their cleaned geometry without
+running foreground inference. The existing target rasterizer adaptively
+approximates those cubics with quadratics before drawing. At reduced sizes the
+preview instead shows the foreground-supported target core used by Game Asset
+rendering.
 For an originally opaque source, AA 0% is a final hard half-coverage cutout:
 it clears lower model-alpha pixels and makes retained pixels opaque. AA 100%
 is the full soft-alpha render. Diorama renders and caches those two endpoints
@@ -45,6 +51,9 @@ Five Gaussian scales and four scan directions find dark ridges. Supported local
 samples fit quadratic patches. Source rasterization and topology-preserving thinning
 provide a trace graph. Direction-compatible continuations merge across small junction
 loops; supported endpoints bridge small gaps. Ambiguous branches remain separate.
+Each ordered trace is then fit as bounded cubic geometry with shared tangent directions
+at joined pieces; real corners and shared junctions remain fixed fit anchors. Target
+rasterization adaptively converts that geometry to quadratics.
 
 Source ink is the detected shoulder-supported footprint plus the thinned centerline.
 Each visible detector sample near a trace measures the contiguous ink span along its
@@ -64,12 +73,15 @@ two, and three projected pixels are rejected. The same source trace can therefor
 drop as the target becomes smaller. Rejection removes its explicit contour redraw
 and its halo evidence, while its original pixels can still contribute to the ordinary
 resampled Lanczos fill. Target coordinates use pixel-center alignment independently on each axis.
-Local robust quadratic smoothing uses a 6.4-target-pixel sigma tapered toward zero at source scale;
-for unequal scale factors it uses the smaller factor. Each retained source contour
+The fitted cubic traces preserve shared tangent directions, then are adaptively
+approximated as quadratics for the existing rasterizer. Each retained source contour
 is rasterized with canonical-direction Zingl/Bresenham quadratics and thinned in
 its own target bounding box. Cleanup cannot replace a black contour connection
 with a route through a different, green contour. Only digital core construction
 rounds coordinates; geometric AA samples retain the subpixel curve coordinates.
+At crowded reductions, source strength and width rank competing parallel detail while
+outer alpha edges retain priority, including holes and gaps in the background-removed
+foreground, keeping the silhouette readable before interior detail.
 
 Rasterization assigns contour ownership before color lookup. Core pixels always
 win over another contour's fringe. At a genuine core overlap, the greater intrinsic

@@ -61,6 +61,21 @@ fn harden_opaque_cutout_at_zero_aa(
     cancel.check()
 }
 
+/// Convert the scaler's binary grayscale contour representation into the
+/// opaque black-on-white image used by the inspection preview.
+fn contour_mask_to_rgba(mask: &image::GrayImage, cancel: &CancellationToken) -> Result<RgbaImage> {
+    let mut image = RgbaImage::new(mask.width(), mask.height());
+    for (i, (source, output)) in mask.pixels().zip(image.pixels_mut()).enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        let value = if source[0] == 0 { 0 } else { OPAQUE_ALPHA };
+        output.0 = [value, value, value, OPAQUE_ALPHA];
+    }
+    cancel.check()?;
+    Ok(image)
+}
+
 fn srgb_to_linear(encoded: u8) -> f64 {
     let encoded = f64::from(encoded) / 255.;
     if encoded <= 0.04045 {
@@ -293,6 +308,27 @@ impl Session {
         Ok(built)
     }
 
+    /// Return a binary contour inspection image for the requested preview
+    /// dimensions. Original-size inspection renders the fitted source traces
+    /// only; downscaled inspection uses the cached foreground support path.
+    pub fn contours(&self, w: u32, h: u32, cancel: &CancellationToken) -> Result<RgbaImage> {
+        cancel.check()?;
+        self.validate_dimensions(w, h)?;
+        let mask = if (w, h) == self.source.dimensions() {
+            self.scaler
+                .polished_contour_mask(w, h, &|| cancel.check().is_err())
+                .map_err(map_error)?
+        } else {
+            let foreground = self.foreground(cancel)?;
+            self.scaler
+                .foreground_contour_mask(&foreground, w, h, GameAssetAa::new(0), &|| {
+                    cancel.check().is_err()
+                })
+                .map_err(map_error)?
+        };
+        contour_mask_to_rgba(&mask, cancel)
+    }
+
     pub fn resize(
         &self,
         w: u32,
@@ -423,6 +459,31 @@ mod tests {
         }))
     }
 
+    fn contour_fixture() -> Arc<RgbaImage> {
+        Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+            if !(16..48).contains(&x) || !(16..48).contains(&y) {
+                image::Rgba([240, 230, 220, 255])
+            } else if x == 16 || x == 47 || y == 16 || y == 47 || (30..34).contains(&y) {
+                image::Rgba([12, 10, 8, 255])
+            } else {
+                image::Rgba([180, 60, 40, 255])
+            }
+        }))
+    }
+
+    fn assert_binary_contours(image: &RgbaImage, dimensions: (u32, u32)) {
+        assert_eq!(image.dimensions(), dimensions);
+        assert!(
+            image
+                .pixels()
+                .all(|pixel| { pixel.0 == [0, 0, 0, 255] || pixel.0 == [255, 255, 255, 255] })
+        );
+        assert!(
+            image.pixels().any(|pixel| pixel.0 == [0, 0, 0, 255]),
+            "fixture must retain at least one detected contour"
+        );
+    }
+
     #[test]
     fn premultiplied_blend_clears_hidden_rgb_when_quantized_alpha_is_zero() {
         let zero = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 0]));
@@ -462,6 +523,117 @@ mod tests {
                 .expect("AA endpoint cache poisoned")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn contour_inspection_uses_polished_source_mask_at_original_size_and_cached_foreground_when_reduced()
+     {
+        let source = contour_fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = Session::with_background_remover(source, counting_remover(calls.clone()));
+        let cancel = CancellationToken::default();
+
+        let original = session.contours(64, 64, &cancel).unwrap();
+        assert_binary_contours(&original, (64, 64));
+        let polished_source_mask = session
+            .scaler
+            .polished_contour_mask(64, 64, &|| cancel.check().is_err())
+            .unwrap();
+        assert_eq!(
+            original,
+            contour_mask_to_rgba(&polished_source_mask, &cancel).unwrap()
+        );
+        let raw_source_mask = session
+            .scaler
+            .source_contour_mask(&|| cancel.check().is_err())
+            .unwrap();
+        assert_ne!(
+            polished_source_mask, raw_source_mask,
+            "fixture must distinguish fitted contour geometry from the raw source footprint"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(
+            session
+                .aa_endpoints
+                .lock()
+                .expect("AA endpoint cache poisoned")
+                .is_none(),
+            "contour inspection must not render resize endpoints"
+        );
+
+        let target = session.contours(32, 32, &cancel).unwrap();
+        assert_binary_contours(&target, (32, 32));
+        let foreground = session.foreground(&cancel).unwrap();
+        let target_mask = session
+            .scaler
+            .foreground_contour_mask(&foreground, 32, 32, GameAssetAa::new(0), &|| {
+                cancel.check().is_err()
+            })
+            .unwrap();
+        assert_eq!(target, contour_mask_to_rgba(&target_mask, &cancel).unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(session.contours(32, 32, &cancel).unwrap(), target);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "foreground must be cached"
+        );
+        assert!(
+            session
+                .aa_endpoints
+                .lock()
+                .expect("AA endpoint cache poisoned")
+                .is_none(),
+            "contour inspection must not populate the resize endpoint cache"
+        );
+    }
+
+    #[test]
+    fn contour_inspection_validates_dimensions_and_preserves_foreground_cancellation_semantics() {
+        let source = contour_fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let remover = counting_remover(calls.clone());
+        let session = Session::with_background_remover(source.clone(), remover);
+        let cancel = CancellationToken::default();
+        assert!(matches!(
+            session.contours(0, 32, &cancel),
+            Err(AppError::InvalidDimensions)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        cancel.cancel();
+        assert!(matches!(
+            session.contours(32, 32, &cancel),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let remover: Arc<BackgroundRemover> = {
+            let calls = calls.clone();
+            Arc::new(move |image, cancel| {
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    cancel.cancel();
+                }
+                Ok(image.clone())
+            })
+        };
+        let session = Session::with_background_remover(source, remover);
+        let cancelled = CancellationToken::default();
+        assert!(matches!(
+            session.contours(32, 32, &cancelled),
+            Err(AppError::Cancelled)
+        ));
+        assert!(
+            session
+                .foreground
+                .lock()
+                .expect("foreground cache poisoned")
+                .is_none(),
+            "a cancelled contour foreground must not be cached"
+        );
+        let retry = CancellationToken::default();
+        assert_binary_contours(&session.contours(32, 32, &retry).unwrap(), (32, 32));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
