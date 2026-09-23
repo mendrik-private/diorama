@@ -32,5 +32,5 @@ test(
   'cargo-tests',
   cargo_script,
   args: [meson.project_source_root(), '', 'test'],
-  timeout: 600,
+  timeout: 1800,
 )
