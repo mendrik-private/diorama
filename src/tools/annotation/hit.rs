@@ -4,7 +4,7 @@ use crate::document::{
 
 use super::arrow::curve_points;
 use super::geometry::{distance_to_polyline, distance_to_segment, polyline_length};
-use super::highlight::sloppy_ellipse;
+use super::highlight::{rotated_rect_points, rotated_sloppy_ellipse};
 use super::pencil::{geometry_bounds, outline_points};
 use super::text::baseline;
 
@@ -177,7 +177,7 @@ pub fn handles(annotation: &Annotation) -> Vec<(HandleKind, Point)> {
                 .collect()
         }
         Shape::Pencil { geometry, .. } => rectangular_handles(geometry_bounds(geometry)),
-        Shape::Highlight { rect, .. } => rectangular_handles(*rect),
+        Shape::Highlight { rect, angle, .. } => rotated_rect_handles(*rect, *angle),
         Shape::Arrow {
             start,
             end,
@@ -269,6 +269,32 @@ fn rectangular_handles(rect: Rect) -> Vec<(HandleKind, Point)> {
     ]
 }
 
+fn rotated_rect_handles(rect: Rect, angle: f32) -> Vec<(HandleKind, Point)> {
+    let points = rotated_rect_points(rect, angle);
+    let kinds = [
+        HandleKind::NorthWest,
+        HandleKind::North,
+        HandleKind::NorthEast,
+        HandleKind::East,
+        HandleKind::SouthEast,
+        HandleKind::South,
+        HandleKind::SouthWest,
+        HandleKind::West,
+    ];
+    (0..8)
+        .map(|index| {
+            (
+                kinds[index],
+                if index % 2 == 0 {
+                    points[index / 2]
+                } else {
+                    points[index / 2].midpoint(points[(index / 2 + 1) % 4])
+                },
+            )
+        })
+        .collect()
+}
+
 fn handle_hit(annotation: &Annotation, point: Point, tolerance: f32) -> Option<HandleKind> {
     handles(annotation)
         .into_iter()
@@ -284,6 +310,7 @@ fn rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> b
                 geometry: PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_),
                 ..
             }
+            | Shape::Highlight { .. }
     ) {
         return false;
     }
@@ -314,8 +341,10 @@ fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
         } => {
             distance_to_polyline(point, &outline_points(geometry)) <= tolerance + style.width / 2.0
         }
-        Shape::Highlight { rect, seed, .. } => {
-            distance_to_polyline(point, &sloppy_ellipse(*rect, *seed))
+        Shape::Highlight {
+            rect, angle, seed, ..
+        } => {
+            distance_to_polyline(point, &rotated_sloppy_ellipse(*rect, *seed, *angle))
                 <= tolerance + HIGHLIGHT_STROKE_WIDTH / 2.0
         }
         Shape::Arrow {
@@ -365,6 +394,7 @@ fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
 mod tests {
     use crate::document::{BrushPoint, PencilGeometry, Rect, StrokeStyle};
 
+    use super::super::highlight::{rotated_sloppy_ellipse, sloppy_ellipse};
     use super::*;
 
     fn selected() -> Annotation {
@@ -377,6 +407,7 @@ mod tests {
                     width: 40.0,
                     height: 30.0,
                 },
+                angle: 0.0,
                 seed: 1,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -414,6 +445,26 @@ mod tests {
         assert_eq!(
             hit_test(&[first, second], None, point, 8.0).unwrap().id,
             AnnotationId(2)
+        );
+    }
+
+    #[test]
+    fn rotated_highlight_body_hit_uses_the_rotated_ellipse() {
+        let mut annotation = selected();
+        let Shape::Highlight {
+            rect, angle, seed, ..
+        } = &mut annotation.shape
+        else {
+            unreachable!()
+        };
+        *angle = std::f32::consts::FRAC_PI_2;
+        let point = rotated_sloppy_ellipse(*rect, *seed, *angle)[40];
+        assert_eq!(
+            hit_test(std::slice::from_ref(&annotation), None, point, 1.0),
+            Some(Hit {
+                id: annotation.id,
+                kind: HitKind::Body,
+            })
         );
     }
 

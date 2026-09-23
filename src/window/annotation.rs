@@ -121,6 +121,14 @@ impl ViewerWindow {
                 if !tool.is_annotation() {
                     return;
                 }
+                // Ctrl is the pencil line gesture. Leave node hits unclaimed so
+                // the pencil controller can start or close a connected segment.
+                if tool == Tool::Pencil
+                    && super::pencil_drag_mode(gesture.current_event_state())
+                        == super::PencilDragMode::Line
+                {
+                    return;
+                }
                 if this.close_text_editor() {
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                     return;
@@ -199,6 +207,9 @@ impl ViewerWindow {
         drag.connect_drag_update({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
+                if !this.0.tool.get().is_annotation() {
+                    return;
+                }
                 let Some((origin_x, origin_y)) = gesture.start_point() else {
                     return;
                 };
@@ -221,6 +232,10 @@ impl ViewerWindow {
         drag.connect_drag_end({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
+                if !this.0.tool.get().is_annotation() {
+                    this.cancel_annotation_drag();
+                    return;
+                }
                 let Some(state) = this.0.annotation_drag.take() else {
                     return;
                 };
@@ -384,6 +399,7 @@ impl ViewerWindow {
                 shape: match tool {
                     Tool::Highlight => Shape::Highlight {
                         rect: highlight_creation_rect(*start, pointer),
+                        angle: 0.0,
                         seed: id.0 ^ 0xD10A_AA73_9E37_79B9,
                         style: StrokeStyle {
                             color,
@@ -507,6 +523,38 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .map_or_else(Vec::new, crate::document::Document::annotations);
+        // A linked line node can change several independent annotations. Render
+        // a complete same-sized document preview so no stationary endpoint is
+        // left behind beneath the overlay.
+        if matches!(
+            &annotation.shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(_),
+                ..
+            }
+        ) && let Some(mut preview) = self.0.document.borrow().as_ref().cloned()
+        {
+            let linked = preview.line_links().iter().any(|link| {
+                link.first.annotation == annotation.id || link.second.annotation == annotation.id
+            });
+            if linked {
+                preview.apply(Operation::Annotate(AnnotationEdit::Set(annotation.clone())));
+                if let Ok(rendered) = preview.render(&crate::document::CancellationToken::default())
+                    && let Ok(texture) = texture_from_rgba(&rendered.pixels)
+                {
+                    self.0.canvas.clear_annotation_previews();
+                    self.0.canvas.set_texture(Some(&texture));
+                    self.0.annotation_preview.replace(Some(annotation.clone()));
+                    self.0
+                        .canvas
+                        .set_annotation_selection(Some(SelectionHandles {
+                            annotation,
+                            hot: None,
+                        }));
+                    return;
+                }
+            }
+        }
         if let Ok(Some(overlay)) = render_annotation_preview(
             dimensions,
             &annotation,
@@ -1054,6 +1102,9 @@ fn rotation_center(annotation: &Annotation) -> Point {
     if let Shape::Pencil { geometry, .. } = &annotation.shape {
         return crate::tools::annotation::pencil::geometry_bounds(geometry).center();
     }
+    if let Shape::Highlight { rect, .. } = &annotation.shape {
+        return rect.center();
+    }
     if let Shape::Text {
         anchor,
         angle,
@@ -1196,6 +1247,128 @@ mod tests {
                 width: 4.0,
                 height: 20.0,
             }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn linked_line_preview_returns_to_the_original_render_and_cancels_cleanly() {
+        use crate::window::adw;
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        fn line(id: u64, points: &[(f32, f32)], color: [u8; 4]) -> Annotation {
+            Annotation {
+                id: AnnotationId(id),
+                shape: Shape::Pencil {
+                    geometry: PencilGeometry::Line(
+                        points.iter().map(|&(x, y)| Point { x, y }).collect(),
+                    ),
+                    style: StrokeStyle { color, width: 3.0 },
+                    anti_aliasing: true,
+                },
+            }
+        }
+
+        fn canvas_pixels(window: &ViewerWindow) -> image::RgbaImage {
+            let texture = window.0.canvas.texture().expect("canvas texture");
+            let bytes = texture.save_to_png_bytes();
+            image::load_from_memory(bytes.as_ref())
+                .expect("decode texture PNG")
+                .to_rgba8()
+        }
+
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.LinkedPreviewTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let source = image::RgbaImage::from_pixel(64, 64, image::Rgba([240, 240, 240, 255]));
+        let original = line(1, &[(12.5, 20.5), (48.5, 20.5)], [220, 40, 40, 255]);
+        let linked = line(2, &[(12.5, 20.5), (12.5, 50.5)], [40, 70, 220, 255]);
+        let mut document = crate::document::Document::new(crate::document::ImageSource {
+            pixels: Arc::new(source),
+            path: None,
+            metadata: crate::document::Metadata::default(),
+        });
+        document.apply(Operation::Annotate(AnnotationEdit::Create(
+            original.clone(),
+        )));
+        document.apply(Operation::Annotate(AnnotationEdit::CreateLinked {
+            annotation: linked,
+            links: vec![crate::document::LineLink {
+                first: crate::document::LineVertex {
+                    annotation: AnnotationId(2),
+                    index: 0,
+                },
+                second: crate::document::LineVertex {
+                    annotation: AnnotationId(1),
+                    index: 0,
+                },
+            }],
+        }));
+        let baseline = document
+            .render(&crate::document::CancellationToken::default())
+            .expect("baseline render")
+            .pixels;
+        let mut moved = original.clone();
+        let Shape::Pencil {
+            geometry: PencilGeometry::Line(points),
+            ..
+        } = &mut moved.shape
+        else {
+            unreachable!();
+        };
+        points[0] = Point { x: 30.5, y: 34.5 };
+        let mut expected_document = document.clone();
+        expected_document.apply(Operation::Annotate(AnnotationEdit::Set(moved.clone())));
+        let expected_preview = expected_document
+            .render(&crate::document::CancellationToken::default())
+            .expect("linked preview render")
+            .pixels;
+
+        window.0.document.replace(Some(document));
+        window.0.rendered.replace(Some(baseline.clone()));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        window.0.canvas.set_texture(Some(
+            &texture_from_rgba(&baseline).expect("baseline texture"),
+        ));
+        window.0.canvas.allocate(64, 64, -1, None);
+
+        window.preview_annotation_now(moved.clone());
+        assert_eq!(canvas_pixels(&window), expected_preview);
+
+        window.preview_annotation_now(original.clone());
+        assert_eq!(canvas_pixels(&window), baseline);
+
+        window.preview_annotation_now(moved);
+        window.0.annotation_drag.replace(Some(AnnotationDrag::Move {
+            original: original.clone(),
+            start: Point { x: 12.5, y: 20.5 },
+        }));
+        assert!(window.cancel_annotation_drag());
+        let expected_generation = window.0.render_generation.get();
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while window.0.rendered_generation.get() != expected_generation && Instant::now() < deadline
+        {
+            context.iteration(false);
+        }
+        assert_eq!(window.0.rendered_generation.get(), expected_generation);
+        assert_eq!(canvas_pixels(&window), baseline);
+        assert_eq!(
+            window.0.document.borrow().as_ref().unwrap().annotations(),
+            vec![
+                original,
+                line(2, &[(12.5, 20.5), (12.5, 50.5)], [40, 70, 220, 255])
+            ]
         );
     }
 }

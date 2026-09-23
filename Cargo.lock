@@ -113,6 +113,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-scaler"
+version = "0.1.0"
+source = "git+https://github.com/mendrik-private/asset-scaler?rev=32d313b7ee94c67824002fb90db5fbb2b321a8e7#32d313b7ee94c67824002fb90db5fbb2b321a8e7"
+dependencies = [
+ "image",
+ "thiserror",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,8 +644,9 @@ dependencies = [
 
 [[package]]
 name = "diorama"
-version = "0.3.17"
+version = "0.3.19"
 dependencies = [
+ "asset-scaler",
  "base64",
  "crc32fast",
  "fast_image_resize",

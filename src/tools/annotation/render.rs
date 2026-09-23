@@ -9,7 +9,7 @@ use crate::tools::pencil::{blend, paint_stroke};
 
 use super::arrow::{arrow_head, curve_points};
 use super::font::{OutlineCommand, glyph_outline, units_per_em};
-use super::highlight::{draw_crayon, highlight_stroke_width, sloppy_ellipse};
+use super::highlight::{CrayonGeometry, draw_crayon, highlight_stroke_width};
 use super::measure::{gap_markers, length_label};
 use super::pencil::{geometry_bounds, stroke_for};
 use super::pixel_font::{CELL_HEIGHT as PIXEL_LABEL_HEIGHT, for_each_ink_pixel, text_width};
@@ -199,11 +199,19 @@ fn draw_annotation(
                 destination[3] = source[3];
             }
         }
-        Shape::Highlight { rect, seed, style } => {
+        Shape::Highlight {
+            rect,
+            angle,
+            seed,
+            style,
+        } => {
             draw_crayon(
                 pixmap,
-                *rect,
-                *seed,
+                CrayonGeometry {
+                    rect: *rect,
+                    angle: *angle,
+                    seed: *seed,
+                },
                 highlight_stroke_width(dimensions),
                 style.color,
                 transform,
@@ -776,8 +784,11 @@ fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<
             bounds.expand(style.width / 2.0 + 2.0);
             Some(bounds)
         }
-        Shape::Highlight { rect, seed, .. } => {
-            let mut points = sloppy_ellipse(*rect, *seed).into_iter();
+        Shape::Highlight {
+            rect, angle, seed, ..
+        } => {
+            let mut points =
+                super::highlight::rotated_sloppy_ellipse(*rect, *seed, *angle).into_iter();
             let mut bounds = Bounds::point(points.next()?);
             points.for_each(|point| bounds.include(point));
             bounds.expand(highlight_stroke_width(dimensions) / 2.0 + 2.0);
@@ -862,6 +873,7 @@ mod tests {
                     width: 20.0,
                     height: 20.0,
                 },
+                angle: 0.0,
                 seed: 5,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -912,6 +924,7 @@ mod tests {
                     width: 40.0,
                     height: 30.0,
                 },
+                angle: 0.0,
                 seed: 5,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -937,6 +950,37 @@ mod tests {
         .unwrap();
         assert!(bounded.pixels.width() < 100);
         assert!(bounded.pixels.height() < 100);
+    }
+
+    #[test]
+    fn rotated_highlight_render_bounds_follow_the_rotated_ellipse() {
+        let annotation = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Highlight {
+                rect: Rect {
+                    x: 50.0,
+                    y: 60.0,
+                    width: 100.0,
+                    height: 30.0,
+                },
+                angle: std::f32::consts::FRAC_PI_2,
+                seed: 9,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                },
+            },
+        };
+        let overlay = render_bounded_overlay(
+            (220, 220),
+            std::slice::from_ref(&annotation),
+            &CancellationToken::default(),
+        )
+        .expect("render rotated highlight")
+        .expect("rotated highlight bounds");
+        assert!(overlay.bounds.width < 45.0, "rotated width");
+        assert!(overlay.bounds.height > 100.0, "rotated height");
+        assert!(overlay.pixels.pixels().any(|pixel| pixel[3] != 0));
     }
 
     #[test]
@@ -1053,6 +1097,7 @@ mod tests {
                             width: 100.0,
                             height: 70.0,
                         },
+                        angle: 0.0,
                         seed: 5,
                         style: StrokeStyle {
                             color: [255, 0, 0, 255],

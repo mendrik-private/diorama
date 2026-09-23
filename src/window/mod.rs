@@ -5,14 +5,16 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::canvas::{Background, CropOverlay, ImageCanvas, LassoOverlay, MiniMap, ZoomFilter};
+use crate::canvas::{
+    Background, CropOverlay, ImageCanvas, LassoOverlay, MeshGrid, MiniMap, ZoomFilter,
+};
 use crate::compare::{SplitOrientation, choose_split};
 #[cfg(test)]
 use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
-    GameAssetAa, HIGHLIGHT_STROKE_WIDTH, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry,
-    Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
+    GameAssetAa, HIGHLIGHT_STROKE_WIDTH, LineLink, LineVertex, MEASUREMENT_STROKE_WIDTH, Operation,
+    PencilGeometry, Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -27,7 +29,7 @@ use crate::tools::annotation::highlight::highlight_stroke_width;
 use crate::tools::crop::CropBounds;
 use adw::prelude::{
     ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
-    ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt,
+    ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt, PreferencesRowExt,
 };
 use gio::prelude::*;
 use gtk::prelude::*;
@@ -38,6 +40,7 @@ mod canvas_resize;
 mod color;
 mod file_state;
 mod fullscreen_preview;
+mod mesh;
 mod presentation;
 mod print;
 mod scale;
@@ -170,6 +173,31 @@ fn lasso_overlay(prepared: &PreparedSelection) -> LassoOverlay {
         origin_x: prepared.origin.x,
         origin_y: prepared.origin.y,
     }
+}
+
+/// The crop remains the visible in-bounds provenance for the normal selection
+/// actions, while the cutout and alpha matte retain their complete dimensions
+/// for moving a clipboard image back across a canvas edge.
+fn pasted_crop(
+    canvas: (u32, u32),
+    cutout: (u32, u32),
+    origin: ForegroundOrigin,
+) -> Option<CropOverlay> {
+    let (canvas_width, canvas_height) = (i64::from(canvas.0), i64::from(canvas.1));
+    let right = origin.x.saturating_add(i64::from(cutout.0));
+    let bottom = origin.y.saturating_add(i64::from(cutout.1));
+    let left = origin.x.clamp(0, canvas_width);
+    let top = origin.y.clamp(0, canvas_height);
+    let right = right.clamp(0, canvas_width);
+    let bottom = bottom.clamp(0, canvas_height);
+    (right > left && bottom > top).then_some(CropOverlay {
+        x: left as u32,
+        y: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+        image_width: canvas.0,
+        image_height: canvas.1,
+    })
 }
 
 /// A fully off-canvas foreground cannot receive a pointer hit. While it is in
@@ -342,6 +370,56 @@ fn pencil_geometry(mode: PencilDragMode, points: &[BrushPoint]) -> Option<Pencil
             })
         }
     })
+}
+
+/// Keep an intentional line endpoint exactly on an existing editable vertex.
+/// The tolerance is expressed in image pixels so callers can keep it visually
+/// constant by dividing the screen-space handle size by the canvas scale.
+fn snap_line_endpoint(endpoint: Point, vertices: &[Point], tolerance: f32) -> Point {
+    vertices
+        .iter()
+        .copied()
+        .filter(|vertex| endpoint.distance(*vertex) <= tolerance)
+        .min_by(|left, right| {
+            endpoint
+                .distance(*left)
+                .total_cmp(&endpoint.distance(*right))
+        })
+        .unwrap_or(endpoint)
+}
+
+fn nearest_line_vertex(
+    annotations: &[Annotation],
+    endpoint: Point,
+    tolerance: f32,
+    exclude: Option<AnnotationId>,
+) -> Option<(LineVertex, Point)> {
+    annotations
+        .iter()
+        .filter(|annotation| Some(annotation.id) != exclude)
+        .filter_map(|annotation| match &annotation.shape {
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(points),
+                ..
+            } => Some((annotation.id, points)),
+            _ => None,
+        })
+        .flat_map(|(annotation, points)| {
+            points
+                .iter()
+                .copied()
+                .enumerate()
+                .map(move |(index, point)| {
+                    (
+                        LineVertex { annotation, index },
+                        point,
+                        endpoint.distance(point),
+                    )
+                })
+        })
+        .filter(|(_, _, distance)| *distance <= tolerance)
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+        .map(|(vertex, point, _)| (vertex, point))
 }
 
 fn pencil_event_time(gesture: &gtk::GestureDrag) -> u32 {
@@ -634,6 +712,15 @@ struct WindowState {
     selection_activation_pending: Cell<bool>,
     selection_foreground_active: Cell<bool>,
     region_controls: gtk::Box,
+    mesh_controls: gtk::Box,
+    square_grid_button: gtk::ToggleButton,
+    dimetric_grid_button: gtk::ToggleButton,
+    isometric_grid_button: gtk::ToggleButton,
+    warp_mesh_button: gtk::ToggleButton,
+    clear_mesh_button: gtk::Button,
+    apply_mesh_button: gtk::Button,
+    mesh: RefCell<Option<mesh::Session>>,
+    mesh_preview_generation: Cell<u64>,
     color_picker_button: gtk::ToggleButton,
     pencil_button: gtk::ToggleButton,
     lens_button: gtk::ToggleButton,
@@ -792,6 +879,29 @@ impl ViewerWindow {
             "win.selection-fill-background",
         ));
         canvas_overlay.add_overlay(&region_controls);
+        let mesh_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        mesh_controls.add_css_class("toolbar");
+        mesh_controls.add_css_class("osd");
+        mesh_controls.set_visible(false);
+        mesh_controls.set_halign(gtk::Align::Start);
+        mesh_controls.set_valign(gtk::Align::End);
+        mesh_controls.set_margin_start(26);
+        mesh_controls.set_margin_bottom(26);
+        let square_grid_button = toggle_button("view-grid-symbolic", "Square grid guide");
+        let dimetric_grid_button =
+            toggle_button("mesh-dimetric-symbolic", "2:1 dimetric grid guide");
+        let isometric_grid_button =
+            toggle_button("mesh-isometric-symbolic", "Isometric grid guide");
+        let warp_mesh_button = toggle_button("warp-mesh-symbolic", "Warp Mesh");
+        let clear_mesh_button = button("edit-clear-symbolic", "Clear Nodes", "win.clear-mesh");
+        let apply_mesh_button = button("emblem-ok-symbolic", "Apply mesh", "win.apply-mesh");
+        mesh_controls.append(&square_grid_button);
+        mesh_controls.append(&dimetric_grid_button);
+        mesh_controls.append(&isometric_grid_button);
+        mesh_controls.append(&warp_mesh_button);
+        mesh_controls.append(&clear_mesh_button);
+        mesh_controls.append(&apply_mesh_button);
+        canvas_overlay.add_overlay(&mesh_controls);
         let zoom_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         zoom_controls.add_css_class("toolbar");
         zoom_controls.add_css_class("osd");
@@ -1129,6 +1239,15 @@ impl ViewerWindow {
             selection_activation_pending: Cell::new(false),
             selection_foreground_active: Cell::new(false),
             region_controls,
+            mesh_controls,
+            square_grid_button,
+            dimetric_grid_button,
+            isometric_grid_button,
+            warp_mesh_button,
+            clear_mesh_button,
+            apply_mesh_button,
+            mesh: RefCell::new(None),
+            mesh_preview_generation: Cell::new(0),
             color_picker_button: header_widgets.color_picker_button,
             pencil_button: header_widgets.pencil_button,
             lens_button: header_widgets.lens_button,
@@ -1498,6 +1617,10 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.copy_current_selection_or_image_to_clipboard()
         });
+        self.add_action("paste-image", {
+            let this = self.clone();
+            move || this.paste_image_from_clipboard()
+        });
         self.add_action("copy-filepath", {
             let this = self.clone();
             move || this.copy_current_filepath_to_clipboard()
@@ -1623,6 +1746,13 @@ impl ViewerWindow {
         self.add_action("undo", {
             let this = self.clone();
             move || {
+                if this.mesh_undo() {
+                    this.update_action_states();
+                    return;
+                }
+                if this.0.tool.get() == Tool::MeshPoints {
+                    this.set_tool(Tool::None);
+                }
                 this.clear_region_selection();
                 this.0.nudge_annotation.set(None);
                 let changed = this
@@ -1640,6 +1770,13 @@ impl ViewerWindow {
         self.add_action("redo", {
             let this = self.clone();
             move || {
+                if this.mesh_redo() {
+                    this.update_action_states();
+                    return;
+                }
+                if this.0.tool.get() == Tool::MeshPoints {
+                    this.set_tool(Tool::None);
+                }
                 this.clear_region_selection();
                 this.0.nudge_annotation.set(None);
                 let changed = this
@@ -1685,6 +1822,18 @@ impl ViewerWindow {
         self.add_action("text", {
             let this = self.clone();
             move || this.toggle_tool(Tool::Text)
+        });
+        self.add_action("mesh-points", {
+            let this = self.clone();
+            move || this.toggle_tool(Tool::MeshPoints)
+        });
+        self.add_action("clear-mesh", {
+            let this = self.clone();
+            move || this.clear_mesh_nodes()
+        });
+        self.add_action("apply-mesh", {
+            let this = self.clone();
+            move || this.confirm_mesh()
         });
         self.add_action("scale-preview", {
             let this = self.clone();
@@ -1791,6 +1940,10 @@ impl ViewerWindow {
                     && let Some(return_tool) = this.0.return_tool.get()
                 {
                     this.set_tool(return_tool);
+                    return;
+                }
+                if this.0.tool.get() == Tool::MeshPoints {
+                    this.set_tool(Tool::None);
                     return;
                 }
                 if matches!(this.0.tool.get(), Tool::None | Tool::Select) {
@@ -1949,6 +2102,12 @@ impl ViewerWindow {
                     this.confirm_scale_preview();
                     return glib::Propagation::Stop;
                 }
+                if this.0.tool.get() == Tool::MeshPoints
+                    && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                {
+                    this.confirm_mesh();
+                    return glib::Propagation::Stop;
+                }
                 if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
                     && this.zoom_selected_region()
                 {
@@ -2072,7 +2231,7 @@ impl ViewerWindow {
             Tool::Select => Some(KeyboardTool::Select),
             Tool::PickColor => Some(KeyboardTool::PickColor),
             Tool::Pencil => Some(KeyboardTool::Pencil),
-            Tool::None | Tool::Scale => None,
+            Tool::None | Tool::MeshPoints | Tool::Scale => None,
         }
     }
 
@@ -2278,6 +2437,7 @@ impl ViewerWindow {
                                 width,
                                 height,
                             },
+                            angle: 0.0,
                             seed: id.0 ^ 0xD10A_AA73_9E37_79B9,
                             style: StrokeStyle {
                                 color,
@@ -2493,12 +2653,14 @@ impl ViewerWindow {
             "palette",
             "pencil",
             "pick-color",
+            "mesh-points",
             "select",
             "tool",
         ] {
             self.set_action_enabled(action, editable);
         }
         let region_selected = editable && self.0.region_selection.get().is_some();
+        self.set_action_enabled("paste-image", editable && self.rendered_is_current());
         for action in [
             "selection-copy",
             "selection-remove-background",
@@ -2525,8 +2687,16 @@ impl ViewerWindow {
             button.set_sensitive(vector_annotations_available);
         }
         self.set_action_enabled("save", document.as_ref().is_some_and(Document::is_dirty));
-        self.set_action_enabled("undo", document.as_ref().is_some_and(Document::can_undo));
-        self.set_action_enabled("redo", document.as_ref().is_some_and(Document::can_redo));
+        let (can_undo, can_redo) = if self.mesh_has_draft() {
+            (self.mesh_can_undo(), self.mesh_can_redo())
+        } else {
+            (
+                document.as_ref().is_some_and(Document::can_undo),
+                document.as_ref().is_some_and(Document::can_redo),
+            )
+        };
+        self.set_action_enabled("undo", can_undo);
+        self.set_action_enabled("redo", can_redo);
         let has_animation = self.0.animation_frames.borrow().len() > 1;
         self.set_action_enabled("play-pause", has_animation);
         self.set_action_enabled("previous-frame", has_animation);
@@ -2537,6 +2707,9 @@ impl ViewerWindow {
         // Any history mutation can make a cached cutout refer to pixels no
         // longer displayed (undo/redo included). A move restores its freshly
         // rebased cache immediately after applying its own snapshot.
+        if self.0.tool.get() == Tool::MeshPoints {
+            self.set_tool(Tool::None);
+        }
         if let Some(cancellation) = self.0.selection_preparation.borrow_mut().take() {
             cancellation.cancel();
         }
@@ -2610,6 +2783,10 @@ impl ViewerWindow {
             Tool::PickColor => self.set_color_picker_active(false),
             Tool::Select => self.set_selection_active(false),
             Tool::Scale => self.set_scale_preview_active(false),
+            Tool::MeshPoints => {
+                self.0.mesh_controls.set_visible(false);
+                self.finish_mesh_session(true);
+            }
             Tool::Measure => {
                 self.0.canvas.set_measurement_cursor(None);
                 self.prepare_keyboard_tool(false);
@@ -2647,6 +2824,15 @@ impl ViewerWindow {
             Tool::PickColor => self.set_color_picker_active(true),
             Tool::Select => self.set_selection_active(true),
             Tool::Scale => self.set_scale_preview_active(true),
+            Tool::MeshPoints => {
+                if self.start_mesh_session() {
+                    self.0.mesh_controls.set_visible(true);
+                    self.0.canvas.set_cursor_from_name(Some("crosshair"));
+                } else {
+                    self.0.tool.set(Tool::Select);
+                    self.set_selection_active(true);
+                }
+            }
             Tool::Measure => {
                 self.0.canvas.set_cursor_from_name(Some("none"));
                 self.prepare_keyboard_tool(true);
@@ -2731,6 +2917,50 @@ impl ViewerWindow {
     }
 
     fn install_tool_controls(&self) {
+        self.0.square_grid_button.connect_toggled({
+            let this = self.clone();
+            move |button| {
+                let should_toggle = !this.0.updating_tool.get()
+                    && this.0.mesh.borrow().as_ref().is_some_and(|session| {
+                        button.is_active() || session.grid == Some(MeshGrid::Square)
+                    });
+                if should_toggle {
+                    this.set_mesh_grid(MeshGrid::Square);
+                }
+            }
+        });
+        self.0.dimetric_grid_button.connect_toggled({
+            let this = self.clone();
+            move |button| {
+                let should_toggle = !this.0.updating_tool.get()
+                    && this.0.mesh.borrow().as_ref().is_some_and(|session| {
+                        button.is_active() || session.grid == Some(MeshGrid::Dimetric)
+                    });
+                if should_toggle {
+                    this.set_mesh_grid(MeshGrid::Dimetric);
+                }
+            }
+        });
+        self.0.isometric_grid_button.connect_toggled({
+            let this = self.clone();
+            move |button| {
+                let should_toggle = !this.0.updating_tool.get()
+                    && this.0.mesh.borrow().as_ref().is_some_and(|session| {
+                        button.is_active() || session.grid == Some(MeshGrid::Isometric)
+                    });
+                if should_toggle {
+                    this.set_mesh_grid(MeshGrid::Isometric);
+                }
+            }
+        });
+        self.0.warp_mesh_button.connect_toggled({
+            let this = self.clone();
+            move |button| {
+                if !this.0.updating_tool.get() && button.is_active() {
+                    this.begin_mesh_warp();
+                }
+            }
+        });
         self.0.measurement_button.connect_toggled({
             let this = self.clone();
             move |button| this.tool_button_toggled(button, Tool::Measure)
@@ -3529,6 +3759,149 @@ impl ViewerWindow {
         }
     }
 
+    fn paste_image_from_clipboard(&self) {
+        if text_input_has_focus(&self.0.window) {
+            return;
+        }
+        if !self.rendered_is_current() {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
+            return;
+        }
+        let Some(operations): Option<Arc<[Operation]>> = self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .map(|document| document.operations().into())
+        else {
+            self.0
+                .toasts
+                .add_toast(adw::Toast::new(&gettext("Open an editable image first")));
+            return;
+        };
+        let render_generation = self.0.render_generation.get();
+        let clipboard = self.0.window.clipboard();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            let result = clipboard.read_texture_future().await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let window = ViewerWindow(state);
+            if !window.clipboard_paste_is_current(render_generation, &operations) {
+                return;
+            }
+            match result {
+                Ok(Some(texture)) => match rgba_from_texture(&texture) {
+                    Some(image) => window.paste_rgba_image(image),
+                    None => window.0.toasts.add_toast(adw::Toast::new(&gettext(
+                        "Clipboard image could not be read",
+                    ))),
+                },
+                Ok(None) => window.0.toasts.add_toast(adw::Toast::new(&gettext(
+                    "Clipboard does not contain an image",
+                ))),
+                Err(error) => window.0.toasts.add_toast(adw::Toast::new(
+                    &gettext("Could not read image from clipboard: {error}")
+                        .replace("{error}", &error.to_string()),
+                )),
+            }
+        });
+    }
+
+    fn clipboard_paste_is_current(&self, render_generation: u64, operations: &[Operation]) -> bool {
+        self.0.render_generation.get() == render_generation
+            && self.rendered_is_current()
+            && self.0.fullscreen_preview.borrow().is_none()
+            && !text_input_has_focus(&self.0.window)
+            && self
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .is_some_and(|document| document.operations() == operations)
+    }
+
+    fn paste_rgba_image(&self, cutout: image::RgbaImage) {
+        if cutout.width() == 0
+            || cutout.height() == 0
+            || !cutout.pixels().any(|pixel| pixel[3] != 0)
+        {
+            self.0.toasts.add_toast(adw::Toast::new(&gettext(
+                "Clipboard image has no visible pixels",
+            )));
+            return;
+        }
+        let Some(current) = self.0.rendered.borrow().as_ref().cloned() else {
+            return;
+        };
+        let origin = ForegroundOrigin {
+            x: (i64::from(current.width()) - i64::from(cutout.width())).div_euclid(2),
+            y: (i64::from(current.height()) - i64::from(cutout.height())).div_euclid(2),
+        };
+        let Some(crop) = pasted_crop(current.dimensions(), cutout.dimensions(), origin) else {
+            return;
+        };
+        let mask = image::GrayImage::from_fn(cutout.width(), cutout.height(), |x, y| {
+            image::Luma([cutout.get_pixel(x, y)[3]])
+        });
+        let mut pasted = current.clone();
+        if crate::tools::selection::paste_cutout_at(&mut pasted, origin.x, origin.y, &cutout, &mask)
+            .is_err()
+        {
+            return;
+        }
+        self.0.region_drag.set(None);
+        self.set_tool(Tool::Select);
+        let flattened_annotations =
+            self.0
+                .document
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, |document| {
+                    document
+                        .annotations()
+                        .into_iter()
+                        .map(|annotation| annotation.id)
+                        .collect()
+                });
+        self.apply(Operation::SelectionEdit {
+            pixels: Arc::new(pasted),
+            flattened_annotations,
+        });
+        let operations: Arc<[Operation]> = self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .map_or_else(|| Arc::from([]), |document| document.operations().into());
+        let clean_background = Arc::new(current);
+        let prepared = PreparedSelection {
+            crop,
+            origin,
+            mask: Arc::new(mask),
+            cutout: Arc::new(cutout),
+            background: crate::tools::selection::detected_background(&clean_background)
+                .unwrap_or([0; 4]),
+            clean_background: Some(clean_background.clone()),
+            fallback_background: clean_background,
+            operations,
+        };
+        self.0.prepared_selection.replace(Some(prepared.clone()));
+        self.0.selection_foreground_active.set(true);
+        self.0.region_selection.set(Some(crop));
+        self.0.canvas.set_crop_overlay(None);
+        self.0
+            .canvas
+            .set_lasso_overlay(Some(lasso_overlay(&prepared)));
+        self.update_action_states();
+        self.0.toasts.add_toast(adw::Toast::new(&gettext(
+            "Pasted image. Drag its outline to move it.",
+        )));
+    }
+
     fn open_with(&self) {
         let Some(file) = self.0.current_file.borrow().clone() else {
             self.0
@@ -3916,7 +4289,7 @@ impl ViewerWindow {
     }
 
     fn commit_editable_pencil_stroke(&self, points: &[BrushPoint], mode: PencilDragMode) {
-        let Some(geometry) = pencil_geometry(mode, points) else {
+        let Some(mut geometry) = pencil_geometry(mode, points) else {
             self.0.canvas.clear_pencil_overlay();
             return;
         };
@@ -3939,11 +4312,38 @@ impl ViewerWindow {
                 ..
             } = &mut annotation.shape
         {
+            let tolerance = 8.0 / self.0.canvas.image_scale().max(0.01);
+            let (end, link) = self
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .and_then(|document| {
+                    nearest_line_vertex(&document.annotations(), end, tolerance, None)
+                })
+                .map_or_else(
+                    || (snap_line_endpoint(end, vertices, tolerance), None),
+                    |(vertex, point)| (point, (vertex.annotation != id).then_some(vertex)),
+                );
             if vertices.last().copied() != Some(end) {
+                let index = vertices.len();
                 vertices.push(end);
                 self.0.canvas.clear_pencil_overlay();
                 self.commit_annotation_preview(&annotation);
-                self.apply(Operation::Annotate(AnnotationEdit::Set(annotation)));
+                if let Some(second) = link {
+                    self.apply(Operation::Annotate(AnnotationEdit::SetLinked {
+                        annotation,
+                        links: vec![LineLink {
+                            first: LineVertex {
+                                annotation: id,
+                                index,
+                            },
+                            second,
+                        }],
+                    }));
+                } else {
+                    self.apply(Operation::Annotate(AnnotationEdit::Set(annotation)));
+                }
             } else {
                 self.0.canvas.clear_pencil_overlay();
             }
@@ -3958,6 +4358,30 @@ impl ViewerWindow {
             };
             document.allocate_annotation_id()
         };
+        let mut links = Vec::new();
+        if let PencilGeometry::Line(vertices) = &mut geometry {
+            let tolerance = 8.0 / self.0.canvas.image_scale().max(0.01);
+            let annotations = self
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, Document::annotations);
+            for (index, vertex) in vertices.iter_mut().enumerate() {
+                if let Some((second, point)) =
+                    nearest_line_vertex(&annotations, *vertex, tolerance, None)
+                {
+                    *vertex = point;
+                    links.push(LineLink {
+                        first: LineVertex {
+                            annotation: id,
+                            index,
+                        },
+                        second,
+                    });
+                }
+            }
+        }
         let annotation = Annotation {
             id,
             shape: Shape::Pencil {
@@ -3971,7 +4395,11 @@ impl ViewerWindow {
         };
         self.0.canvas.clear_pencil_overlay();
         self.commit_annotation_preview(&annotation);
-        self.apply(Operation::Annotate(AnnotationEdit::Create(annotation)));
+        self.apply(Operation::Annotate(if links.is_empty() {
+            AnnotationEdit::Create(annotation)
+        } else {
+            AnnotationEdit::CreateLinked { annotation, links }
+        }));
         if mode == PencilDragMode::Freehand && points.len() == 1 {
             self.select_annotation(None);
         } else {
@@ -4023,17 +4451,44 @@ impl ViewerWindow {
         if canvas != &self.0.canvas || button != 1 {
             return;
         }
-        let Some(origin) = canvas
+        let mode = pencil_drag_mode(modifiers);
+        let Some(mut origin) = canvas
             .pixel_at(screen_x, screen_y)
             .map(|(x, y)| BrushPoint {
                 x: x as f32 + 0.5,
                 y: y as f32 + 0.5,
                 pressure: 1.0,
             })
+            .or_else(|| {
+                (mode == PencilDragMode::Line)
+                    .then(|| canvas.image_point_at(screen_x, screen_y))
+                    .flatten()
+                    .map(|point| BrushPoint {
+                        x: point.x,
+                        y: point.y,
+                        pressure: 1.0,
+                    })
+            })
         else {
             return;
         };
-        let mode = pencil_drag_mode(modifiers);
+        if mode == PencilDragMode::Line {
+            let pointer = canvas.image_point_at(screen_x, screen_y).unwrap_or(Point {
+                x: origin.x,
+                y: origin.y,
+            });
+            if let Some((_, point)) = self.0.document.borrow().as_ref().and_then(|document| {
+                nearest_line_vertex(
+                    &document.annotations(),
+                    pointer,
+                    8.0 / canvas.image_scale().max(0.01),
+                    None,
+                )
+            }) {
+                origin.x = point.x;
+                origin.y = point.y;
+            }
+        }
         let line_start = pencil_line_start(
             mode,
             self.pencil_line_chain_end()
@@ -4062,16 +4517,49 @@ impl ViewerWindow {
         screen_y: f64,
         timestamp_ms: u32,
     ) {
-        let Some(current) = canvas
+        let line_drag = self
+            .0
+            .pencil_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.mode == PencilDragMode::Line);
+        let Some(mut current) = canvas
             .pixel_at(screen_x, screen_y)
             .map(|(x, y)| BrushPoint {
                 x: x as f32 + 0.5,
                 y: y as f32 + 0.5,
                 pressure: 1.0,
             })
+            .or_else(|| {
+                line_drag
+                    .then(|| canvas.image_point_at(screen_x, screen_y))
+                    .flatten()
+                    .map(|point| BrushPoint {
+                        x: point.x,
+                        y: point.y,
+                        pressure: 1.0,
+                    })
+            })
         else {
             return;
         };
+        if line_drag {
+            let endpoint = canvas.image_point_at(screen_x, screen_y).unwrap_or(Point {
+                x: current.x,
+                y: current.y,
+            });
+            if let Some((_, point)) = self.0.document.borrow().as_ref().and_then(|document| {
+                nearest_line_vertex(
+                    &document.annotations(),
+                    endpoint,
+                    8.0 / canvas.image_scale().max(0.01),
+                    None,
+                )
+            }) {
+                current.x = point.x;
+                current.y = point.y;
+            }
+        }
         let (points, path, should_preview) = {
             let mut pencil_drag = self.0.pencil_drag.borrow_mut();
             let Some(drag) = pencil_drag.as_mut() else {
@@ -4844,11 +5332,26 @@ impl ViewerWindow {
             .model(&color_format_model)
             .selected(color_format_index(self.0.settings.color_picker_format()))
             .build();
+        let mesh_grid_size = adw::SpinRow::with_range(1.0, 1_000_000.0, 1.0);
+        mesh_grid_size.set_title(&gettext("Mesh grid size"));
+        mesh_grid_size.set_subtitle(&gettext("Image pixels"));
+        mesh_grid_size.set_value(f64::from(self.0.settings.mesh_grid_size()));
+        let mesh_grid_offset_x = adw::SpinRow::with_range(-1_000_000.0, 1_000_000.0, 1.0);
+        mesh_grid_offset_x.set_title(&gettext("Mesh grid X offset"));
+        mesh_grid_offset_x.set_subtitle(&gettext("Image pixels"));
+        mesh_grid_offset_x.set_value(f64::from(self.0.settings.mesh_grid_offset_x()));
+        let mesh_grid_offset_y = adw::SpinRow::with_range(-1_000_000.0, 1_000_000.0, 1.0);
+        mesh_grid_offset_y.set_title(&gettext("Mesh grid Y offset"));
+        mesh_grid_offset_y.set_subtitle(&gettext("Image pixels"));
+        mesh_grid_offset_y.set_value(f64::from(self.0.settings.mesh_grid_offset_y()));
         let drawing_group = adw::PreferencesGroup::builder()
             .title(gettext("Drawing"))
             .build();
         drawing_group.add(&anti_aliasing);
         drawing_group.add(&color_format);
+        drawing_group.add(&mesh_grid_size);
+        drawing_group.add(&mesh_grid_offset_x);
+        drawing_group.add(&mesh_grid_offset_y);
 
         page.add(&viewing_group);
         page.add(&drawing_group);
@@ -4909,6 +5412,33 @@ impl ViewerWindow {
         color_format.connect_selected_notify({
             let settings = self.0.settings.clone();
             move |row| settings.set_color_picker_format(color_format_at(row.selected()))
+        });
+        mesh_grid_size.connect_value_notify({
+            let this = self.clone();
+            move |row| {
+                this.0
+                    .settings
+                    .set_mesh_grid_size(row.value().round().clamp(1.0, 1_000_000.0) as u32);
+                this.refresh_mesh_overlay();
+            }
+        });
+        mesh_grid_offset_x.connect_value_notify({
+            let this = self.clone();
+            move |row| {
+                this.0
+                    .settings
+                    .set_mesh_grid_offset_x(row.value().round() as i32);
+                this.refresh_mesh_overlay();
+            }
+        });
+        mesh_grid_offset_y.connect_value_notify({
+            let this = self.clone();
+            move |row| {
+                this.0
+                    .settings
+                    .set_mesh_grid_offset_y(row.value().round() as i32);
+                this.refresh_mesh_overlay();
+            }
         });
         dialog.present(Some(&self.0.window));
     }
@@ -5034,6 +5564,7 @@ impl ViewerWindow {
                     (gettext("Measure"), "m"),
                     (gettext("Text"), "t"),
                     (gettext("Scale"), "s"),
+                    (gettext("Warp Mesh"), "w"),
                     (gettext("Zoom Selected Region or Apply Scale"), "Return"),
                     (gettext("Move Active Tool"), "Left Right Up Down"),
                     (gettext("Set Tool Point"), "Return"),
@@ -7046,10 +7577,9 @@ impl ViewerWindow {
                 };
                 let Some(image_dimensions) = this
                     .0
-                    .rendered
-                    .borrow()
-                    .as_ref()
-                    .map(image::GenericImageView::dimensions)
+                    .canvas
+                    .texture()
+                    .map(|texture| (texture.width() as u32, texture.height() as u32))
                 else {
                     return;
                 };
@@ -7068,6 +7598,9 @@ impl ViewerWindow {
         region_drag.connect_drag_update({
             let this = self.clone();
             move |_, dx, dy| {
+                if this.0.tool.get() != Tool::Select {
+                    return;
+                }
                 let Some(drag) = this.0.region_drag.get() else {
                     return;
                 };
@@ -7157,6 +7690,9 @@ impl ViewerWindow {
         region_drag.connect_drag_end({
             let this = self.clone();
             move |_, dx, dy| {
+                if this.0.tool.get() != Tool::Select {
+                    return;
+                }
                 let Some(drag) = this.0.region_drag.take() else {
                     return;
                 };
@@ -7290,6 +7826,58 @@ impl ViewerWindow {
         });
         self.0.canvas.add_controller(region_drag);
 
+        let mesh_click = gtk::GestureClick::new();
+        mesh_click.set_button(1);
+        mesh_click.connect_pressed({
+            let this = self.clone();
+            move |gesture, _, x, y| {
+                let drawing = this
+                    .0
+                    .mesh
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| !session.warped);
+                if this.0.tool.get() == Tool::MeshPoints && drawing {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    this.mesh_click(x, y);
+                    this.0.canvas.grab_focus();
+                }
+            }
+        });
+        self.0.canvas.add_controller(mesh_click);
+        let mesh_drag = gtk::GestureDrag::new();
+        mesh_drag.set_button(1);
+        let mesh_drag_start = Rc::new(Cell::new(None::<(f64, f64)>));
+        mesh_drag.connect_drag_begin({
+            let this = self.clone();
+            let start = mesh_drag_start.clone();
+            move |gesture, x, y| {
+                if this.0.tool.get() == Tool::MeshPoints && this.mesh_begin_drag(x, y) {
+                    start.set(Some((x, y)));
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            }
+        });
+        mesh_drag.connect_drag_update({
+            let this = self.clone();
+            let start = mesh_drag_start.clone();
+            move |_, dx, dy| {
+                if let Some((x, y)) = start.get() {
+                    this.mesh_drag_to(x + dx, y + dy);
+                }
+            }
+        });
+        mesh_drag.connect_drag_end({
+            let this = self.clone();
+            let start = mesh_drag_start.clone();
+            move |_, _, _| {
+                if start.take().is_some() {
+                    this.mesh_end_drag();
+                }
+            }
+        });
+        self.0.canvas.add_controller(mesh_drag);
+
         let pencil = gtk::GestureDrag::new();
         pencil.set_button(1);
         pencil.connect_drag_begin({
@@ -7298,7 +7886,11 @@ impl ViewerWindow {
                 if this.0.tool.get() != Tool::Pencil {
                     return;
                 }
-                if !pencil_drag_available(this.annotation_hit_at(x, y)) {
+                let mode = pencil_drag_mode(gesture.current_event_state());
+                if !pencil_drag_available(
+                    this.annotation_hit_at(x, y),
+                    mode == PencilDragMode::Line,
+                ) {
                     return;
                 }
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -7355,6 +7947,10 @@ impl ViewerWindow {
                     this.commit_editable_pencil_stroke(&points, mode);
                 }
             }
+        });
+        pencil.connect_cancel({
+            let this = self.clone();
+            move |_, _| this.abort_pencil_drag()
         });
         self.0.canvas.add_controller(pencil);
 
@@ -7533,7 +8129,7 @@ fn build_header(title: &adw::WindowTitle) -> HeaderWidgets {
     header.pack_start(&animation_controls);
     header.pack_start(&previous);
     header.pack_start(&next);
-    header.pack_end(&menu_button());
+    header.pack_start(&menu_button());
     let save_as_button = button("media-floppy-symbolic", "Save As", "win.save-as");
     header.pack_end(&save_as_button);
     HeaderWidgets {
@@ -7609,40 +8205,55 @@ fn menu_submenu(menu: &gio::Menu, label: &str, submenu: &gio::Menu) {
 
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu_item(&menu, "Open…", "win.open");
-    menu_item(&menu, "Open With…", "win.open-with");
-    menu_item(&menu, "Copy Image or Selection", "win.copy-image");
-    menu_item(&menu, "Copy Filepath", "win.copy-filepath");
-    menu_item(&menu, "Save", "win.save");
-    menu_item(&menu, "Save As…", "win.save-as");
-    menu_item(&menu, "Print…", "win.print");
-    menu_item(&menu, "Compare Images…", "win.compare");
+
+    let file_menu = gio::Menu::new();
+    menu_item(&file_menu, "Open…", "win.open");
+    menu_item(&file_menu, "Open With…", "win.open-with");
+    menu_item(&file_menu, "Copy Image or Selection", "win.copy-image");
+    menu_item(&file_menu, "Copy Filepath", "win.copy-filepath");
+    menu_item(&file_menu, "Save", "win.save");
+    menu_item(&file_menu, "Save As…", "win.save-as");
+    menu_item(&file_menu, "Print…", "win.print");
+    menu_submenu(&menu, "File", &file_menu);
+
+    let tools_menu = gio::Menu::new();
+    menu_item(&tools_menu, "Select Region", "win.select");
+    menu_item(&tools_menu, "Paste Image", "win.paste-image");
+    menu_item(&tools_menu, "Compare Images…", "win.compare");
+    menu_item(&tools_menu, "Magnifying Lens", "win.lens");
+    menu_item(&tools_menu, "Measure", "win.measure");
+    menu_submenu(&menu, "Tools", &tools_menu);
+
     let edit_menu = gio::Menu::new();
+    menu_item(&edit_menu, "Crop to Content", "win.crop-content");
     menu_item(&edit_menu, "Pencil", "win.pencil");
     menu_item(&edit_menu, "Highlight", "win.highlight");
     menu_item(&edit_menu, "Arrow", "win.arrow");
-    menu_item(&edit_menu, "Measure", "win.measure");
     menu_item(&edit_menu, "Text", "win.text");
-    menu_item(&edit_menu, "Select Region", "win.select");
+    menu_submenu(&menu, "Edit", &edit_menu);
+
+    let transform_menu = gio::Menu::new();
     menu_item(
-        &edit_menu,
+        &transform_menu,
         "Rotate Counterclockwise",
         "win.rotate-counterclockwise",
     );
-    menu_item(&edit_menu, "Rotate Clockwise", "win.rotate-clockwise");
-    menu_item(&edit_menu, "Flip Horizontally", "win.flip-horizontal");
-    menu_item(&edit_menu, "Flip Vertically", "win.flip-vertical");
-    menu_item(&edit_menu, "Scale", "win.scale-preview");
-    menu_item(&edit_menu, "Crop to Content", "win.crop-content");
-    menu_item(&edit_menu, "Square Up", "win.square-up");
-    menu_item(&edit_menu, "Canvas Resize…", "win.canvas-resize");
-    menu_submenu(&menu, "Edit", &edit_menu);
-    menu_item(&menu, "Magnifying Lens", "win.lens");
-    menu_item(&menu, "Fullscreen Image Preview", "win.image-preview");
-    menu_item(&menu, "Image Properties", "win.properties");
-    menu_item(&menu, "Preferences", "win.preferences");
-    menu_item(&menu, "Keyboard Shortcuts", "win.shortcuts");
-    menu_item(&menu, "About Diorama", "win.about");
+    menu_item(&transform_menu, "Rotate Clockwise", "win.rotate-clockwise");
+    menu_item(&transform_menu, "Flip Horizontally", "win.flip-horizontal");
+    menu_item(&transform_menu, "Flip Vertically", "win.flip-vertical");
+    menu_item(&transform_menu, "Scale", "win.scale-preview");
+    menu_item(&transform_menu, "Square Up", "win.square-up");
+    menu_item(&transform_menu, "Warp Mesh", "win.mesh-points");
+    menu_item(&transform_menu, "Canvas Resize…", "win.canvas-resize");
+    menu_submenu(&menu, "Transform", &transform_menu);
+
+    let info_menu = gio::Menu::new();
+    menu_item(&info_menu, "Fullscreen Image Preview", "win.image-preview");
+    menu_item(&info_menu, "Image Properties", "win.properties");
+    menu_item(&info_menu, "Preferences", "win.preferences");
+    menu_item(&info_menu, "Keyboard Shortcuts", "win.shortcuts");
+    menu_item(&info_menu, "About Diorama", "win.about");
+    menu_submenu(&menu, "Info", &info_menu);
     menu
 }
 
@@ -7786,6 +8397,7 @@ mod tests {
                     width: 8.0,
                     height: 8.0,
                 },
+                angle: 0.0,
                 seed: 1,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -8282,6 +8894,68 @@ mod tests {
     }
 
     #[test]
+    fn line_endpoint_snaps_to_the_nearest_existing_vertex_within_handle_tolerance() {
+        let vertices = [
+            Point { x: 4.5, y: 4.5 },
+            Point { x: 5.2, y: 4.6 },
+            Point { x: 20.5, y: 12.5 },
+        ];
+
+        assert_eq!(
+            snap_line_endpoint(Point { x: 4.8, y: 4.7 }, &vertices, 1.0),
+            vertices[0],
+            "closing a line near its starting node must weld it exactly"
+        );
+        assert_eq!(
+            snap_line_endpoint(Point { x: 12.0, y: 12.0 }, &vertices, 1.0),
+            Point { x: 12.0, y: 12.0 },
+            "a distant endpoint must remain independent"
+        );
+    }
+
+    #[test]
+    fn line_vertex_snap_prefers_the_closest_node_even_on_the_active_line() {
+        let active = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Line(vec![
+                    Point { x: 4.5, y: 4.5 },
+                    Point { x: 20.5, y: 12.5 },
+                ]),
+                style: StrokeStyle {
+                    color: [0; 4],
+                    width: 1.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        let external = Annotation {
+            id: AnnotationId(2),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Line(vec![
+                    Point { x: 4.9, y: 4.5 },
+                    Point { x: 8.0, y: 8.0 },
+                ]),
+                style: StrokeStyle {
+                    color: [0; 4],
+                    width: 1.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        assert_eq!(
+            nearest_line_vertex(&[active, external], Point { x: 4.6, y: 4.5 }, 1.0, None),
+            Some((
+                LineVertex {
+                    annotation: AnnotationId(1),
+                    index: 0,
+                },
+                Point { x: 4.5, y: 4.5 },
+            ))
+        );
+    }
+
+    #[test]
     #[ignore = "requires a graphical display"]
     fn circle_drag_does_not_fall_back_to_buffered_freehand_points() {
         adw::init().expect("GTK display initialization");
@@ -8376,7 +9050,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_menu_contains_tools_and_transforms_directly() {
+    fn main_menu_groups_every_action_in_the_requested_order() {
         let menu: gio::MenuModel = main_menu().upcast();
         let string_attribute = |model: &gio::MenuModel, index, name| {
             model
@@ -8384,88 +9058,104 @@ mod tests {
                 .and_then(|value| value.get::<String>())
                 .expect("string menu attribute")
         };
-        let edit_index = (0..menu.n_items())
-            .find(|index| string_attribute(&menu, *index, "label") == "Edit")
-            .expect("Edit submenu");
-        let edit_menu = menu
-            .item_link(edit_index, "submenu")
-            .expect("Edit submenu model");
-        assert_eq!(
-            (0..edit_menu.n_items())
-                .map(|index| string_attribute(&edit_menu, index, "label"))
-                .collect::<Vec<_>>(),
-            [
-                "Pencil".to_owned(),
-                "Highlight".to_owned(),
-                "Arrow".to_owned(),
-                "Measure".to_owned(),
-                "Text".to_owned(),
-                "Select Region".to_owned(),
-                "Rotate Counterclockwise".to_owned(),
-                "Rotate Clockwise".to_owned(),
-                "Flip Horizontally".to_owned(),
-                "Flip Vertically".to_owned(),
-                "Scale".to_owned(),
-                "Crop to Content".to_owned(),
-                "Square Up".to_owned(),
-                "Canvas Resize…".to_owned(),
-            ]
-        );
-        for (index, action) in [
-            (0, "win.pencil"),
-            (1, "win.highlight"),
-            (2, "win.arrow"),
-            (3, "win.measure"),
-            (4, "win.text"),
-            (5, "win.select"),
-            (6, "win.rotate-counterclockwise"),
-            (7, "win.rotate-clockwise"),
-            (8, "win.flip-horizontal"),
-            (9, "win.flip-vertical"),
-            (10, "win.scale-preview"),
-        ] {
-            assert_eq!(string_attribute(&edit_menu, index, "action"), action);
+        let expected = [
+            (
+                "File",
+                [
+                    ("Open…", "win.open"),
+                    ("Open With…", "win.open-with"),
+                    ("Copy Image or Selection", "win.copy-image"),
+                    ("Copy Filepath", "win.copy-filepath"),
+                    ("Save", "win.save"),
+                    ("Save As…", "win.save-as"),
+                    ("Print…", "win.print"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "Tools",
+                [
+                    ("Select Region", "win.select"),
+                    ("Paste Image", "win.paste-image"),
+                    ("Compare Images…", "win.compare"),
+                    ("Magnifying Lens", "win.lens"),
+                    ("Measure", "win.measure"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "Edit",
+                [
+                    ("Crop to Content", "win.crop-content"),
+                    ("Pencil", "win.pencil"),
+                    ("Highlight", "win.highlight"),
+                    ("Arrow", "win.arrow"),
+                    ("Text", "win.text"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "Transform",
+                [
+                    ("Rotate Counterclockwise", "win.rotate-counterclockwise"),
+                    ("Rotate Clockwise", "win.rotate-clockwise"),
+                    ("Flip Horizontally", "win.flip-horizontal"),
+                    ("Flip Vertically", "win.flip-vertical"),
+                    ("Scale", "win.scale-preview"),
+                    ("Square Up", "win.square-up"),
+                    ("Warp Mesh", "win.mesh-points"),
+                    ("Canvas Resize…", "win.canvas-resize"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "Info",
+                [
+                    ("Fullscreen Image Preview", "win.image-preview"),
+                    ("Image Properties", "win.properties"),
+                    ("Preferences", "win.preferences"),
+                    ("Keyboard Shortcuts", "win.shortcuts"),
+                    ("About Diorama", "win.about"),
+                ]
+                .as_slice(),
+            ),
+        ];
+
+        assert_eq!(menu.n_items(), expected.len() as i32);
+        for (index, (group_label, expected_items)) in expected.iter().enumerate() {
+            assert_eq!(
+                string_attribute(&menu, index as i32, "label"),
+                *group_label,
+                "top-level group {index}"
+            );
+            assert!(
+                menu.item_attribute_value(index as i32, "action", None)
+                    .is_none(),
+                "top-level group {group_label} must not be an action"
+            );
+            let submenu = menu
+                .item_link(index as i32, "submenu")
+                .expect("group submenu model");
+            assert_eq!(submenu.n_items(), expected_items.len() as i32);
+            let actual_items = (0..submenu.n_items())
+                .map(|item_index| {
+                    (
+                        string_attribute(&submenu, item_index, "label"),
+                        string_attribute(&submenu, item_index, "action"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected_items = expected_items
+                .iter()
+                .map(|(label, action)| (label.to_string(), action.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual_items, expected_items, "{group_label} items");
+            assert!(
+                (0..submenu.n_items())
+                    .all(|item_index| submenu.item_link(item_index, "submenu").is_none()),
+                "{group_label} contains only direct actions"
+            );
         }
-        assert!(
-            (0..edit_menu.n_items()).all(|index| edit_menu.item_link(index, "submenu").is_none())
-        );
-    }
-
-    #[test]
-    fn main_menu_separates_image_properties_from_preferences() {
-        let menu: gio::MenuModel = main_menu().upcast();
-        let string_attribute = |index, name| {
-            menu.item_attribute_value(index, name, None)
-                .and_then(|value| value.get::<String>())
-        };
-        let entries = (0..menu.n_items())
-            .filter_map(|index| {
-                Some((
-                    string_attribute(index, "label")?,
-                    string_attribute(index, "action")?,
-                ))
-            })
-            .collect::<Vec<_>>();
-        assert!(entries.contains(&("Image Properties".to_owned(), "win.properties".to_owned())));
-        assert!(entries.contains(&("Preferences".to_owned(), "win.preferences".to_owned())));
-    }
-
-    #[test]
-    fn main_menu_delegates_open_with_to_a_window_action() {
-        let menu: gio::MenuModel = main_menu().upcast();
-        let entries = (0..menu.n_items())
-            .filter_map(|index| {
-                let label = menu
-                    .item_attribute_value(index, "label", None)?
-                    .get::<String>()?;
-                let action = menu
-                    .item_attribute_value(index, "action", None)?
-                    .get::<String>()?;
-                Some((label, action))
-            })
-            .collect::<Vec<_>>();
-
-        assert!(entries.contains(&("Open With…".to_owned(), "win.open-with".to_owned())));
     }
 
     #[test]
@@ -9190,6 +9880,7 @@ mod tests {
                     width: 12.0,
                     height: 8.0,
                 },
+                angle: 0.0,
                 seed: 1,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -9836,6 +10527,232 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn select_drag_uses_scaled_image_coordinates_after_committing_scale() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ScaleSelectionCoordinatesTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        window.0.window.set_default_size(800, 600);
+        let source = image::RgbaImage::from_fn(31, 23, |x, y| {
+            image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        });
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(source.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(source.clone()));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&source).expect("source texture")));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        window.present();
+
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while (window.0.canvas.width() == 0 || window.0.canvas.height() == 0)
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(
+            window.0.canvas.width() > 0 && window.0.canvas.height() > 0,
+            "the presented canvas must be allocated before deriving gesture coordinates"
+        );
+
+        window.0.scale_button.set_active(true);
+        window.0.scale_method.set_selected(0);
+        window.0.scale_width.set_value(47.0);
+        assert_eq!(window.0.scale_width.value(), 47.0);
+        assert_eq!(window.0.scale_height.value(), 35.0);
+
+        let target_dimensions = (47, 35);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while (window.0.scale_spinner.get_visible()
+            || window.0.canvas.texture().is_none_or(|texture| {
+                (texture.width() as u32, texture.height() as u32) != target_dimensions
+            }))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(
+            !window.0.scale_spinner.get_visible(),
+            "target-sized scale preview completed before committing"
+        );
+        assert_eq!(
+            window
+                .0
+                .canvas
+                .texture()
+                .map(|texture| (texture.width() as u32, texture.height() as u32)),
+            Some(target_dimensions),
+            "target-sized preview texture"
+        );
+        window.confirm_scale_preview();
+
+        assert_eq!(
+            window
+                .0
+                .rendered
+                .borrow()
+                .as_ref()
+                .map(image::GenericImageView::dimensions),
+            Some(source.dimensions()),
+            "the async committed render has not yet replaced the source-sized image"
+        );
+        assert_eq!(
+            window
+                .0
+                .canvas
+                .texture()
+                .map(|texture| (texture.width() as u32, texture.height() as u32)),
+            Some(target_dimensions),
+            "committing leaves the target-sized preview texture visible"
+        );
+        assert!(!window.rendered_is_current(), "scale render is pending");
+
+        window.set_tool(Tool::Select);
+        let start = (7, 5);
+        let end = (38, 28);
+        let start_widget = window
+            .0
+            .canvas
+            .widget_point_for_image(Point {
+                x: start.0 as f32,
+                y: start.1 as f32,
+            })
+            .expect("scaled start widget point");
+        let end_widget = window
+            .0
+            .canvas
+            .widget_point_for_image(Point {
+                x: end.0 as f32,
+                y: end.1 as f32,
+            })
+            .expect("scaled end widget point");
+        let (start_x, start_y) = (f64::from(start_widget.x()), f64::from(start_widget.y()));
+        let (end_x, end_y) = (f64::from(end_widget.x()), f64::from(end_widget.y()));
+        assert_eq!(
+            window.0.canvas.pixel_boundary_at(start_x, start_y),
+            Some(start),
+            "start widget coordinate maps to the scaled image"
+        );
+        assert_eq!(
+            window.0.canvas.pixel_boundary_at(end_x, end_y),
+            Some(end),
+            "end widget coordinate maps to the scaled image"
+        );
+
+        let drags: Vec<_> = (0..window.0.canvas.observe_controllers().n_items())
+            .filter_map(|index| window.0.canvas.observe_controllers().item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureDrag>().ok())
+            .collect();
+        let region_drag = drags
+            .into_iter()
+            .find(|candidate| {
+                candidate.emit_by_name::<()>("drag-begin", &[&start_x, &start_y]);
+                let is_region_drag = matches!(
+                    window.0.region_drag.get(),
+                    Some(RegionDrag::Marking(SelectionDrag { start: marked_start, .. }))
+                        if marked_start == start
+                );
+                window.0.region_drag.set(None);
+                is_region_drag
+            })
+            .expect("region drag controller");
+
+        region_drag.emit_by_name::<()>("drag-begin", &[&start_x, &start_y]);
+        region_drag.emit_by_name::<()>("drag-update", &[&(end_x - start_x), &(end_y - start_y)]);
+        region_drag.emit_by_name::<()>("drag-end", &[&(end_x - start_x), &(end_y - start_y)]);
+        let selection_while_scale_render_is_pending = window.0.region_selection.get();
+
+        let expected = CropOverlay {
+            x: 7,
+            y: 5,
+            width: 31,
+            height: 23,
+            image_width: 47,
+            image_height: 35,
+        };
+        window.clear_region_selection();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while (!window.rendered_is_current()
+            || window
+                .0
+                .rendered
+                .borrow()
+                .as_ref()
+                .is_none_or(|image| image.dimensions() != target_dimensions)
+            || window.0.canvas.texture().is_none_or(|texture| {
+                (texture.width() as u32, texture.height() as u32) != target_dimensions
+            }))
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert!(
+            window.rendered_is_current(),
+            "committed scale render is current"
+        );
+        assert_eq!(
+            window
+                .0
+                .rendered
+                .borrow()
+                .as_ref()
+                .map(image::GenericImageView::dimensions),
+            Some(target_dimensions),
+            "committed scale render dimensions"
+        );
+        assert_eq!(
+            window
+                .0
+                .canvas
+                .texture()
+                .map(|texture| (texture.width() as u32, texture.height() as u32)),
+            Some(target_dimensions),
+            "canvas texture dimensions after committed scale"
+        );
+        assert_eq!(
+            window.0.rendered_generation.get(),
+            window.0.render_generation.get()
+        );
+
+        region_drag.emit_by_name::<()>("drag-begin", &[&start_x, &start_y]);
+        region_drag.emit_by_name::<()>("drag-update", &[&(end_x - start_x), &(end_y - start_y)]);
+        region_drag.emit_by_name::<()>("drag-end", &[&(end_x - start_x), &(end_y - start_y)]);
+        assert_eq!(
+            window.0.region_selection.get(),
+            Some(expected),
+            "Select drag after the scale render completes uses target-space coordinates"
+        );
+        assert_eq!(
+            selection_while_scale_render_is_pending,
+            Some(expected),
+            "Select drag while a committed scale render is pending must use target-space coordinates"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn copy_image_action_places_the_complete_canvas_texture_on_the_clipboard() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
@@ -9861,6 +10778,298 @@ mod tests {
             .expect("clipboard texture");
 
         assert_eq!(rgba_from_texture(&copied), Some(image));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn paste_image_action_composites_alpha_and_keeps_the_clipboard_cutout_movable() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PasteImageTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let background = image::RgbaImage::from_fn(5, 3, |x, y| {
+            image::Rgba([10 + x as u8, 20 + y as u8, 30, 255])
+        });
+        let cutout = image::RgbaImage::from_fn(3, 2, |x, y| {
+            image::Rgba(match (x, y) {
+                (0, 0) => [240, 10, 20, 255],
+                (1, 0) => [1, 2, 3, 0],
+                (2, 0) => [20, 230, 40, 128],
+                (1, 1) => [220, 210, 10, 255],
+                _ => [1, 2, 3, 0],
+            })
+        });
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(background.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(background.clone()));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&background).unwrap()));
+        window.set_tool(Tool::Select);
+        window.set_region_selection(Some(CropOverlay {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            image_width: 5,
+            image_height: 3,
+        }));
+        window.update_action_states();
+        window
+            .0
+            .window
+            .clipboard()
+            .set_texture(&texture_from_rgba(&cutout).unwrap());
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "paste-image", None);
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while (!window.rendered_is_current() || !window.0.selection_foreground_active.get())
+            && std::time::Instant::now() < deadline
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+
+        assert!(window.rendered_is_current());
+        assert!(window.0.selection_foreground_active.get());
+        let prepared = window.0.prepared_selection.borrow().clone().unwrap();
+        assert_eq!(prepared.origin, ForegroundOrigin { x: 1, y: 0 });
+        assert_eq!(prepared.mask.dimensions(), cutout.dimensions());
+        assert_eq!(prepared.mask.get_pixel(1, 0)[0], 0, "transparent hole");
+        assert_eq!(prepared.crop.width, 3);
+        assert_eq!(prepared.crop.height, 2);
+        let mut expected = background.clone();
+        crate::tools::selection::paste_cutout_at(&mut expected, 1, 0, &cutout, &prepared.mask)
+            .unwrap();
+        assert_eq!(window.0.rendered.borrow().as_ref(), Some(&expected));
+        assert_eq!(
+            expected.get_pixel(3, 0).0,
+            [16, 125, 35, 255],
+            "a half-alpha clipboard pixel is composited once"
+        );
+
+        let moved = prepared
+            .image_at(&expected, ForegroundOrigin { x: 2, y: 1 })
+            .unwrap();
+        assert_eq!(
+            moved.get_pixel(1, 0),
+            background.get_pixel(1, 0),
+            "moving restores the previous opaque pasted pixel"
+        );
+        let mut history = window.0.document.borrow().as_ref().unwrap().clone();
+        history.apply(Operation::SelectionEdit {
+            pixels: Arc::new(moved),
+            flattened_annotations: vec![],
+        });
+        assert!(history.undo());
+        assert_eq!(
+            history
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            expected,
+            "undo returns to the pasted position"
+        );
+        assert!(history.undo());
+        assert_eq!(
+            history
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            background,
+            "a second undo removes the pasted image"
+        );
+        assert!(history.redo());
+        assert_eq!(
+            history
+                .render(&CancellationToken::default())
+                .unwrap()
+                .pixels,
+            expected,
+            "redo restores the pasted image"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn transparent_clipboard_image_and_stale_paste_state_do_not_edit_the_document() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.EmptyPasteTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(image));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        let operations = window
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .operations()
+            .to_vec();
+        assert!(window.clipboard_paste_is_current(window.0.render_generation.get(), &operations));
+        window.paste_rgba_image(image::RgbaImage::from_pixel(2, 2, image::Rgba([0; 4])));
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .is_empty()
+        );
+        assert!(!window.0.selection_foreground_active.get());
+        window
+            .0
+            .render_generation
+            .set(window.0.render_generation.get().wrapping_add(1));
+        assert!(
+            !window.clipboard_paste_is_current(
+                window.0.render_generation.get().wrapping_sub(1),
+                &operations
+            ),
+            "a clipboard callback from an earlier render must be rejected"
+        );
+        window
+            .0
+            .render_generation
+            .set(window.0.rendered_generation.get());
+        window
+            .0
+            .document
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .apply(Operation::FlipHorizontal);
+        assert!(
+            !window.clipboard_paste_is_current(window.0.render_generation.get(), &operations),
+            "a clipboard callback from an earlier document history must be rejected"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn oversized_paste_keeps_its_full_mask_for_lasso_bounds_and_returning_from_an_edge() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.OversizedPasteTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let background = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
+        let cutout = image::RgbaImage::from_fn(5, 4, |x, y| {
+            image::Rgba([20 + x as u8, 40 + y as u8, 60, 255])
+        });
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(background.clone()),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        window.0.rendered.replace(Some(background));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        window.0.canvas.set_texture(Some(
+            &texture_from_rgba(window.0.rendered.borrow().as_ref().unwrap()).unwrap(),
+        ));
+        window.0.canvas.allocate(300, 200, -1, None);
+        window.paste_rgba_image(cutout.clone());
+
+        let prepared = window.0.prepared_selection.borrow().clone().unwrap();
+        assert_eq!(prepared.origin, ForegroundOrigin { x: -1, y: -1 });
+        assert_eq!(prepared.mask.dimensions(), cutout.dimensions());
+        assert_eq!(prepared.crop.width, 3);
+        assert_eq!(prepared.crop.height, 2);
+        let lasso = window
+            .0
+            .canvas
+            .lasso_display_bounds(&lasso_overlay(&prepared))
+            .unwrap();
+        let image_bounds = window
+            .0
+            .canvas
+            .crop_display_bounds(CropOverlay {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+                image_width: 3,
+                image_height: 2,
+            })
+            .unwrap();
+        assert_eq!(lasso.width(), image_bounds.width() * 5.0 / 3.0);
+        assert_eq!(lasso.height(), image_bounds.height() * 4.0 / 2.0);
+
+        let pixels = {
+            let document = window.0.document.borrow();
+            let Operation::SelectionEdit { pixels, .. } =
+                document.as_ref().unwrap().operations().last().unwrap()
+            else {
+                panic!("paste must produce a selection edit");
+            };
+            pixels.clone()
+        };
+        let returned = prepared
+            .image_at(&pixels, ForegroundOrigin { x: 0, y: 0 })
+            .unwrap();
+        assert_eq!(
+            returned.get_pixel(0, 0),
+            cutout.get_pixel(0, 0),
+            "an initially off-canvas source pixel returns intact"
+        );
+    }
+
+    #[test]
+    fn pasted_crop_keeps_in_bounds_provenance_for_an_oversized_cutout() {
+        assert_eq!(
+            pasted_crop((5, 4), (7, 6), ForegroundOrigin { x: -1, y: -1 }),
+            Some(CropOverlay {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 4,
+                image_width: 5,
+                image_height: 4,
+            })
+        );
     }
 
     #[test]
@@ -10158,7 +11367,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn ctrl_line_chain_is_one_annotation_with_every_vertex_handle() {
+    fn ctrl_line_chain_closes_on_an_existing_node_with_every_vertex_handle() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
             .application_id("io.github.mendrik_private.Diorama.PencilLineChainTest")
@@ -10192,6 +11401,10 @@ mod tests {
             &[point(20.5, 12.5), point(36.5, 28.5)],
             PencilDragMode::Line,
         );
+        window.commit_editable_pencil_stroke(
+            &[point(36.5, 28.5), point(4.8, 4.7)],
+            PencilDragMode::Line,
+        );
 
         let document = window.0.document.borrow();
         let annotations = document.as_ref().expect("document").annotations();
@@ -10202,7 +11415,7 @@ mod tests {
         );
         assert_eq!(
             crate::tools::annotation::hit::handles(&annotations[0]).len(),
-            3,
+            4,
             "every line vertex must remain repositionable"
         );
         assert!(matches!(
@@ -10214,8 +11427,145 @@ mod tests {
                 Point { x: 4.5, y: 4.5 },
                 Point { x: 20.5, y: 12.5 },
                 Point { x: 36.5, y: 28.5 },
+                Point { x: 4.5, y: 4.5 },
             ]
         ));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn ctrl_line_endpoint_links_to_an_older_line_vertex() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PencilLineGraphTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+        window.0.canvas.allocate(64, 64, -1, None);
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        let point = |x, y| BrushPoint {
+            x,
+            y,
+            pressure: 1.0,
+        };
+        window.commit_editable_pencil_stroke(
+            &[point(4.5, 4.5), point(20.5, 12.5)],
+            PencilDragMode::Line,
+        );
+        window.0.pencil_line_annotation.set(None);
+        window.commit_editable_pencil_stroke(
+            &[point(40.5, 40.5), point(4.8, 4.7)],
+            PencilDragMode::Line,
+        );
+
+        let document = window.0.document.borrow();
+        let document = document.as_ref().expect("document");
+        assert_eq!(document.annotations().len(), 2);
+        assert_eq!(
+            document.line_links(),
+            vec![LineLink {
+                first: LineVertex {
+                    annotation: AnnotationId(1),
+                    index: 0,
+                },
+                second: LineVertex {
+                    annotation: AnnotationId(2),
+                    index: 1,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn high_zoom_line_snap_uses_the_raw_pointer_position_at_the_image_edge() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PencilHighZoomSnapTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+        window.0.canvas.allocate(256, 256, -1, None);
+        window.0.canvas.set_zoom(32.0);
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+        let point = |x, y| BrushPoint {
+            x,
+            y,
+            pressure: 1.0,
+        };
+        window.commit_editable_pencil_stroke(
+            &[point(1.0, 1.0), point(4.0, 4.0)],
+            PencilDragMode::Line,
+        );
+        window.0.pencil_line_annotation.set(None);
+        let start = window
+            .0
+            .canvas
+            .widget_point_for_image(Point { x: 1.0, y: 1.0 })
+            .unwrap();
+        let edge = window
+            .0
+            .canvas
+            .widget_point_for_image(Point { x: 4.0, y: 4.0 })
+            .unwrap();
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            1,
+            start.x().into(),
+            start.y().into(),
+            gtk::gdk::ModifierType::CONTROL_MASK,
+            0,
+        );
+        assert_eq!(
+            window.0.pencil_points.borrow().first().copied(),
+            Some(point(1.0, 1.0))
+        );
+        let (points, _, mode) = window
+            .finish_pencil_drag(&window.0.canvas, edge.x().into(), edge.y().into(), 1)
+            .unwrap();
+        assert_eq!(points, vec![point(1.0, 1.0), point(4.0, 4.0)]);
+        window.commit_editable_pencil_stroke(&points, mode);
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .line_links()
+                .len(),
+            2
+        );
     }
 
     #[test]

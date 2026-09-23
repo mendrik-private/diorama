@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::{DynamicImage, RgbaImage};
 
-use super::{Annotation, AnnotationEdit, AnnotationId, History, Operation, fold_annotations};
+use super::{
+    Annotation, AnnotationEdit, AnnotationId, History, LineLink, Operation, fold_annotations,
+    fold_line_links,
+};
 use crate::error::{AppError, Result};
 use crate::tools;
 
@@ -115,6 +118,11 @@ impl Document {
     #[must_use]
     pub fn annotations(&self) -> Vec<Annotation> {
         fold_annotations(self.source.pixels.dimensions(), self.operations())
+    }
+
+    #[must_use]
+    pub fn line_links(&self) -> Vec<LineLink> {
+        fold_line_links(self.source.pixels.dimensions(), self.operations())
     }
 
     pub fn amend_annotation(&mut self, annotation: Annotation) -> bool {
@@ -340,7 +348,8 @@ mod tests {
 
     use super::{CancellationToken, Document, ImageSource, Metadata};
     use crate::document::{
-        Annotation, AnnotationEdit, AnnotationId, Operation, Rect, Rotation, Shape, StrokeStyle,
+        Annotation, AnnotationEdit, AnnotationId, LineLink, LineVertex, Operation, PencilGeometry,
+        Point, Rect, Rotation, Shape, StrokeStyle,
     };
 
     fn document() -> Document {
@@ -376,6 +385,7 @@ mod tests {
                     width: 20.0,
                     height: 20.0,
                 },
+                angle: 0.0,
                 seed: id,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
@@ -383,6 +393,31 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn line(id: u64, x: f32, y: f32) -> Annotation {
+        Annotation {
+            id: AnnotationId(id),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Line(vec![Point { x, y }]),
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 2.0,
+                },
+                anti_aliasing: true,
+            },
+        }
+    }
+
+    fn line_point(annotation: &Annotation) -> Point {
+        let Shape::Pencil {
+            geometry: PencilGeometry::Line(points),
+            ..
+        } = &annotation.shape
+        else {
+            panic!("expected line annotation");
+        };
+        points[0]
     }
 
     #[test]
@@ -595,6 +630,44 @@ mod tests {
         assert!(document.undo());
         assert_eq!(document.annotations(), vec![original]);
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn a_linked_vertex_move_is_one_undoable_history_entry() {
+        let mut document = annotation_document();
+        document.apply(Operation::Annotate(AnnotationEdit::Create(line(
+            1, 2.0, 3.0,
+        ))));
+        document.apply(Operation::Annotate(AnnotationEdit::CreateLinked {
+            annotation: line(2, 2.0, 3.0),
+            links: vec![LineLink {
+                first: LineVertex {
+                    annotation: AnnotationId(2),
+                    index: 0,
+                },
+                second: LineVertex {
+                    annotation: AnnotationId(1),
+                    index: 0,
+                },
+            }],
+        }));
+        document.apply(Operation::Annotate(AnnotationEdit::Set(line(1, 8.0, 9.0))));
+
+        assert_eq!(document.operations().len(), 3);
+        assert_eq!(
+            line_point(&document.annotations()[1]),
+            Point { x: 8.0, y: 9.0 }
+        );
+        assert!(document.undo());
+        assert_eq!(
+            line_point(&document.annotations()[1]),
+            Point { x: 2.0, y: 3.0 }
+        );
+        assert!(document.redo());
+        assert_eq!(
+            line_point(&document.annotations()[1]),
+            Point { x: 8.0, y: 9.0 }
+        );
     }
 
     #[test]

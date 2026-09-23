@@ -1,7 +1,13 @@
 # Game Asset scaling
 
-`src/tools/scale/game_asset::Session` is the single production implementation used
-by the live preview and document rendering. It accepts positive dimensions no
+The shared [`asset-scaler`](https://github.com/mendrik-private/asset-scaler) crate
+owns the production algorithm. `src/tools/scale/game_asset` adapts application
+cancellation and errors: live previews use its cached `Session`, while document
+rendering calls the same algorithm through the borrowed `resize` API. Diorama
+selects `ResizeOptions::preserve_opaque_background()` for both paths, so an
+opaque source canvas stays opaque while explicit source alpha is preserved.
+When changing the Git pin, update `build-aux/cargo-sources.json` for offline
+Flatpak builds. The scaler accepts positive dimensions no
 larger than the source, including rectangular images and independent axis reductions.
 Identity scaling preserves the source exactly. Ordinary Nearest, Bicubic and
 Lanczos resampling remain separate methods.
@@ -103,6 +109,11 @@ A bounded halo pass can tone down dark retained-ink bleed immediately adjacent t
 drawn contour core. It estimates nearby fill from non-ink samples with a positive
 triangle filter; it never changes core pixels or alpha, only operates in the one-pixel
 core neighborhood, and caps the encoded RGB correction at 12/255.
+
+Explicit source alpha is authoritative: internal color ridges cannot erode
+opaque source-supported parts of a transparent asset. For opaque flat backgrounds,
+thin connected components without an eroded fill interior retain their endpoints.
+These fix the clipped-limb and off-grid-line regressions shared with Sprite Studio.
 
 Silhouette support and intrinsic alpha then compose the fill in linear light before
 the unchanged opacity contours. Fully transparent output pixels encode as transparent

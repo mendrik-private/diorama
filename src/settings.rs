@@ -262,6 +262,36 @@ impl Settings {
         }
     }
 
+    pub fn mesh_grid_size(&self) -> u32 {
+        self.integer("mesh-grid-size")
+            .unwrap_or(32)
+            .clamp(1, 1_000_000) as u32
+    }
+
+    pub fn set_mesh_grid_size(&self, size: u32) {
+        self.set_integer("mesh-grid-size", size.clamp(1, 1_000_000) as i32);
+    }
+
+    pub fn mesh_grid_offset_x(&self) -> i32 {
+        self.integer("mesh-grid-offset-x")
+            .unwrap_or(0)
+            .clamp(-1_000_000, 1_000_000)
+    }
+
+    pub fn set_mesh_grid_offset_x(&self, offset: i32) {
+        self.set_integer("mesh-grid-offset-x", offset.clamp(-1_000_000, 1_000_000));
+    }
+
+    pub fn mesh_grid_offset_y(&self) -> i32 {
+        self.integer("mesh-grid-offset-y")
+            .unwrap_or(0)
+            .clamp(-1_000_000, 1_000_000)
+    }
+
+    pub fn set_mesh_grid_offset_y(&self, offset: i32) {
+        self.set_integer("mesh-grid-offset-y", offset.clamp(-1_000_000, 1_000_000));
+    }
+
     pub fn preserve_metadata(&self) -> bool {
         self.boolean("preserve-metadata").unwrap_or(true)
     }
@@ -376,6 +406,9 @@ mod tests {
         assert_eq!(settings.last_zoom_mode(), ZoomMode::Fit);
         assert_eq!(settings.pencil_size(), 1);
         assert!(!settings.pencil_antialiasing());
+        assert_eq!(settings.mesh_grid_size(), 32);
+        assert_eq!(settings.mesh_grid_offset_x(), 0);
+        assert_eq!(settings.mesh_grid_offset_y(), 0);
         assert_eq!(
             settings.game_asset_aa(),
             crate::document::GameAssetAa::default()
@@ -383,5 +416,28 @@ mod tests {
         settings.set_game_asset_aa(crate::document::GameAssetAa::new(100));
         settings.set_pencil_size(128);
         settings.set_pencil_antialiasing(true);
+        settings.set_mesh_grid_size(100);
+        settings.set_mesh_grid_offset_x(100);
+        settings.set_mesh_grid_offset_y(-100);
+    }
+
+    #[test]
+    #[ignore = "requires a compiled application schema"]
+    fn mesh_grid_size_persists_with_a_memory_backend() {
+        let schema = gio::SettingsSchemaSource::default()
+            .and_then(|source| source.lookup(crate::APP_ID, true))
+            .expect("compiled Diorama schema");
+        let backend = gio::memory_settings_backend_new();
+        let settings = Settings {
+            inner: Some(gio::Settings::new_full(&schema, Some(&backend), None)),
+        };
+
+        assert_eq!(settings.mesh_grid_size(), 32);
+        settings.set_mesh_grid_size(64);
+        assert_eq!(settings.mesh_grid_size(), 64);
+        settings.set_mesh_grid_size(0);
+        assert_eq!(settings.mesh_grid_size(), 1);
+        settings.set_mesh_grid_size(u32::MAX);
+        assert_eq!(settings.mesh_grid_size(), 1_000_000);
     }
 }

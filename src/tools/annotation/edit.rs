@@ -131,24 +131,23 @@ pub fn handle_drag(
                     }
                 }
             }
-            PencilGeometry::Line(points) => match kind {
-                HandleKind::Start => {
-                    if let Some(start) = points.first_mut() {
-                        *start = pointer;
+            PencilGeometry::Line(points) => {
+                let previous = match kind {
+                    HandleKind::Start => points.first().copied(),
+                    HandleKind::End => points.last().copied(),
+                    HandleKind::Vertex(index) => points.get(index).copied(),
+                    _ => None,
+                };
+                if let Some(previous) = previous {
+                    // Closing a polyline repeats its first vertex at the end. Keep
+                    // that intentional weld when either endpoint is edited.
+                    for vertex in points {
+                        if *vertex == previous {
+                            *vertex = pointer;
+                        }
                     }
                 }
-                HandleKind::End => {
-                    if let Some(end) = points.last_mut() {
-                        *end = pointer;
-                    }
-                }
-                HandleKind::Vertex(index) => {
-                    if let Some(vertex) = points.get_mut(index) {
-                        *vertex = pointer;
-                    }
-                }
-                _ => {}
-            },
+            }
             PencilGeometry::Rectangle(rect) | PencilGeometry::Ellipse(rect) => {
                 *rect = resized_rect(*rect, kind, pointer, preserve_aspect);
             }
@@ -158,8 +157,21 @@ pub fn handle_drag(
                 resize_freehand(points, original, resized);
             }
         },
-        Shape::Highlight { rect, .. } => {
-            *rect = resized_rect(*rect, kind, pointer, preserve_aspect);
+        Shape::Highlight { rect, angle, .. } => {
+            let center = rect.center();
+            let local_pointer = inverse_rotate_point(pointer, center, *angle);
+            let resized = resized_rect(*rect, kind, local_pointer, preserve_aspect);
+            // `rect` is the oval's local frame while its center is in image
+            // coordinates. Shift the frame so the dragged rotated handle lands
+            // precisely beneath the pointer as its local center changes.
+            let previous_center = center;
+            let next_center = resized.center();
+            let rotated_next_center = rotate_point(next_center, previous_center, *angle);
+            *rect = Rect {
+                x: resized.x + rotated_next_center.x - next_center.x,
+                y: resized.y + rotated_next_center.y - next_center.y,
+                ..resized
+            };
         }
         Shape::Arrow {
             start,
@@ -292,6 +304,10 @@ pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotat
         }
         return changed;
     }
+    if let Shape::Highlight { angle, .. } = &mut changed.shape {
+        *angle += rotation_delta(delta_angle, snap);
+        return changed;
+    }
     let Shape::Text {
         anchor,
         angle,
@@ -330,6 +346,10 @@ fn rotate_point(point: Point, center: Point, angle: f32) -> Point {
         x: center.x + x * cos - y * sin,
         y: center.y + x * sin + y * cos,
     }
+}
+
+fn inverse_rotate_point(point: Point, center: Point, angle: f32) -> Point {
+    rotate_point(point, center, -angle)
 }
 
 fn resized_rect(rect: Rect, kind: HandleKind, pointer: Point, preserve_aspect: bool) -> Rect {
@@ -517,6 +537,78 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn highlight_rotation_keeps_handles_hit_testing_and_resize_in_its_local_frame() {
+        use super::super::hit::{HitKind, handles, hit_test};
+
+        let original = Annotation {
+            id: AnnotationId(11),
+            shape: Shape::Highlight {
+                rect: Rect {
+                    x: 40.0,
+                    y: 40.0,
+                    width: 120.0,
+                    height: 80.0,
+                },
+                angle: 0.0,
+                seed: 7,
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 1.0,
+                },
+            },
+        };
+        let turned = rotated(&original, std::f32::consts::FRAC_PI_2, false);
+        let Shape::Highlight { angle, .. } = turned.shape else {
+            unreachable!()
+        };
+        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        let positions = handles(&turned);
+        let northwest = positions[0].1;
+        assert!(northwest.distance(Point { x: 140.0, y: 20.0 }) < 0.001);
+        assert_eq!(
+            hit_test(
+                std::slice::from_ref(&turned),
+                Some(turned.id),
+                northwest,
+                8.0
+            )
+            .expect("selected rotated highlight handle")
+            .kind,
+            HitKind::Handle(HandleKind::NorthWest)
+        );
+        let center = Point { x: 100.0, y: 80.0 };
+        let ring = Point {
+            x: northwest.x + (northwest.x - center.x) / northwest.distance(center) * 12.0,
+            y: northwest.y + (northwest.y - center.y) / northwest.distance(center) * 12.0,
+        };
+        assert_eq!(
+            hit_test(std::slice::from_ref(&turned), Some(turned.id), ring, 8.0)
+                .expect("selected rotated highlight rotation ring")
+                .kind,
+            HitKind::Rotate
+        );
+
+        let resized = handle_drag(
+            &turned,
+            HandleKind::SouthEast,
+            Point { x: 40.0, y: 180.0 },
+            false,
+        );
+        assert!(handles(&resized)[0].1.distance(northwest) < 0.001);
+        assert!(handles(&resized)[4].1.distance(Point { x: 40.0, y: 180.0 }) < 0.001);
+        let snapped = rotated(&original, 38.0_f32.to_radians(), true);
+        let expected = rotated(&original, 45.0_f32.to_radians(), false);
+        assert_eq!(snapped, expected);
+        let translated = moved(&turned, Point { x: 10.0, y: -5.0 }, false);
+        assert!(
+            handles(&translated)[0]
+                .1
+                .distance(Point { x: 150.0, y: 15.0 })
+                < 0.001
+        );
     }
 
     #[test]
@@ -791,6 +883,50 @@ mod tests {
                 Point { x: 22.0, y: 35.0 },
                 Point { x: 30.0, y: 40.0 },
             ]
+        ));
+
+        let closed = handle_drag(
+            &annotation(PencilGeometry::Line(vec![
+                Point { x: 10.0, y: 20.0 },
+                Point { x: 30.0, y: 40.0 },
+                Point { x: 50.0, y: 20.0 },
+                Point { x: 10.0, y: 20.0 },
+            ])),
+            HandleKind::Start,
+            Point { x: 12.0, y: 24.0 },
+            false,
+        );
+        assert!(matches!(
+            closed.shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(points),
+                ..
+            } if points == [
+                Point { x: 12.0, y: 24.0 },
+                Point { x: 30.0, y: 40.0 },
+                Point { x: 50.0, y: 20.0 },
+                Point { x: 12.0, y: 24.0 },
+            ]
+        ));
+
+        let closed_from_end = handle_drag(
+            &annotation(PencilGeometry::Line(vec![
+                Point { x: 10.0, y: 20.0 },
+                Point { x: 30.0, y: 40.0 },
+                Point { x: 50.0, y: 20.0 },
+                Point { x: 10.0, y: 20.0 },
+            ])),
+            HandleKind::End,
+            Point { x: 12.0, y: 24.0 },
+            false,
+        );
+        assert!(matches!(
+            closed_from_end.shape,
+            Shape::Pencil {
+                geometry: PencilGeometry::Line(points),
+                ..
+            } if points.first() == Some(&Point { x: 12.0, y: 24.0 })
+                && points.last() == Some(&Point { x: 12.0, y: 24.0 })
         ));
 
         for geometry in [

@@ -9,6 +9,7 @@ use crate::{APP_ID, window};
 const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.open", &["<Control>o"]),
     ("win.copy-image", &["<Control>c"]),
+    ("win.paste-image", &["<Control>v"]),
     ("win.save", &["<Control>s"]),
     ("win.save-as", &["<Control><Shift>s"]),
     ("win.print", &["<Control>p"]),
@@ -63,6 +64,7 @@ const SHORTCUTS: &[(&str, &[&str])] = &[
     ("win.compare", &["d"]),
     ("win.lens", &["l"]),
     ("win.pencil", &["p"]),
+    ("win.mesh-points", &["w"]),
     ("win.fullscreen", &["F11"]),
     ("win.cancel-tool", &["Escape"]),
 ];
@@ -140,6 +142,7 @@ mod tests {
     #[test]
     fn control_c_uses_the_contextual_copy_action() {
         assert!(SHORTCUTS.contains(&("win.copy-image", &["<Control>c"])));
+        assert!(SHORTCUTS.contains(&("win.paste-image", &["<Control>v"])));
         assert!(
             !SHORTCUTS
                 .iter()
@@ -197,6 +200,7 @@ mod tests {
         assert!(SHORTCUTS.contains(&("win.scale-preview", &["s"])));
         assert!(SHORTCUTS.contains(&("win.lens", &["l"])));
         assert!(SHORTCUTS.contains(&("win.pencil", &["p"])));
+        assert!(SHORTCUTS.contains(&("win.mesh-points", &["w"])));
         assert!(
             !SHORTCUTS
                 .iter()

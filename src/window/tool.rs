@@ -9,6 +9,7 @@ pub(super) enum Tool {
     Text,
     PickColor,
     Select,
+    MeshPoints,
     Scale,
 }
 
@@ -23,6 +24,7 @@ impl Tool {
             Self::Text => "text",
             Self::PickColor => "pick-color",
             Self::Select => "select",
+            Self::MeshPoints => "mesh-points",
             Self::Scale => "scale",
         }
     }
@@ -37,6 +39,7 @@ impl Tool {
             "text" => Self::Text,
             "pick-color" => Self::PickColor,
             "select" => Self::Select,
+            "mesh-points" => Self::MeshPoints,
             "scale" => Self::Scale,
             _ => return None,
         })
@@ -61,8 +64,8 @@ pub(super) const fn palette_visible(tool: Tool, return_tool: Option<Tool>) -> bo
     tool.is_annotation() || matches!(tool, Tool::PickColor) && return_tool.is_some()
 }
 
-pub(super) const fn pencil_drag_available(annotation_hit: bool) -> bool {
-    !annotation_hit
+pub(super) const fn pencil_drag_available(annotation_hit: bool, drawing_line: bool) -> bool {
+    !annotation_hit || drawing_line
 }
 
 pub(super) const fn resting_tool(requested: Tool, editable: bool) -> Tool {
@@ -88,6 +91,7 @@ mod tests {
             Tool::Text,
             Tool::PickColor,
             Tool::Select,
+            Tool::MeshPoints,
             Tool::Scale,
         ] {
             assert_eq!(Tool::from_name(tool.name()), Some(tool));
@@ -107,8 +111,9 @@ mod tests {
 
     #[test]
     fn pencil_defers_to_existing_vector_annotations() {
-        assert!(pencil_drag_available(false));
-        assert!(!pencil_drag_available(true));
+        assert!(pencil_drag_available(false, false));
+        assert!(!pencil_drag_available(true, false));
+        assert!(pencil_drag_available(true, true));
     }
 
     #[test]

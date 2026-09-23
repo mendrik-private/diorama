@@ -1,244 +1,21 @@
-//! Game Asset reduction: direction-merged contours, source-width opacity,
-//! tight antialiasing, and Lanczos3 source fill with bounded halo tone-down.
+//! Application boundary for the shared Game Asset scaler.
 use crate::{
     document::{CancellationToken, GameAssetAa},
     error::{AppError, Result},
 };
 use image::RgbaImage;
-use std::sync::{Arc, Mutex};
-mod antialias;
-#[cfg(test)]
-mod benchmarks;
-mod cleanup;
-mod color;
-mod contours;
-mod coverage;
-mod detect;
-mod field;
-mod halo;
-mod ink;
-mod lanczos;
-mod opacity;
-mod paint;
-mod raster;
-mod silhouette;
-mod smoothing;
-mod source;
-mod strokes;
-#[cfg(test)]
-mod tests;
-const MEMORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
-// The source phase keeps the established 512 B/pixel allowance for analysis,
-// contour storage and source resampling. Target data is not concurrent
-// with analysis, but can contain two linear images, contour ownership/colors,
-// support/opacity projections, the output and cache; 160 B/pixel conservatively
-// accounts for that composition peak. This phase-aware estimate is capped at
-// four GiB, independently of the decoder and canvas safety limits.
-const SOURCE_PHASE_BYTES: u64 = 512;
-const TARGET_PHASE_BYTES: u64 = 160;
+use std::sync::Arc;
 
-fn working_set_estimate(sw: u32, sh: u32, w: u32, h: u32) -> u64 {
-    u64::from(sw)
-        .saturating_mul(u64::from(sh))
-        .saturating_mul(SOURCE_PHASE_BYTES)
-        .saturating_add(
-            u64::from(w)
-                .saturating_mul(u64::from(h))
-                .saturating_mul(TARGET_PHASE_BYTES),
-        )
-}
+const SCALER_OPTIONS: asset_scaler::ResizeOptions =
+    asset_scaler::ResizeOptions::preserve_opaque_background();
 
-fn check_working_set_budget(sw: u32, sh: u32, w: u32, h: u32) -> Result<()> {
-    if working_set_estimate(sw, sh, w, h) > MEMORY_BUDGET {
-        return Err(AppError::GameAssetMemoryLimit {
-            limit_bytes: MEMORY_BUDGET,
-        });
-    }
-    Ok(())
-}
-struct Prepared {
-    models: Vec<detect::Model>,
-    widths: Vec<f64>,
-    contours: contours::Contours,
-    mask: raster::Mask,
-    linear: color::LinearImage,
-    silhouette: Option<silhouette::Silhouette>,
-}
-struct TargetContours {
-    strokes: strokes::Strokes,
-    colors: Vec<[f64; 3]>,
-}
-impl Prepared {
-    fn new(image: &RgbaImage, cancel: &CancellationToken) -> Result<Self> {
-        cancel.check()?;
-        let samples = detect::detect(image, cancel)?;
-        cancel.check()?;
-        let models = detect::fit_models(&samples, 0.012, cancel)?;
-        let (raw, distance) = source::rasterize(
-            &models,
-            image.width() as usize,
-            image.height() as usize,
-            cancel,
-        )?;
-        let thinned = cleanup::thin(&raw, &distance, cancel)?;
-        cancel.check()?;
-        let contours = contours::Contours::new(&thinned, &models, cancel)?;
-        let mask = ink::ink_mask(image, &samples, &thinned, cancel)?;
-        cancel.check()?;
-        let widths = opacity::widths(image, &mask, &samples, &contours, cancel)?;
-        let linear = color::LinearImage::from_rgba(image);
-        let silhouette = silhouette::Silhouette::detect(image, cancel)?;
-        Ok(Self {
-            models,
-            widths,
-            contours,
-            mask,
-            linear,
-            silhouette,
-        })
-    }
-    fn target_contours(
-        &self,
-        image: &RgbaImage,
-        w: u32,
-        h: u32,
-        aa: GameAssetAa,
-        cancel: &CancellationToken,
-    ) -> Result<TargetContours> {
-        let scale = [
-            w as f64 / image.width() as f64,
-            h as f64 / image.height() as f64,
-        ];
-        let (retained, owners) =
-            self.contours
-                .retain_with_ids(&self.models, scale, contours::MAX_SHORT_PIXELS);
-        let smoothed = smoothing::smooth(&retained, scale[0].min(scale[1]), cancel)?;
-        let curves: Vec<_> = smoothed
-            .iter()
-            .map(|m| {
-                detect::controls(m, 1.)
-                    .map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5])
-            })
-            .collect();
-        cancel.check()?;
-        let strokes = strokes::render(&curves, &owners, &self.widths, w, h, aa, cancel)?;
-        let colors = paint::ink_colors(
-            &self.linear,
-            &retained,
-            &smoothed,
-            &owners,
-            &strokes,
-            scale,
-            cancel,
-        )?;
-        Ok(TargetContours { strokes, colors })
-    }
-    fn resize(
-        &self,
-        image: &RgbaImage,
-        w: u32,
-        h: u32,
-        aa: GameAssetAa,
-        cancel: &CancellationToken,
-    ) -> Result<RgbaImage> {
-        let TargetContours { strokes, colors } = self.target_contours(image, w, h, aa, cancel)?;
-        let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
-        let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
-        let scale = [
-            w as f64 / image.width() as f64,
-            h as f64 / image.height() as f64,
-        ];
-        let mut retained_mask = self.contours.retained_ink_mask(&self.mask, scale, cancel)?;
-        cancel.check()?;
-        let isolated = if let Some(silhouette) = &self.silhouette {
-            for (i, (masked, &supported)) in retained_mask
-                .data
-                .iter_mut()
-                .zip(&silhouette.support.data)
-                .enumerate()
-            {
-                if i % 4096 == 0 {
-                    cancel.check()?;
-                }
-                *masked &= supported;
-            }
-            Some(silhouette.isolated(&self.linear, cancel)?)
-        } else {
-            None
-        };
-        let fill_source = isolated.as_ref().unwrap_or(&self.linear);
-        let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
-        let base = halo::apply(fill_source, &retained_mask, base, &strokes.core, cancel)?;
-        let fill = if let Some(silhouette) = &self.silhouette {
-            let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
-            let retained_coverage =
-                silhouette.project_mask(&retained_mask, w as usize, h as usize, cancel)?;
-            let coverage = silhouette.target_coverage(
-                &source_coverage,
-                &retained_coverage,
-                &strokes.core,
-                aa,
-                cancel,
-            )?;
-            let opacity = silhouette.intrinsic_opacity(
-                fill_source,
-                &source_coverage,
-                w as usize,
-                h as usize,
-                cancel,
-            )?;
-            let exterior = silhouette.exterior();
-            let mut pixels = Vec::with_capacity(base.pixels.len());
-            for (i, ((pixel, support), intrinsic)) in
-                base.pixels.iter().zip(coverage).zip(opacity).enumerate()
-            {
-                if i % 4096 == 0 {
-                    cancel.check()?;
-                }
-                let alpha = (intrinsic * support).clamp(0., 1.);
-                let out_alpha = alpha + exterior[3] * (1. - alpha);
-                pixels.push(if out_alpha <= 1e-8 {
-                    [0.; 4]
-                } else {
-                    [
-                        (pixel[0] * alpha + exterior[0] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[1] * alpha + exterior[1] * exterior[3] * (1. - alpha)) / out_alpha,
-                        (pixel[2] * alpha + exterior[2] * exterior[3] * (1. - alpha)) / out_alpha,
-                        out_alpha,
-                    ]
-                });
-            }
-            color::LinearImage {
-                w: w as usize,
-                h: h as usize,
-                pixels,
-            }
-        } else {
-            base
-        };
-        let result = paint::composite(&fill, &colors, &paint);
-        cancel.check()?;
-        Ok(result)
-    }
-}
-#[derive(Default)]
-struct Cache {
-    prepared: Option<Arc<Prepared>>,
-    target: Option<((u32, u32, GameAssetAa), Arc<RgbaImage>)>,
-}
-/// One source analysis and one target result per preview session. Heavy work
-/// stays outside the lock so an obsolete preview can be cancelled promptly.
-pub struct Session {
-    source: Arc<RgbaImage>,
-    cache: Mutex<Cache>,
-}
+pub struct Session(asset_scaler::Session);
+
 impl Session {
     pub fn new(source: Arc<RgbaImage>) -> Self {
-        Self {
-            source,
-            cache: Mutex::new(Cache::default()),
-        }
+        Self(asset_scaler::Session::with_options(source, SCALER_OPTIONS))
     }
+
     pub fn resize(
         &self,
         w: u32,
@@ -246,40 +23,156 @@ impl Session {
         aa: GameAssetAa,
         cancel: &CancellationToken,
     ) -> Result<RgbaImage> {
-        cancel.check()?;
-        let (sw, sh) = self.source.dimensions();
-        if w == 0 || h == 0 || sw == 0 || sh == 0 || w > sw || h > sh {
-            return Err(AppError::InvalidDimensions);
+        self.0
+            .resize(w, h, aa, &|| cancel.check().is_err())
+            .map_err(map_error)
+    }
+}
+
+pub fn resize(
+    image: &RgbaImage,
+    w: u32,
+    h: u32,
+    aa: GameAssetAa,
+    cancel: &CancellationToken,
+) -> Result<RgbaImage> {
+    asset_scaler::resize_with_options(image, w, h, aa, &|| cancel.check().is_err(), SCALER_OPTIONS)
+        .map_err(map_error)
+}
+
+fn map_error(error: asset_scaler::Error) -> AppError {
+    match error {
+        asset_scaler::Error::Cancelled => AppError::Cancelled,
+        asset_scaler::Error::InvalidDimensions => AppError::InvalidDimensions,
+        asset_scaler::Error::GameAssetMemoryLimit { limit_bytes } => {
+            AppError::GameAssetMemoryLimit { limit_bytes }
         }
-        if (w, h) == (sw, sh) {
-            return Ok((*self.source).clone());
+        asset_scaler::Error::Scaling(message) => AppError::Scaling(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Document, ImageSource, Metadata, Operation, Resampling};
+
+    #[test]
+    fn shared_preview_matches_document_commit_undo_redo_at_every_aa() {
+        let source = Arc::new(RgbaImage::from_fn(96, 80, |x, y| {
+            image::Rgba(if (y as f64 - (0.57 * x as f64 + 10.)).abs() < 3. {
+                [8, 10, 4, 255]
+            } else {
+                [130, 170, 90, 255]
+            })
+        }));
+        let session = Session::new(source.clone());
+        let cancel = CancellationToken::default();
+        let mut outputs = Vec::new();
+        for percent in [0, 100, 50, 0] {
+            let aa = GameAssetAa::new(percent);
+            let preview = session.resize(32, 27, aa, &cancel).unwrap();
+            assert_eq!(session.resize(32, 27, aa, &cancel).unwrap(), preview);
+            let mut document = Document::new(ImageSource {
+                pixels: source.clone(),
+                path: None,
+                metadata: Metadata::default(),
+            });
+            let operation = Operation::Scale {
+                width: 32,
+                height: 27,
+                resampling: Resampling::GameAsset(aa),
+            };
+            document.apply(operation.clone());
+            assert_eq!(document.render(&cancel).unwrap().pixels, preview);
+            assert!(document.undo());
+            assert_eq!(document.render(&cancel).unwrap().pixels, *source);
+            assert!(document.redo());
+            assert_eq!(document.operations(), &[operation]);
+            assert_eq!(document.render(&cancel).unwrap().pixels, preview);
+            outputs.push(preview);
         }
-        check_working_set_budget(sw, sh, w, h)?;
-        let prepared = {
-            let cache = self.cache.lock().expect("Game Asset cache poisoned");
-            if let Some((key, result)) = &cache.target
-                && *key == (w, h, aa)
-            {
-                return Ok((**result).clone());
+        assert_ne!(outputs[0], outputs[1]);
+        assert_ne!(outputs[1], outputs[2]);
+        assert_eq!(outputs[0], outputs[3]);
+    }
+
+    #[test]
+    fn shared_scaler_preserves_an_opaque_canvas() {
+        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+            if (20..44).contains(&x) && (20..44).contains(&y) {
+                image::Rgba([120, 180, 90, 255])
+            } else {
+                image::Rgba([240, 230, 220, 255])
             }
-            cache.prepared.clone()
-        };
-        let prepared = match prepared {
-            Some(p) => p,
-            None => {
-                let p = Arc::new(Prepared::new(&self.source, cancel)?);
-                cancel.check()?;
-                self.cache
-                    .lock()
-                    .expect("Game Asset cache poisoned")
-                    .prepared = Some(p.clone());
-                p
+        }));
+        let cancel = CancellationToken::default();
+        let one_shot = resize(&source, 16, 16, GameAssetAa::new(20), &cancel).unwrap();
+        let cached = Session::new(source)
+            .resize(16, 16, GameAssetAa::new(20), &cancel)
+            .unwrap();
+        assert_eq!(cached, one_shot);
+        assert_eq!(one_shot.get_pixel(0, 0), &image::Rgba([240, 230, 220, 255]));
+
+        let mut document = Document::new(ImageSource {
+            pixels: Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+                if (20..44).contains(&x) && (20..44).contains(&y) {
+                    image::Rgba([120, 180, 90, 255])
+                } else {
+                    image::Rgba([240, 230, 220, 255])
+                }
+            })),
+            path: None,
+            metadata: Metadata::default(),
+        });
+        document.apply(Operation::Scale {
+            width: 16,
+            height: 16,
+            resampling: Resampling::GameAsset(GameAssetAa::new(20)),
+        });
+        assert_eq!(document.render(&cancel).unwrap().pixels, cached);
+    }
+
+    #[test]
+    fn shared_scaler_keeps_explicit_source_alpha() {
+        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+            if (20..44).contains(&x) && (20..44).contains(&y) {
+                image::Rgba([120, 180, 90, 255])
+            } else {
+                image::Rgba([240, 0, 220, 0])
             }
-        };
-        let result = prepared.resize(&self.source, w, h, aa, cancel)?;
-        cancel.check()?;
-        self.cache.lock().expect("Game Asset cache poisoned").target =
-            Some(((w, h, aa), Arc::new(result.clone())));
-        Ok(result)
+        }));
+        let cancel = CancellationToken::default();
+        let one_shot = resize(&source, 16, 16, GameAssetAa::new(20), &cancel).unwrap();
+        let cached = Session::new(source)
+            .resize(16, 16, GameAssetAa::new(20), &cancel)
+            .unwrap();
+        assert_eq!(cached, one_shot);
+        assert_eq!(one_shot.get_pixel(0, 0)[3], 0);
+        assert_eq!(one_shot.get_pixel(8, 8)[3], 255);
+    }
+
+    #[test]
+    fn shared_scaler_errors_preserve_application_semantics() {
+        let image = Arc::new(RgbaImage::new(16, 16));
+        let session = Session::new(image.clone());
+        let cancel = CancellationToken::default();
+        assert!(matches!(
+            session.resize(17, 16, Default::default(), &cancel),
+            Err(AppError::InvalidDimensions)
+        ));
+        session.resize(8, 8, Default::default(), &cancel).unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            session.resize(8, 8, Default::default(), &cancel),
+            Err(AppError::Cancelled)
+        ));
+        assert!(matches!(
+            resize(&image, 16, 16, Default::default(), &cancel),
+            Err(AppError::Cancelled)
+        ));
+        assert!(matches!(
+            map_error(asset_scaler::Error::GameAssetMemoryLimit { limit_bytes: 42 }),
+            AppError::GameAssetMemoryLimit { limit_bytes: 42 }
+        ));
     }
 }

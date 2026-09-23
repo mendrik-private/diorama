@@ -80,18 +80,71 @@ pub fn sloppy_ellipse(rect: Rect, seed: u64) -> Vec<Point> {
     points
 }
 
+#[must_use]
+pub fn rotated_sloppy_ellipse(rect: Rect, seed: u64, angle: f32) -> Vec<Point> {
+    if angle == 0.0 {
+        return sloppy_ellipse(rect, seed);
+    }
+    let center = rect.center();
+    let (sin, cos) = angle.sin_cos();
+    sloppy_ellipse(rect, seed)
+        .into_iter()
+        .map(|point| Point {
+            x: center.x + (point.x - center.x) * cos - (point.y - center.y) * sin,
+            y: center.y + (point.x - center.x) * sin + (point.y - center.y) * cos,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn rotated_rect_points(rect: Rect, angle: f32) -> [Point; 4] {
+    let center = rect.center();
+    let (sin, cos) = angle.sin_cos();
+    std::array::from_fn(|index| {
+        let point = [
+            Point {
+                x: rect.x,
+                y: rect.y,
+            },
+            Point {
+                x: rect.x + rect.width,
+                y: rect.y,
+            },
+            Point {
+                x: rect.x + rect.width,
+                y: rect.y + rect.height,
+            },
+            Point {
+                x: rect.x,
+                y: rect.y + rect.height,
+            },
+        ][index];
+        Point {
+            x: center.x + (point.x - center.x) * cos - (point.y - center.y) * sin,
+            y: center.y + (point.x - center.x) * sin + (point.y - center.y) * cos,
+        }
+    })
+}
+
 /// Render on a separate, tightly bounded layer so grain never erases another
 /// annotation. Texture coordinates follow the oval, independent of overlay bounds.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CrayonGeometry {
+    pub rect: Rect,
+    pub angle: f32,
+    pub seed: u64,
+}
+
 pub(super) fn draw_crayon(
     destination: &mut Pixmap,
-    rect: Rect,
-    seed: u64,
+    geometry: CrayonGeometry,
     width: f32,
     color: [u8; 4],
     transform: Transform,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let points = sloppy_ellipse(rect, seed);
+    let CrayonGeometry { rect, angle, seed } = geometry;
+    let points = rotated_sloppy_ellipse(rect, seed, angle);
     let padding = width / 2.0 + 2.0;
     let left = points
         .iter()
@@ -180,6 +233,12 @@ pub(super) fn draw_crayon(
     }
     let grain_size = (width / 7.0).max(0.65);
     let layer_width = layer.width() as usize;
+    let inverse_rotation = if angle == 0.0 {
+        None
+    } else {
+        let (sin, cos) = (-angle).sin_cos();
+        Some((rect.center(), sin, cos))
+    };
     for (index, pixel) in layer.data_mut().chunks_exact_mut(4).enumerate() {
         if index % 16_384 == 0 {
             cancellation.check()?;
@@ -187,8 +246,21 @@ pub(super) fn draw_crayon(
         if pixel[3] == 0 {
             continue;
         }
-        let x = (index % layer_width) as f32 + left as f32 - transform.tx - rect.x;
-        let y = (index / layer_width) as f32 + top as f32 - transform.ty - rect.y;
+        let (x, y) = if let Some((center, sin, cos)) = inverse_rotation {
+            let point = Point {
+                x: (index % layer_width) as f32 + left as f32 - transform.tx,
+                y: (index / layer_width) as f32 + top as f32 - transform.ty,
+            };
+            (
+                (point.x - center.x) * cos - (point.y - center.y) * sin + center.x - rect.x,
+                (point.x - center.x) * sin + (point.y - center.y) * cos + center.y - rect.y,
+            )
+        } else {
+            (
+                (index % layer_width) as f32 + left as f32 - transform.tx - rect.x,
+                (index / layer_width) as f32 + top as f32 - transform.ty - rect.y,
+            )
+        };
         let fine = grain(seed, x / grain_size, y / grain_size);
         let coarse = grain(
             seed ^ 0x51A7,
@@ -248,13 +320,16 @@ mod tests {
 
     #[test]
     fn crayon_grain_survives_moving_clipping_and_compositing() {
-        let render = |rect, transform, background| {
+        let render = |rect, angle, transform, background| {
             let mut image = Pixmap::new(180, 120).unwrap();
             image.fill(background);
             draw_crayon(
                 &mut image,
-                rect,
-                4,
+                CrayonGeometry {
+                    rect,
+                    angle,
+                    seed: 4,
+                },
                 12.0,
                 [240, 20, 20, 255],
                 transform,
@@ -264,14 +339,15 @@ mod tests {
             image
         };
         let clear = tiny_skia::Color::TRANSPARENT;
-        let original = render(RECT, Transform::identity(), clear);
-        assert_eq!(original, render(RECT, Transform::identity(), clear));
+        let original = render(RECT, 0.0, Transform::identity(), clear);
+        assert_eq!(original, render(RECT, 0.0, Transform::identity(), clear));
         let translated = render(
             Rect {
                 x: RECT.x + 17.0,
                 y: RECT.y + 9.0,
                 ..RECT
             },
+            0.0,
             Transform::identity(),
             clear,
         );
@@ -280,7 +356,7 @@ mod tests {
                 assert_eq!(original.pixel(x, y), translated.pixel(x + 17, y + 9));
             }
         }
-        let clipped = render(RECT, Transform::from_translate(-40.0, -30.0), clear);
+        let clipped = render(RECT, 0.0, Transform::from_translate(-40.0, -30.0), clear);
         for y in 0..90 {
             for x in 0..140 {
                 assert_eq!(original.pixel(x + 40, y + 30), clipped.pixel(x, y));
@@ -288,6 +364,7 @@ mod tests {
         }
         let on_blue = render(
             RECT,
+            0.0,
             Transform::identity(),
             tiny_skia::Color::from_rgba8(0, 0, 255, 255),
         );
@@ -328,13 +405,16 @@ mod tests {
         for (index, seed) in [4, 9, 42].into_iter().enumerate() {
             draw_crayon(
                 &mut image,
-                Rect {
-                    x: 70.0,
-                    y: 30.0 + index as f32 * 230.0,
-                    width: 850.0,
-                    height: 170.0,
+                CrayonGeometry {
+                    rect: Rect {
+                        x: 70.0,
+                        y: 30.0 + index as f32 * 230.0,
+                        width: 850.0,
+                        height: 170.0,
+                    },
+                    angle: 0.0,
+                    seed,
                 },
-                seed,
                 highlight_stroke_width((1000, 720)),
                 [225, 25, 30, 255],
                 Transform::identity(),
@@ -357,6 +437,14 @@ mod tests {
     fn ellipse_is_deterministic_and_seeded() {
         assert_eq!(sloppy_ellipse(RECT, 4), sloppy_ellipse(RECT, 4));
         assert_ne!(sloppy_ellipse(RECT, 4), sloppy_ellipse(RECT, 5));
+    }
+
+    #[test]
+    fn zero_angle_uses_the_original_ellipse_points_exactly() {
+        assert_eq!(
+            rotated_sloppy_ellipse(RECT, 4, 0.0),
+            sloppy_ellipse(RECT, 4)
+        );
     }
 
     #[test]

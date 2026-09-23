@@ -1,6 +1,6 @@
 [package]
 name = "diorama"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, native GNOME image viewer"
@@ -8,6 +8,7 @@ license = "GPL-3.0-only"
 build = "build.rs"
 
 [dependencies]
+asset-scaler = { git = "https://github.com/mendrik-private/asset-scaler", rev = "32d313b7ee94c67824002fb90db5fbb2b321a8e7" }
 fast_image_resize = "6.0.0"
 flate2 = "1.1.9"
 gio = { version = "0.22.8", features = ["v2_80"] }
@@ -41,8 +42,8 @@ tar = { version = "0.4.46", default-features = false }
 base64 = "0.22.1"
 
 [profile.dev]
-# Game Asset's numeric kernels live in this crate, outside the dependency
-# override below. Keep normal launches responsive with debug checks/symbols.
+# Keep normal launches responsive with debug checks/symbols.
+# The shared scaler is optimized by the dependency override below.
 opt-level = 3
 
 [profile.dev.package."*"]
@@ -54,7 +55,6 @@ codegen-units = 1
 strip = "debuginfo"
 
 [lints.rust]
-# The private Game Asset SIMD dispatcher is the only local exception.
 unsafe_code = "deny"
 
 [lints.clippy]

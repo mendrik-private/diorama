@@ -19,12 +19,7 @@ pub fn resize(
         return Err(AppError::InvalidDimensions);
     }
     if let Resampling::GameAsset(aa) = resampling {
-        return game_asset::Session::new(std::sync::Arc::new(image.clone())).resize(
-            target_width,
-            target_height,
-            aa,
-            cancellation,
-        );
+        return game_asset::resize(image, target_width, target_height, aa, cancellation);
     }
     cancellation.check()?;
     if image.dimensions() == (target_width, target_height) {

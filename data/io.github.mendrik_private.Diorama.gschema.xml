@@ -27,5 +27,20 @@
     <key name="palette-dithering" type="b"><default>false</default></key>
     <key name="compare-lens-size" type="i"><default>280</default></key>
     <key name="compare-lens-magnification" type="d"><default>4.0</default></key>
+    <key name="mesh-grid-size" type="i">
+      <range min="1" max="1000000"/>
+      <default>32</default>
+      <summary>Mesh grid size in image pixels</summary>
+    </key>
+    <key name="mesh-grid-offset-x" type="i">
+      <range min="-1000000" max="1000000"/>
+      <default>0</default>
+      <summary>Horizontal offset of mesh grid guides</summary>
+    </key>
+    <key name="mesh-grid-offset-y" type="i">
+      <range min="-1000000" max="1000000"/>
+      <default>0</default>
+      <summary>Vertical offset of mesh grid guides</summary>
+    </key>
   </schema>
 </schemalist>

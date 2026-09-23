@@ -178,6 +178,275 @@ fn canvas_image_bounds(
     .logical_bounds
 }
 
+#[cfg(test)]
+mod mesh_grid_tests {
+    use super::{
+        DIMETRIC_DIAGONAL_SLOPES, ISOMETRIC_DIAGONAL_SLOPES, MAX_MESH_GRID_LINES, MeshGrid,
+        diagonal_grid_intercept_spacing, diagonal_grid_line_family, diagonal_grid_phase,
+        diagonal_grid_slopes, grid_phase, mesh_grid_layout, mesh_grid_spacing,
+    };
+
+    #[test]
+    fn mesh_grid_spacing_is_the_configured_image_pixel_size() {
+        assert_eq!(mesh_grid_spacing(32), 32.0);
+        assert_eq!(mesh_grid_spacing(64), 64.0);
+        assert_eq!(mesh_grid_spacing(128), 128.0);
+        assert_eq!(mesh_grid_spacing(0), 1.0);
+    }
+
+    #[test]
+    fn mesh_grid_spacing_is_independent_of_image_dimensions_at_sensible_zoom() {
+        for grid in [MeshGrid::Square, MeshGrid::Dimetric, MeshGrid::Isometric] {
+            for grid_size in [32, 64, 128] {
+                let small = mesh_grid_layout(320, 240, grid_size, grid, 1.0, 1.0);
+                let large = mesh_grid_layout(3_200, 2_400, grid_size, grid, 1.0, 1.0);
+
+                assert_eq!(small.spacing, grid_size as f32);
+                assert_eq!(large.spacing, grid_size as f32);
+            }
+        }
+    }
+
+    #[test]
+    fn grid_layout_caps_each_line_family_on_extreme_images_and_at_tiny_zoom() {
+        for (width, height, grid) in [
+            (1_000_000, 1, MeshGrid::Square),
+            (1, 1_000_000, MeshGrid::Square),
+            (1_000_000, 1, MeshGrid::Dimetric),
+            (1, 1_000_000, MeshGrid::Dimetric),
+            (1_000_000, 1, MeshGrid::Isometric),
+            (1, 1_000_000, MeshGrid::Isometric),
+        ] {
+            let layout = mesh_grid_layout(width, height, 32, grid, 0.001, 0.001);
+            assert!(layout.vertical_lines <= MAX_MESH_GRID_LINES);
+            assert!(layout.horizontal_lines <= MAX_MESH_GRID_LINES);
+            assert!(layout.diagonal_lines <= MAX_MESH_GRID_LINES);
+            assert!(layout.spacing.is_finite() && layout.spacing > 0.0);
+            let multiple = layout.spacing / mesh_grid_spacing(32);
+            assert!((multiple - multiple.round()).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn dimetric_guide_keeps_verticals_and_half_slopes() {
+        assert_eq!(DIMETRIC_DIAGONAL_SLOPES, [-0.5, 0.5]);
+        let layout = mesh_grid_layout(800, 600, 32, MeshGrid::Dimetric, 1.0, 1.0);
+        assert!(layout.vertical_lines > 1);
+        assert!(layout.horizontal_lines > 1);
+        assert!(layout.diagonal_lines > 1);
+    }
+
+    #[test]
+    fn isometric_guide_keeps_verticals_and_thirty_degree_slopes() {
+        let slope = 1.0 / 3.0_f32.sqrt();
+        let slopes = diagonal_grid_slopes(MeshGrid::Isometric).unwrap();
+        assert!((slopes[0] + slope).abs() < f32::EPSILON);
+        assert!((slopes[1] - slope).abs() < f32::EPSILON);
+        let layout = mesh_grid_layout(800, 600, 32, MeshGrid::Isometric, 1.0, 1.0);
+        assert!(layout.vertical_lines > 1);
+        assert!(layout.diagonal_lines > 1);
+    }
+
+    #[test]
+    fn isometric_diagonal_crossings_land_on_the_vertical_lattice() {
+        for (width, height, grid_size, offset_x, offset_y, scale) in [
+            (800, 600, 32, 0, 0, 1.0),
+            (801, 599, 32, 13, -19, 1.0),
+            (1_000_000, 1, 32, -1_000_000, 1_000_000, 0.001),
+        ] {
+            let layout =
+                mesh_grid_layout(width, height, grid_size, MeshGrid::Isometric, scale, scale);
+            let vertical_phase = grid_phase(offset_x as f32, layout.spacing);
+            let slope = ISOMETRIC_DIAGONAL_SLOPES[1];
+            let diagonal_intercept_spacing =
+                diagonal_grid_intercept_spacing(MeshGrid::Isometric, slope, layout.spacing);
+            let diagonal_perpendicular_spacing =
+                diagonal_intercept_spacing / (1.0 + slope * slope).sqrt();
+            assert!(
+                (diagonal_perpendicular_spacing - layout.spacing).abs()
+                    < layout.spacing.max(1.0) * 1e-5,
+                "all three isometric line families must have equal perpendicular spacing"
+            );
+            let negative = diagonal_grid_line_family(
+                width as f32,
+                height as f32,
+                MeshGrid::Isometric,
+                ISOMETRIC_DIAGONAL_SLOPES[0],
+                layout,
+                offset_x,
+                offset_y,
+            );
+            let positive = diagonal_grid_line_family(
+                width as f32,
+                height as f32,
+                MeshGrid::Isometric,
+                ISOMETRIC_DIAGONAL_SLOPES[1],
+                layout,
+                offset_x,
+                offset_y,
+            );
+            assert!(negative.count <= MAX_MESH_GRID_LINES);
+            assert!(positive.count <= MAX_MESH_GRID_LINES);
+            let mut crossings = 0;
+
+            for negative_intercept in negative.intercepts() {
+                for positive_intercept in positive.intercepts() {
+                    let crossing_x = (negative_intercept - positive_intercept) / (2.0 * slope);
+                    if (0.0..=width as f32).contains(&crossing_x) {
+                        crossings += 1;
+                        let lattice_position = (crossing_x - vertical_phase) / layout.spacing;
+                        assert!(
+                            (lattice_position - lattice_position.round()).abs() < 1e-3,
+                            "crossing x={crossing_x} must land on a vertical lattice line"
+                        );
+                    }
+                }
+            }
+            assert!(
+                crossings > 0,
+                "test geometry must include crossings within the image X span"
+            );
+        }
+    }
+
+    #[test]
+    fn isometric_origin_phase_is_independent_of_image_dimensions() {
+        let offset_x = 13;
+        let offset_y = -19;
+        let small = mesh_grid_layout(800, 600, 32, MeshGrid::Isometric, 1.0, 1.0);
+        let large = mesh_grid_layout(801, 599, 32, MeshGrid::Isometric, 1.0, 1.0);
+        assert_eq!(small.spacing, large.spacing);
+
+        for slope in ISOMETRIC_DIAGONAL_SLOPES {
+            let small_family = diagonal_grid_line_family(
+                800.0,
+                600.0,
+                MeshGrid::Isometric,
+                slope,
+                small,
+                offset_x,
+                offset_y,
+            );
+            let large_family = diagonal_grid_line_family(
+                801.0,
+                599.0,
+                MeshGrid::Isometric,
+                slope,
+                large,
+                offset_x,
+                offset_y,
+            );
+            assert!(
+                (small_family.start.rem_euclid(small_family.step)
+                    - large_family.start.rem_euclid(large_family.step))
+                .abs()
+                    < 1e-5
+            );
+        }
+    }
+
+    #[test]
+    fn isometric_layout_uses_the_thirty_degree_diagonal_extent() {
+        let layout = mesh_grid_layout(800, 600, 1, MeshGrid::Isometric, 10.0, 10.0);
+        assert_eq!(layout.spacing, 4.0);
+        assert!(layout.diagonal_lines <= MAX_MESH_GRID_LINES);
+    }
+
+    #[test]
+    fn square_grid_offsets_translate_positive_and_negative_image_coordinates() {
+        assert_eq!(grid_phase(13.0, 10.0), 3.0);
+        assert_eq!(grid_phase(-13.0, 10.0), 7.0);
+        assert_eq!(grid_phase(4.0, 10.0), 4.0);
+        assert_eq!(grid_phase(-4.0, 10.0), 6.0);
+    }
+
+    #[test]
+    fn diagonal_grid_offsets_apply_the_full_x_translation_before_wrapping() {
+        let spacing = 10.0;
+        assert_eq!(diagonal_grid_phase(13, 4, 0.5, spacing), 7.5);
+        assert_eq!(diagonal_grid_phase(13, 4, -0.5, spacing), 0.5);
+        assert_eq!(diagonal_grid_phase(-13, -4, 0.5, spacing), 2.5);
+        assert_eq!(diagonal_grid_phase(-13, -4, -0.5, spacing), 9.5);
+    }
+
+    #[test]
+    fn isometric_grid_offsets_follow_thirty_degree_slopes() {
+        let spacing = 10.0;
+        let tolerance = 1e-5;
+        let intercept_spacing = diagonal_grid_intercept_spacing(
+            MeshGrid::Isometric,
+            ISOMETRIC_DIAGONAL_SLOPES[1],
+            spacing,
+        );
+        assert!(
+            (diagonal_grid_phase(13, 4, ISOMETRIC_DIAGONAL_SLOPES[1], intercept_spacing)
+                - 8.041_452)
+                .abs()
+                < tolerance
+        );
+        assert!(
+            (diagonal_grid_phase(13, 4, ISOMETRIC_DIAGONAL_SLOPES[0], intercept_spacing)
+                - 11.505_552)
+                .abs()
+                < tolerance
+        );
+        assert!(
+            (diagonal_grid_phase(-13, -4, ISOMETRIC_DIAGONAL_SLOPES[1], intercept_spacing)
+                - 3.505_553)
+                .abs()
+                < tolerance
+        );
+        assert!(
+            (diagonal_grid_phase(-13, -4, ISOMETRIC_DIAGONAL_SLOPES[0], intercept_spacing)
+                - 0.041_452_408)
+                .abs()
+                < tolerance
+        );
+    }
+
+    #[test]
+    fn grid_offset_periods_preserve_the_same_phases() {
+        let spacing = 10.0;
+        assert_eq!(grid_phase(13.0, spacing), grid_phase(113.0, spacing));
+        for slope in DIMETRIC_DIAGONAL_SLOPES {
+            assert_eq!(
+                diagonal_grid_phase(13, 4, slope, spacing),
+                diagonal_grid_phase(33, 4, slope, spacing),
+            );
+            assert_eq!(
+                diagonal_grid_phase(13, 4, slope, spacing),
+                diagonal_grid_phase(13, 14, slope, spacing),
+            );
+        }
+        for slope in ISOMETRIC_DIAGONAL_SLOPES {
+            assert!(
+                (diagonal_grid_phase(13, 4, slope, spacing)
+                    - diagonal_grid_phase(13, 14, slope, spacing))
+                .abs()
+                    < 1e-5
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_offsets_remain_normalized_without_increasing_grid_line_caps() {
+        for grid in [MeshGrid::Square, MeshGrid::Dimetric, MeshGrid::Isometric] {
+            let layout = mesh_grid_layout(1_000_000, 1_000_000, 32, grid, 0.001, 0.001);
+            assert!(layout.vertical_lines <= MAX_MESH_GRID_LINES);
+            assert!(layout.horizontal_lines <= MAX_MESH_GRID_LINES);
+            assert!(layout.diagonal_lines <= MAX_MESH_GRID_LINES);
+            assert!((0.0..layout.spacing).contains(&grid_phase(1_000_000.0, layout.spacing)));
+            assert!((0.0..layout.spacing).contains(&grid_phase(-1_000_000.0, layout.spacing)));
+            for slopes in [DIMETRIC_DIAGONAL_SLOPES, ISOMETRIC_DIAGONAL_SLOPES] {
+                for slope in slopes {
+                    let phase = diagonal_grid_phase(1_000_000, -1_000_000, slope, layout.spacing);
+                    assert!((0.0..layout.spacing).contains(&phase));
+                }
+            }
+        }
+    }
+}
+
 fn overlay_rect(image_bounds: gtk::graphene::Rect, overlay: &CropOverlay) -> gtk::graphene::Rect {
     let width = overlay.image_width.max(1) as f32;
     let height = overlay.image_height.max(1) as f32;
@@ -257,6 +526,176 @@ pub struct CropOverlay {
     pub height: u32,
     pub image_width: u32,
     pub image_height: u32,
+}
+
+/// A non-destructive guide and mesh points drawn over the current canvas image.
+/// Coordinates are image pixels, so it remains aligned while zooming or
+/// panning and is never part of an exported texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshGrid {
+    Square,
+    Dimetric,
+    Isometric,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshOverlay {
+    pub grid: Option<MeshGrid>,
+    pub grid_size: u32,
+    pub grid_offset_x: i32,
+    pub grid_offset_y: i32,
+    pub points: Vec<Point>,
+    pub active_handle: Option<usize>,
+}
+
+/// Native-pixel spacing configured for all mesh guides.
+pub fn mesh_grid_spacing(grid_size: u32) -> f32 {
+    grid_size.max(1) as f32
+}
+
+const DIMETRIC_DIAGONAL_SLOPES: [f32; 2] = [-0.5, 0.5];
+// tan(30°), used by the two diagonal line families of an isometric guide.
+const ISOMETRIC_DIAGONAL_SLOPES: [f32; 2] = [-0.577_350_26, 0.577_350_26];
+const MAX_MESH_GRID_LINES: u32 = 512;
+const MIN_MESH_GRID_SCREEN_SPACING: f32 = 8.0;
+
+#[derive(Debug, Clone, Copy)]
+struct MeshGridLayout {
+    spacing: f32,
+    vertical_lines: u32,
+    horizontal_lines: u32,
+    diagonal_lines: u32,
+}
+
+fn mesh_grid_layout(
+    width: u32,
+    height: u32,
+    grid_size: u32,
+    grid: MeshGrid,
+    scale_x: f32,
+    scale_y: f32,
+) -> MeshGridLayout {
+    let width = width as f32;
+    let height = height as f32;
+    let maximum_intervals = (MAX_MESH_GRID_LINES - 1) as f32;
+    let screen_limited_spacing = [scale_x, scale_y]
+        .into_iter()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .map(|scale| MIN_MESH_GRID_SCREEN_SPACING / scale)
+        .fold(0.0_f32, f32::max);
+    let native_spacing = mesh_grid_spacing(grid_size);
+    let mut minimum_spacing = native_spacing
+        .max(width / maximum_intervals)
+        .max(height / maximum_intervals)
+        .max(screen_limited_spacing);
+    let diagonal_extent = diagonal_grid_extent(width, height, grid);
+    if let Some(diagonal_extent) = diagonal_extent {
+        let diagonal_spacing_factor = diagonal_grid_slopes(grid)
+            .map(|slopes| diagonal_grid_intercept_spacing(grid, slopes[0], 1.0))
+            .unwrap_or(1.0);
+        minimum_spacing = minimum_spacing
+            .max((diagonal_extent * 2.0) / (maximum_intervals * diagonal_spacing_factor));
+    }
+    // Preserve the native image-grid alignment when reducing density: every
+    // displayed line remains an integer multiple of the configured pixel step.
+    let spacing = native_spacing * (minimum_spacing / native_spacing).ceil().max(1.0);
+    let vertical_lines = grid_line_count(width, spacing);
+    let horizontal_lines = grid_line_count(height, spacing);
+    let diagonal_lines = diagonal_extent.map_or(0, |extent| {
+        let slopes = diagonal_grid_slopes(grid).expect("diagonal extent requires diagonal slopes");
+        grid_line_count(
+            extent * 2.0,
+            diagonal_grid_intercept_spacing(grid, slopes[0], spacing),
+        )
+    });
+    MeshGridLayout {
+        spacing,
+        vertical_lines,
+        horizontal_lines,
+        diagonal_lines,
+    }
+}
+
+fn grid_line_count(extent: f32, spacing: f32) -> u32 {
+    if !extent.is_finite() || !spacing.is_finite() || spacing <= 0.0 {
+        return 0;
+    }
+    (extent / spacing).floor() as u32 + 1
+}
+
+fn grid_phase(offset: f32, spacing: f32) -> f32 {
+    if !offset.is_finite() || !spacing.is_finite() || spacing <= 0.0 {
+        return 0.0;
+    }
+    offset.rem_euclid(spacing)
+}
+
+fn diagonal_grid_extent(width: f32, height: f32, grid: MeshGrid) -> Option<f32> {
+    diagonal_grid_slopes(grid).map(|slopes| width * slopes[0].abs() + height)
+}
+
+fn diagonal_grid_slopes(grid: MeshGrid) -> Option<&'static [f32; 2]> {
+    match grid {
+        MeshGrid::Square => None,
+        MeshGrid::Dimetric => Some(&DIMETRIC_DIAGONAL_SLOPES),
+        MeshGrid::Isometric => Some(&ISOMETRIC_DIAGONAL_SLOPES),
+    }
+}
+
+fn diagonal_grid_phase(offset_x: i32, offset_y: i32, slope: f32, spacing: f32) -> f32 {
+    grid_phase(offset_y as f32 - slope * offset_x as f32, spacing)
+}
+
+fn diagonal_grid_intercept_spacing(grid: MeshGrid, slope: f32, spacing: f32) -> f32 {
+    match grid {
+        MeshGrid::Isometric => 2.0 * slope.abs() * spacing,
+        MeshGrid::Square | MeshGrid::Dimetric => spacing,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiagonalGridLineFamily {
+    start: f32,
+    step: f32,
+    count: u32,
+}
+
+impl DiagonalGridLineFamily {
+    fn intercepts(self) -> impl Iterator<Item = f32> {
+        (0..self.count).map(move |index| self.start + index as f32 * self.step)
+    }
+}
+
+fn diagonal_grid_line_family(
+    width: f32,
+    height: f32,
+    grid: MeshGrid,
+    slope: f32,
+    layout: MeshGridLayout,
+    offset_x: i32,
+    offset_y: i32,
+) -> DiagonalGridLineFamily {
+    let extent = diagonal_grid_extent(width, height, grid)
+        .expect("diagonal grid intercepts require a diagonal grid");
+    if grid == MeshGrid::Dimetric {
+        let phase = diagonal_grid_phase(offset_x, offset_y, slope, layout.spacing);
+        return DiagonalGridLineFamily {
+            start: -extent + phase,
+            step: layout.spacing,
+            count: layout.diagonal_lines,
+        };
+    }
+    let step = diagonal_grid_intercept_spacing(grid, slope, layout.spacing);
+    let phase = diagonal_grid_phase(offset_x, offset_y, slope, step);
+    let first_index = ((-extent - phase) / step).ceil() as i64;
+    let last_index = ((extent - phase) / step).floor() as i64;
+    let count = (last_index - first_index + 1).max(0) as u32;
+    debug_assert!(count <= layout.diagonal_lines);
+    DiagonalGridLineFamily {
+        start: phase + first_index as f32 * step,
+        step,
+        count,
+    }
 }
 
 /// The alpha matte of an activated selection. Keeping it separate from the
@@ -549,6 +988,7 @@ mod imp {
         pub(super) lens: RefCell<Option<Lens>>,
         pub marker: Cell<Option<(f32, f32)>>,
         pub crop_overlay: RefCell<Option<CropOverlay>>,
+        pub mesh_overlay: RefCell<Option<MeshOverlay>>,
         pub(super) lasso_overlay: RefCell<Option<CachedLassoOverlay>>,
         pub crop_dash_phase: Cell<f32>,
         pub crop_animation_running: Cell<bool>,
@@ -704,6 +1144,20 @@ mod imp {
                         .as_ref()
                         .map_or((1, 1), |texture| (texture.width(), texture.height())),
                     selection,
+                    self.render_scale.get(),
+                );
+            }
+            if let Some(image_bounds) = image_bounds
+                && let Some(overlay) = self.mesh_overlay.borrow().as_ref()
+            {
+                draw_mesh_overlay(
+                    snapshot,
+                    image_bounds,
+                    self.texture
+                        .borrow()
+                        .as_ref()
+                        .map_or((1, 1), |texture| (texture.width(), texture.height())),
+                    overlay,
                     self.render_scale.get(),
                 );
             }
@@ -915,29 +1369,10 @@ mod imp {
             Shape::Pencil { geometry, .. } => {
                 outline = crate::tools::annotation::pencil::outline_points(geometry);
             }
-            Shape::Highlight { rect, .. } => {
-                outline.extend([
-                    Point {
-                        x: rect.x,
-                        y: rect.y,
-                    },
-                    Point {
-                        x: rect.x + rect.width,
-                        y: rect.y,
-                    },
-                    Point {
-                        x: rect.x + rect.width,
-                        y: rect.y + rect.height,
-                    },
-                    Point {
-                        x: rect.x,
-                        y: rect.y + rect.height,
-                    },
-                    Point {
-                        x: rect.x,
-                        y: rect.y,
-                    },
-                ]);
+            Shape::Highlight { rect, angle, .. } => {
+                let points =
+                    crate::tools::annotation::highlight::rotated_rect_points(*rect, *angle);
+                outline.extend(points.into_iter().chain(std::iter::once(points[0])));
             }
             Shape::Arrow {
                 start,
@@ -1112,6 +1547,114 @@ mod imp {
         let rect = overlay_rect(image_bounds, overlay);
         draw_dashed_crop_border(snapshot, rect, render_scale, dash_phase);
         draw_crop_handles(snapshot, rect);
+    }
+
+    pub(super) fn draw_mesh_overlay(
+        snapshot: &gtk::Snapshot,
+        image_bounds: gtk::graphene::Rect,
+        image_dimensions: (i32, i32),
+        overlay: &MeshOverlay,
+        render_scale: f64,
+    ) {
+        let width = image_dimensions.0.max(1) as u32;
+        let height = image_dimensions.1.max(1) as u32;
+        let scale_x = image_bounds.width() / width as f32;
+        let scale_y = image_bounds.height() / height as f32;
+        snapshot.push_clip(&image_bounds);
+        {
+            let context = snapshot.append_cairo(&image_bounds);
+            context.set_line_width((3.0 / sanitized_render_scale(render_scale)).max(1.5));
+            if let Some(grid) = overlay.grid {
+                let layout =
+                    mesh_grid_layout(width, height, overlay.grid_size, grid, scale_x, scale_y);
+                let spacing = layout.spacing;
+                let vertical_phase = grid_phase(overlay.grid_offset_x as f32, spacing);
+                for index in 0..layout.vertical_lines {
+                    let x = vertical_phase + index as f32 * spacing;
+                    let screen_x = image_bounds.x() + x * scale_x;
+                    context.move_to(screen_x.into(), image_bounds.y().into());
+                    context.line_to(
+                        screen_x.into(),
+                        (image_bounds.y() + image_bounds.height()).into(),
+                    );
+                }
+                match diagonal_grid_slopes(grid) {
+                    None => {
+                        let horizontal_phase = grid_phase(overlay.grid_offset_y as f32, spacing);
+                        for index in 0..layout.horizontal_lines {
+                            let y = horizontal_phase + index as f32 * spacing;
+                            let screen_y = image_bounds.y() + y * scale_y;
+                            context.move_to(image_bounds.x().into(), screen_y.into());
+                            context.line_to(
+                                (image_bounds.x() + image_bounds.width()).into(),
+                                screen_y.into(),
+                            );
+                        }
+                    }
+                    Some(slopes) => {
+                        for slope in slopes {
+                            for offset in diagonal_grid_line_family(
+                                width as f32,
+                                height as f32,
+                                grid,
+                                *slope,
+                                layout,
+                                overlay.grid_offset_x,
+                                overlay.grid_offset_y,
+                            )
+                            .intercepts()
+                            {
+                                let start_x = 0.0;
+                                let end_x = width as f32;
+                                let start_y = *slope * start_x + offset;
+                                let end_y = *slope * end_x + offset;
+                                context.move_to(
+                                    (image_bounds.x() + start_x * scale_x).into(),
+                                    (image_bounds.y() + start_y * scale_y).into(),
+                                );
+                                context.line_to(
+                                    (image_bounds.x() + end_x * scale_x).into(),
+                                    (image_bounds.y() + end_y * scale_y).into(),
+                                );
+                            }
+                        }
+                    }
+                }
+                context.set_source_rgba(0.0, 0.0, 0.0, 0.75);
+                let _ = context.stroke_preserve();
+                context.set_line_width((1.5 / sanitized_render_scale(render_scale)).max(0.75));
+                context.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+                let _ = context.stroke();
+            }
+
+            if !overlay.points.is_empty() {
+                let screen = |point: Point| {
+                    (
+                        image_bounds.x() + point.x * scale_x,
+                        image_bounds.y() + point.y * scale_y,
+                    )
+                };
+                for (index, point) in overlay.points.iter().copied().enumerate() {
+                    let (x, y) = screen(point);
+                    context.set_source_rgba(
+                        0.15,
+                        0.4,
+                        0.95,
+                        if overlay.active_handle == Some(index) {
+                            1.0
+                        } else {
+                            0.88
+                        },
+                    );
+                    context.arc(x.into(), y.into(), 5.0, 0.0, std::f64::consts::TAU);
+                    let _ = context.fill();
+                    context.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+                    context.arc(x.into(), y.into(), 5.0, 0.0, std::f64::consts::TAU);
+                    let _ = context.stroke();
+                }
+            }
+        }
+        snapshot.pop();
     }
 
     fn draw_lasso_overlay(
@@ -1645,6 +2188,14 @@ impl ImageCanvas {
         }
     }
 
+    pub fn set_mesh_overlay(&self, overlay: Option<MeshOverlay>) {
+        if self.imp().mesh_overlay.borrow().as_ref() == overlay.as_ref() {
+            return;
+        }
+        self.imp().mesh_overlay.replace(overlay);
+        self.queue_draw();
+    }
+
     pub fn set_measurement_cursor(&self, cursor: Option<(f32, f32)>) {
         if self.imp().measurement_cursor.replace(cursor) != cursor {
             self.queue_draw();
@@ -1768,8 +2319,8 @@ impl ImageCanvas {
         Some(gtk::graphene::Rect::new(
             image_bounds.x() + overlay.origin_x as f32 * scale_x,
             image_bounds.y() + overlay.origin_y as f32 * scale_y,
-            overlay.crop.width as f32 * scale_x,
-            overlay.crop.height as f32 * scale_y,
+            overlay.mask.width() as f32 * scale_x,
+            overlay.mask.height() as f32 * scale_y,
         ))
     }
 
@@ -2312,6 +2863,46 @@ mod tests {
                 },
             );
             assert!(snapshot.to_node().is_some());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn mesh_overlay_draws_inside_an_image_clip() {
+        gtk::init().expect("GTK display initialization");
+        let bounds = gtk::graphene::Rect::new(10.0, 20.0, 80.0, 60.0);
+        let snapshot = gtk::Snapshot::new();
+        imp::draw_mesh_overlay(
+            &snapshot,
+            bounds,
+            (40, 30),
+            &MeshOverlay {
+                grid: Some(MeshGrid::Dimetric),
+                grid_size: 32,
+                grid_offset_x: 0,
+                grid_offset_y: 0,
+                points: vec![
+                    Point { x: -10.0, y: 5.0 },
+                    Point { x: 20.0, y: 5.0 },
+                    Point { x: 50.0, y: 35.0 },
+                ],
+                active_handle: Some(1),
+            },
+            1.0,
+        );
+        let node = snapshot.to_node().expect("mesh render node");
+        let node_bounds = node.bounds();
+        assert!(node_bounds.width() > 0.0 && node_bounds.height() > 0.0);
+        assert!(node_bounds.x() >= bounds.x() - f32::EPSILON);
+        assert!(node_bounds.y() >= bounds.y() - f32::EPSILON);
+        assert!(
+            node_bounds.x() + node_bounds.width() <= bounds.x() + bounds.width() + f32::EPSILON
+        );
+        assert!(
+            node_bounds.y() + node_bounds.height() <= bounds.y() + bounds.height() + f32::EPSILON
+        );
+        if let Ok(clip) = node.clone().downcast::<gtk::gsk::ClipNode>() {
+            assert_eq!(clip.bounds(), bounds);
         }
     }
 

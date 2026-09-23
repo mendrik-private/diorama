@@ -33,6 +33,9 @@ install_data(
   'icons/hicolor/scalable/actions/highlight-symbolic.svg',
   'icons/hicolor/scalable/actions/arrow-symbolic.svg',
   'icons/hicolor/scalable/actions/text-symbolic.svg',
+  'icons/hicolor/scalable/actions/mesh-dimetric-symbolic.svg',
+  'icons/hicolor/scalable/actions/mesh-isometric-symbolic.svg',
+  'icons/hicolor/scalable/actions/warp-mesh-symbolic.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'actions',
 )
 install_data(
