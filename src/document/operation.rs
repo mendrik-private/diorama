@@ -28,14 +28,14 @@ pub use asset_scaler::GameAssetAa;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameAssetOptions {
     aa: GameAssetAa,
-    contour_darkening: u8,
+    contour_opacity: u8,
 }
 
 impl GameAssetOptions {
-    pub fn new(aa: GameAssetAa, contour_darkening: u8) -> Self {
+    pub fn new(aa: GameAssetAa, contour_opacity: u8) -> Self {
         Self {
             aa,
-            contour_darkening: contour_darkening.min(100),
+            contour_opacity: contour_opacity.min(100),
         }
     }
 
@@ -43,18 +43,18 @@ impl GameAssetOptions {
         self.aa
     }
 
-    pub fn contour_darkening(self) -> u8 {
-        self.contour_darkening
+    pub fn contour_opacity(self) -> u8 {
+        self.contour_opacity
     }
 
-    pub fn ink_brightness(self) -> f64 {
-        1. - f64::from(self.contour_darkening) / 100.
+    pub fn contour_opacity_fraction(self) -> f64 {
+        f64::from(self.contour_opacity) / 100.
     }
 }
 
 impl Default for GameAssetOptions {
     fn default() -> Self {
-        Self::new(GameAssetAa::default(), 20)
+        Self::new(GameAssetAa::default(), 100)
     }
 }
 
@@ -130,15 +130,15 @@ mod tests {
     fn game_asset_options_default_and_clamp_are_stable() {
         assert_eq!(
             GameAssetOptions::default(),
-            GameAssetOptions::new(GameAssetAa::new(50), 20)
+            GameAssetOptions::new(GameAssetAa::new(50), 100)
         );
         let options = GameAssetOptions::new(GameAssetAa::new(42), 255);
         assert_eq!(options.aa(), GameAssetAa::new(42));
-        assert_eq!(options.contour_darkening(), 100);
-        assert_eq!(options.ink_brightness(), 0.);
+        assert_eq!(options.contour_opacity(), 100);
+        assert_eq!(options.contour_opacity_fraction(), 1.);
         assert_eq!(
-            GameAssetOptions::new(GameAssetAa::new(42), 0).ink_brightness(),
-            1.
+            GameAssetOptions::new(GameAssetAa::new(42), 0).contour_opacity_fraction(),
+            0.
         );
     }
 }

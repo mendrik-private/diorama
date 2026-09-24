@@ -444,11 +444,6 @@ fn distance(left: BrushPoint, right: BrushPoint) -> f32 {
     (right.x - left.x).hypot(right.y - left.y)
 }
 
-fn subdued_edge_coverage(coverage: f32) -> f32 {
-    // Keep the fully covered brush core intact while making the AA fringe less visually heavy.
-    coverage * coverage * (2.0 - coverage)
-}
-
 fn paint_antialiased_stroke(
     image: &mut RgbaImage,
     points: &[BrushPoint],
@@ -503,17 +498,14 @@ fn accumulate_stamp_coverage(
     let max_y = (center_y + outer_radius)
         .ceil()
         .min(height.saturating_sub(1) as f32) as u32;
-    let hard_radius = (radius - 0.5).max(0.0) * stroke.hardness;
-
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let distance = (x as f32 + 0.5 - center_x).hypot(y as f32 + 0.5 - center_y);
-            let linear_coverage = if distance <= hard_radius {
-                1.0
-            } else {
-                ((outer_radius - distance) / (outer_radius - hard_radius)).clamp(0.0, 1.0)
-            };
-            let pixel_coverage = subdued_edge_coverage(linear_coverage);
+            let pixel_coverage = asset_scaler::pen_aa::coverage_for_distance_f32(
+                distance,
+                stroke.width * pressure.clamp(0.01, 1.0),
+                stroke.hardness,
+            );
             if pixel_coverage <= 0.0 {
                 continue;
             }

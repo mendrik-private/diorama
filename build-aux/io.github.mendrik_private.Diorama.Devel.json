@@ -59,6 +59,7 @@
             ".flatpak-builder",
             "build",
             "target",
+            "vendor/asset-scaler/target",
             "build-local",
             "build-local-stable",
             "build-property-fix",

@@ -1,0 +1,39 @@
+[package]
+name = "asset-scaler"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.92"
+description = "Contour-aware downscaling for game sprites and illustrated assets"
+license = "GPL-3.0-only"
+repository = "https://github.com/mendrik-private/asset-scaler"
+readme = "README.md"
+keywords = ["image", "resize", "sprites", "pixel-art", "gamedev"]
+categories = ["multimedia::images", "game-development"]
+include = [
+    "src/**",
+    "tests/**",
+    "examples/resize.rs",
+    "docs/asset-scaler-server.md",
+    "docs/images/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+[dependencies]
+image = { version = "0.25.10", default-features = false }
+thiserror = "2"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+crc32fast = "1.5"
+
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -156,26 +156,23 @@ impl Settings {
         self.set_integer("game-asset-aa", i32::from(aa.percent()));
     }
 
-    pub fn game_asset_contour_darkening(&self) -> u8 {
-        self.integer("game-asset-contour-darkening")
-            .unwrap_or(20)
+    pub fn game_asset_contour_opacity(&self) -> u8 {
+        self.integer("game-asset-contour-opacity")
+            .unwrap_or(100)
             .clamp(0, 100) as u8
     }
 
-    pub fn set_game_asset_contour_darkening(&self, darkening: u8) {
-        self.set_integer(
-            "game-asset-contour-darkening",
-            i32::from(darkening.min(100)),
-        );
+    pub fn set_game_asset_contour_opacity(&self, opacity: u8) {
+        self.set_integer("game-asset-contour-opacity", i32::from(opacity.min(100)));
     }
 
     pub fn game_asset_options(&self) -> GameAssetOptions {
-        GameAssetOptions::new(self.game_asset_aa(), self.game_asset_contour_darkening())
+        GameAssetOptions::new(self.game_asset_aa(), self.game_asset_contour_opacity())
     }
 
     pub fn set_game_asset_options(&self, options: GameAssetOptions) {
         self.set_game_asset_aa(options.aa());
-        self.set_game_asset_contour_darkening(options.contour_darkening());
+        self.set_game_asset_contour_opacity(options.contour_opacity());
     }
 
     pub fn color_picker_format(&self) -> ColorFormat {
@@ -433,8 +430,8 @@ mod tests {
         assert_eq!(settings.mesh_grid_offset_x(), 0);
         assert_eq!(settings.mesh_grid_offset_y(), 0);
         assert_eq!(settings.game_asset_options(), GameAssetOptions::default());
-        settings.set_game_asset_options(GameAssetOptions::new(GameAssetAa::new(100), 100));
-        assert_eq!(settings.game_asset_contour_darkening(), 20);
+        settings.set_game_asset_options(GameAssetOptions::new(GameAssetAa::new(100), 0));
+        assert_eq!(settings.game_asset_contour_opacity(), 100);
         settings.set_pencil_size(128);
         settings.set_pencil_antialiasing(true);
         settings.set_mesh_grid_size(100);

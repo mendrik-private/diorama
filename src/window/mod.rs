@@ -460,6 +460,14 @@ impl ZoomGestureAnchor {
     }
 }
 
+fn canvas_coordinate_from_viewport(
+    viewport_coordinate: f64,
+    adjustment: f64,
+    centered_canvas_offset: f64,
+) -> f64 {
+    viewport_coordinate + adjustment - centered_canvas_offset
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalePreviewView {
     Footprint,
@@ -654,6 +662,7 @@ struct WindowState {
     window: adw::ApplicationWindow,
     fullscreen_preview: RefCell<Option<fullscreen_preview::FullscreenPreview>>,
     canvas: ImageCanvas,
+    canvas_viewport: gtk::Viewport,
     scrolled: gtk::ScrolledWindow,
     canvas_overlay: gtk::Overlay,
     content_stack: gtk::Stack,
@@ -781,7 +790,7 @@ struct WindowState {
     scale_method: gtk::DropDown,
     scale_aa_controls: gtk::Box,
     scale_aa: gtk::SpinButton,
-    scale_contour_darkening: gtk::SpinButton,
+    scale_contour_opacity: gtk::SpinButton,
     scale_show_contours: gtk::ToggleButton,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
@@ -1072,23 +1081,21 @@ impl ViewerWindow {
         scale_aa_controls.append(&scale_aa_label);
         scale_aa_controls.append(&scale_aa);
         scale_aa_controls.append(&gtk::Label::new(Some("%")));
-        let scale_contour_darkening_label = gtk::Label::with_mnemonic(&gettext("_Darken"));
-        let scale_contour_darkening = spin(
-            0.0,
-            100.0,
-            f64::from(settings.game_asset_contour_darkening()),
+        let scale_contour_opacity_label = gtk::Label::with_mnemonic(&gettext("_Opacity"));
+        let scale_contour_opacity =
+            spin(0.0, 100.0, f64::from(settings.game_asset_contour_opacity()));
+        scale_contour_opacity.set_width_chars(3);
+        scale_contour_opacity_label.set_mnemonic_widget(Some(&scale_contour_opacity));
+        let opacity_description = gettext(
+            "Contour opacity: 0% adds no contours; 100% draws full contours over the existing fill",
         );
-        scale_contour_darkening.set_width_chars(3);
-        scale_contour_darkening_label.set_mnemonic_widget(Some(&scale_contour_darkening));
-        let darkening_description =
-            gettext("Contour darkening: 0% keeps the detected color; 100% uses black ink");
-        scale_contour_darkening.set_tooltip_text(Some(&darkening_description));
-        scale_contour_darkening.update_property(&[
-            gtk::accessible::Property::Label(&gettext("Contour darkening (%)")),
-            gtk::accessible::Property::Description(&darkening_description),
+        scale_contour_opacity.set_tooltip_text(Some(&opacity_description));
+        scale_contour_opacity.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Contour opacity (%)")),
+            gtk::accessible::Property::Description(&opacity_description),
         ]);
-        scale_aa_controls.append(&scale_contour_darkening_label);
-        scale_aa_controls.append(&scale_contour_darkening);
+        scale_aa_controls.append(&scale_contour_opacity_label);
+        scale_aa_controls.append(&scale_contour_opacity);
         scale_aa_controls.append(&gtk::Label::new(Some("%")));
         let scale_top_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         scale_control_row.set_valign(gtk::Align::Start);
@@ -1212,6 +1219,7 @@ impl ViewerWindow {
             window,
             fullscreen_preview: RefCell::new(None),
             canvas,
+            canvas_viewport,
             scrolled,
             canvas_overlay,
             content_stack,
@@ -1337,7 +1345,7 @@ impl ViewerWindow {
             scale_method,
             scale_aa_controls,
             scale_aa,
-            scale_contour_darkening,
+            scale_contour_opacity,
             scale_show_contours,
             scale_original_button,
             scale_source: RefCell::new(None),
@@ -3093,7 +3101,7 @@ impl ViewerWindow {
             self.0.scale_width.clone().upcast::<gtk::Widget>(),
             self.0.scale_height.clone().upcast(),
             self.0.scale_aa.clone().upcast(),
-            self.0.scale_contour_darkening.clone().upcast(),
+            self.0.scale_contour_opacity.clone().upcast(),
         ] {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3137,7 +3145,7 @@ impl ViewerWindow {
                 let resampling = match resampling_at(dropdown.selected()) {
                     Resampling::GameAsset(_) => Resampling::GameAsset(GameAssetOptions::new(
                         GameAssetAa::new(this.0.scale_aa.value().round() as u8),
-                        this.0.scale_contour_darkening.value().round() as u8,
+                        this.0.scale_contour_opacity.value().round() as u8,
                     )),
                     method => method,
                 };
@@ -3158,7 +3166,7 @@ impl ViewerWindow {
                 }
                 let options = GameAssetOptions::new(
                     GameAssetAa::new(spin.value().round() as u8),
-                    this.0.scale_contour_darkening.value().round() as u8,
+                    this.0.scale_contour_opacity.value().round() as u8,
                 );
                 this.0.settings.set_game_asset_options(options);
                 if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
@@ -3167,7 +3175,7 @@ impl ViewerWindow {
                 }
             }
         });
-        self.0.scale_contour_darkening.connect_value_changed({
+        self.0.scale_contour_opacity.connect_value_changed({
             let this = self.clone();
             move |spin| {
                 if this.0.scale_updating_controls.get() {
@@ -7359,6 +7367,9 @@ impl ViewerWindow {
 
     fn install_gestures(&self) {
         let zoom = gtk::GestureZoom::new();
+        // The centered canvas can be smaller than its viewport after keyboard zoom.
+        // Capture there so pinches starting in the exposed viewport margin still reach us.
+        zoom.set_propagation_phase(gtk::PropagationPhase::Capture);
         let zoom_anchor = Rc::new(Cell::new(None::<ZoomGestureAnchor>));
         let zoom_adjustment_target = Rc::new(Cell::new(None::<ZoomGestureAnchor>));
         self.0.scrolled.hadjustment().connect_changed({
@@ -7387,10 +7398,16 @@ impl ViewerWindow {
                     (horizontal.page_size() - f64::from(this.0.canvas.width())).max(0.0) / 2.0;
                 let canvas_offset_y =
                     (vertical.page_size() - f64::from(this.0.canvas.height())).max(0.0) / 2.0;
-                let (content_x, content_y) = gesture.bounding_box_center().unwrap_or((
-                    horizontal.value() + horizontal.page_size() / 2.0 - canvas_offset_x,
-                    vertical.value() + vertical.page_size() / 2.0 - canvas_offset_y,
-                ));
+                let (viewport_x, viewport_y) = gesture
+                    .bounding_box_center()
+                    .unwrap_or((horizontal.page_size() / 2.0, vertical.page_size() / 2.0));
+                let content_x = canvas_coordinate_from_viewport(
+                    viewport_x,
+                    horizontal.value(),
+                    canvas_offset_x,
+                );
+                let content_y =
+                    canvas_coordinate_from_viewport(viewport_y, vertical.value(), canvas_offset_y);
                 let Some(texture) = this.0.canvas.texture() else {
                     return;
                 };
@@ -7409,8 +7426,8 @@ impl ViewerWindow {
                     // The anchor belongs to the image, excluding centered margins.
                     content_x: content_x - f64::from(bounds.x()),
                     content_y: content_y - f64::from(bounds.y()),
-                    viewport_x: content_x + canvas_offset_x - horizontal.value(),
-                    viewport_y: content_y + canvas_offset_y - vertical.value(),
+                    viewport_x,
+                    viewport_y,
                     image_width: f64::from(bounds.width()),
                     image_height: f64::from(bounds.height()),
                 }));
@@ -7464,7 +7481,7 @@ impl ViewerWindow {
                 zoom_adjustment_target.set(None);
             }
         });
-        self.0.canvas.add_controller(zoom);
+        self.0.canvas_viewport.add_controller(zoom);
 
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll({
@@ -8523,6 +8540,22 @@ mod tests {
         None
     }
 
+    fn installed_pinch_gesture(window: &ViewerWindow) -> gtk::GestureZoom {
+        [
+            window.0.canvas.clone().upcast::<gtk::Widget>(),
+            window.0.canvas_viewport.clone().upcast(),
+        ]
+        .into_iter()
+        .flat_map(|widget| {
+            let controllers = widget.observe_controllers();
+            (0..controllers.n_items())
+                .filter_map(move |index| controllers.item(index))
+                .filter_map(|controller| controller.downcast::<gtk::GestureZoom>().ok())
+        })
+        .next()
+        .expect("installed pinch gesture")
+    }
+
     #[test]
     fn region_handles_use_directional_resize_cursors() {
         let rect = gtk::graphene::Rect::new(20.0, 30.0, 100.0, 80.0);
@@ -9380,10 +9413,7 @@ mod tests {
         let texture = texture_from_rgba(&image::RgbaImage::new(1_600, 1_200)).unwrap();
         window.0.canvas.set_texture(Some(&texture));
         window.0.content_stack.set_visible_child_name("viewer");
-        let controllers = window.0.canvas.observe_controllers();
-        let gesture = (0..controllers.n_items())
-            .find_map(|index| controllers.item(index)?.downcast::<gtk::GestureZoom>().ok())
-            .expect("installed pinch gesture");
+        let gesture = installed_pinch_gesture(&window);
         let sequence = None::<gtk::gdk::EventSequence>;
 
         for filter in [ZoomFilter::Soft, ZoomFilter::Hard] {
@@ -9435,6 +9465,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pinch_reaches_viewport_margins_after_keyboard_zoom() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.KeyboardPinchRouteTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let texture = texture_from_rgba(&image::RgbaImage::new(1_600, 1_200)).unwrap();
+        window.0.canvas.set_texture(Some(&texture));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        window.0.window.set_default_size(800, 600);
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        for filter in [ZoomFilter::Soft, ZoomFilter::Hard] {
+            window.0.canvas.set_filter(filter);
+            for (action, initial_zoom) in [
+                ("zoom-25", 1.0),
+                ("zoom-out", 0.5),
+                ("zoom-in", 0.5),
+                ("zoom-100", 0.5),
+                ("fit", 1.0),
+            ] {
+                window.set_zoom_with_alignment(initial_zoom, false);
+                window.0.scrolled.allocate(800, 600, -1, None);
+                gio::prelude::ActionGroupExt::activate_action(&window.0.window, action, None);
+                while context.pending() {
+                    context.iteration(false);
+                }
+                window.0.scrolled.allocate(800, 600, -1, None);
+
+                let gesture = installed_pinch_gesture(&window);
+                let target = window
+                    .0
+                    .canvas_viewport
+                    .pick(1.0, 1.0, gtk::PickFlags::DEFAULT)
+                    .expect("fixed viewport coordinate must be targetable after keyboard zoom");
+                let owner = gesture.widget().expect("gesture controller owner");
+                assert!(
+                    target == owner || target.is_ancestor(&owner),
+                    "{filter:?}, {action}: pinch at a viewport coordinate targets {}, but the zoom controller is on {}",
+                    target.type_().name(),
+                    owner.type_().name(),
+                );
+
+                let start_zoom = window.0.canvas.zoom();
+                let sequence = None::<gtk::gdk::EventSequence>;
+                gesture.emit_by_name::<()>("begin", &[&sequence]);
+                gesture.emit_by_name::<()>("scale-changed", &[&1.25_f64]);
+                while context.pending() {
+                    context.iteration(false);
+                }
+                gesture.emit_by_name::<()>("end", &[&sequence]);
+                assert!(
+                    (window.0.canvas.zoom() - start_zoom * 1.25).abs() < 1e-9,
+                    "{filter:?}, {action}: pinch did not start from the keyboard-selected zoom"
+                );
+
+                let cancelled_zoom = window.0.canvas.zoom();
+                gesture.emit_by_name::<()>("begin", &[&sequence]);
+                gesture.emit_by_name::<()>("scale-changed", &[&0.8_f64]);
+                gesture.emit_by_name::<()>("cancel", &[&sequence]);
+                assert!((window.0.canvas.zoom() - cancelled_zoom * 0.8).abs() < 1e-9);
+
+                let restarted_zoom = window.0.canvas.zoom();
+                gesture.emit_by_name::<()>("begin", &[&sequence]);
+                gesture.emit_by_name::<()>("scale-changed", &[&1.1_f64]);
+                gesture.emit_by_name::<()>("end", &[&sequence]);
+                assert!((window.0.canvas.zoom() - restarted_zoom * 1.1).abs() < 1e-9);
+            }
+        }
+        window.0.window.close();
+    }
+
+    #[test]
+    fn viewport_pinch_coordinates_map_to_a_centered_scrolled_canvas() {
+        assert_eq!(canvas_coordinate_from_viewport(40.0, 320.0, 200.0), 160.0);
+        assert_eq!(canvas_coordinate_from_viewport(400.0, 0.0, 200.0), 200.0);
     }
 
     #[test]

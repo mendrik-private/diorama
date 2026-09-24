@@ -15,10 +15,10 @@
       <default>50</default>
       <summary>Game Asset antialiasing intensity</summary>
     </key>
-    <key name="game-asset-contour-darkening" type="i">
+    <key name="game-asset-contour-opacity" type="i">
       <range min="0" max="100"/>
-      <default>20</default>
-      <summary>Game Asset contour darkening</summary>
+      <default>100</default>
+      <summary>Game Asset contour opacity</summary>
     </key>
     <key name="color-picker-format" type="s"><default>'hex'</default></key>
     <key name="pencil-size" type="i"><default>1</default></key>

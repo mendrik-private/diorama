@@ -136,6 +136,15 @@ mod tests {
         assert_eq!(window.0.scale_aa.value(), 50.);
         assert_eq!(window.0.scale_aa.adjustment().lower(), 0.);
         assert_eq!(window.0.scale_aa.adjustment().upper(), 100.);
+        assert_eq!(window.0.scale_contour_opacity.value(), 100.);
+        assert_eq!(window.0.scale_contour_opacity.adjustment().lower(), 0.);
+        assert_eq!(window.0.scale_contour_opacity.adjustment().upper(), 100.);
+        assert_eq!(
+            window.0.scale_contour_opacity.tooltip_text().as_deref(),
+            Some(
+                "Contour opacity: 0% adds no contours; 100% draws full contours over the existing fill"
+            )
+        );
         window.0.scale_game_asset.replace(Some(session.clone()));
         window.0.scale_width.set_value(32.);
         window.present();
@@ -154,7 +163,26 @@ mod tests {
         for percent in [0, 100, 50] {
             window.0.scale_aa.set_value(f64::from(percent));
             assert_eq!(window.0.scale_aa.value(), f64::from(percent));
-            let options = GameAssetOptions::new(GameAssetAa::new(percent), 20);
+            let options = GameAssetOptions::new(GameAssetAa::new(percent), 100);
+            assert_eq!(
+                window.0.scale_resampling.get(),
+                Resampling::GameAsset(options)
+            );
+            wait_for_preview();
+            assert_eq!(window.0.settings.game_asset_options(), options);
+            let expected = session
+                .resize(32, 27, options, &CancellationToken::default())
+                .unwrap();
+            assert_eq!(
+                window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+                &expected
+            );
+            assert_eq!(window.0.canvas.zoom(), preserved_zoom);
+        }
+        for percent in [0, 50, 100] {
+            window.0.scale_contour_opacity.set_value(f64::from(percent));
+            assert_eq!(window.0.scale_contour_opacity.value(), f64::from(percent));
+            let options = GameAssetOptions::new(GameAssetAa::new(50), percent);
             assert_eq!(
                 window.0.scale_resampling.get(),
                 Resampling::GameAsset(options)
@@ -173,14 +201,14 @@ mod tests {
         // Switching methods hides the paired controls without forgetting them
         // or contaminating another method. Rapid changes publish only the latest value.
         window.0.scale_aa.set_value(75.);
-        window.0.scale_contour_darkening.set_value(40.);
+        window.0.scale_contour_opacity.set_value(40.);
         for method in [0, 1, 3] {
             window.0.scale_method.set_selected(method);
             assert!(!window.0.scale_aa_controls.get_visible());
         }
         window.0.scale_method.set_selected(2);
         assert_eq!(window.0.scale_aa.value(), 75.);
-        assert_eq!(window.0.scale_contour_darkening.value(), 40.);
+        assert_eq!(window.0.scale_contour_opacity.value(), 40.);
         window.0.scale_aa.set_value(0.);
         let obsolete = window
             .0
@@ -206,12 +234,12 @@ mod tests {
         );
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
-        window.0.scale_contour_darkening.grab_focus();
+        window.0.scale_contour_opacity.grab_focus();
         while context.pending() {
             context.iteration(false);
         }
         assert!(application.accels_for_action("win.zoom-100").is_empty());
-        let controllers = window.0.scale_contour_darkening.observe_controllers();
+        let controllers = window.0.scale_contour_opacity.observe_controllers();
         assert!(
             (0..controllers.n_items())
                 .filter_map(|i| controllers.item(i))
@@ -259,11 +287,7 @@ mod tests {
             );
             let bounds = window.0.scale_aa.compute_bounds(row).unwrap();
             assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
-            let bounds = window
-                .0
-                .scale_contour_darkening
-                .compute_bounds(row)
-                .unwrap();
+            let bounds = window.0.scale_contour_opacity.compute_bounds(row).unwrap();
             assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
             let bounds = row.compute_bounds(&top_row).unwrap();
             assert_eq!(bounds.y(), 0., "AA stays on the first row");

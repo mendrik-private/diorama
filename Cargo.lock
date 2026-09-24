@@ -115,7 +115,6 @@ dependencies = [
 [[package]]
 name = "asset-scaler"
 version = "0.1.1"
-source = "git+https://github.com/mendrik-private/asset-scaler?rev=cff93b5e626270be4a3cf923f01109ee9eab452a#cff93b5e626270be4a3cf923f01109ee9eab452a"
 dependencies = [
  "image",
  "thiserror",
@@ -644,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "diorama"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "asset-scaler",
  "base64",

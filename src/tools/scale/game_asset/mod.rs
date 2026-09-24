@@ -16,7 +16,7 @@ const HARD_CUTOUT_ALPHA: u8 = 128;
 /// cache entry.
 struct AaEndpoints {
     target: (u32, u32),
-    contour_darkening: u8,
+    contour_opacity: u8,
     zero: RgbaImage,
     full: RgbaImage,
 }
@@ -240,8 +240,7 @@ impl Session {
             .expect("AA endpoint cache poisoned")
             .as_ref()
             .filter(|endpoints| {
-                endpoints.target == target
-                    && endpoints.contour_darkening == options.contour_darkening()
+                endpoints.target == target && endpoints.contour_opacity == options.contour_opacity()
             })
             .cloned()
         {
@@ -259,31 +258,31 @@ impl Session {
         let source_is_opaque = self.source_is_opaque(cancel)?;
         let mut zero = self
             .scaler
-            .resize_with_foreground_ink(
+            .resize_with_foreground_opacity(
                 &foreground,
                 target.0,
                 target.1,
                 GameAssetAa::new(0),
-                options.ink_brightness(),
+                options.contour_opacity_fraction(),
                 &|| cancel.check().is_err(),
             )
             .map_err(map_error)?;
         harden_opaque_cutout_at_zero_aa(&mut zero, source_is_opaque, GameAssetAa::new(0), cancel)?;
         let full = self
             .scaler
-            .resize_with_foreground_ink(
+            .resize_with_foreground_opacity(
                 &foreground,
                 target.0,
                 target.1,
                 GameAssetAa::new(100),
-                options.ink_brightness(),
+                options.contour_opacity_fraction(),
                 &|| cancel.check().is_err(),
             )
             .map_err(map_error)?;
         cancel.check()?;
         let built = Arc::new(AaEndpoints {
             target,
-            contour_darkening: options.contour_darkening(),
+            contour_opacity: options.contour_opacity(),
             zero,
             full,
         });
@@ -296,8 +295,7 @@ impl Session {
         if let Some(endpoints) = cache
             .as_ref()
             .filter(|endpoints| {
-                endpoints.target == target
-                    && endpoints.contour_darkening == options.contour_darkening()
+                endpoints.target == target && endpoints.contour_opacity == options.contour_opacity()
             })
             .cloned()
         {
@@ -403,7 +401,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn options(aa: u8) -> GameAssetOptions {
-        GameAssetOptions::new(GameAssetAa::new(aa), 20)
+        GameAssetOptions::new(GameAssetAa::new(aa), 100)
     }
 
     fn remove_flat_background(image: &RgbaImage, cancel: &CancellationToken) -> Result<RgbaImage> {
@@ -480,7 +478,11 @@ mod tests {
         );
         assert!(
             image.pixels().any(|pixel| pixel.0 == [0, 0, 0, 255]),
-            "fixture must retain at least one detected contour"
+            "contour preview must render detected contours as black lines"
+        );
+        assert!(
+            image.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]),
+            "contour preview must retain a white background"
         );
     }
 
@@ -542,14 +544,6 @@ mod tests {
         assert_eq!(
             original,
             contour_mask_to_rgba(&polished_source_mask, &cancel).unwrap()
-        );
-        let raw_source_mask = session
-            .scaler
-            .source_contour_mask(&|| cancel.check().is_err())
-            .unwrap();
-        assert_ne!(
-            polished_source_mask, raw_source_mask,
-            "fixture must distinguish fitted contour geometry from the raw source footprint"
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(
@@ -651,12 +645,12 @@ mod tests {
         let raw_scaler = asset_scaler::Session::new(source.clone());
         raw_scaler.prepare(&|| false).unwrap();
         let old_one = raw_scaler
-            .resize_with_foreground_ink(
+            .resize_with_foreground_opacity(
                 &foreground,
                 32,
                 32,
                 GameAssetAa::new(1),
-                options(1).ink_brightness(),
+                options(1).contour_opacity_fraction(),
                 &|| false,
             )
             .unwrap();
@@ -673,23 +667,23 @@ mod tests {
         // The direct calls define the historical 0%/100% recipes. The
         // Session must return those endpoint bytes unchanged before blending.
         let mut raw_zero = raw_scaler
-            .resize_with_foreground_ink(
+            .resize_with_foreground_opacity(
                 &foreground,
                 32,
                 32,
                 GameAssetAa::new(0),
-                options(0).ink_brightness(),
+                options(0).contour_opacity_fraction(),
                 &|| false,
             )
             .unwrap();
         harden_opaque_cutout_at_zero_aa(&mut raw_zero, true, GameAssetAa::new(0), &cancel).unwrap();
         let raw_full = raw_scaler
-            .resize_with_foreground_ink(
+            .resize_with_foreground_opacity(
                 &foreground,
                 32,
                 32,
                 GameAssetAa::new(100),
-                options(100).ink_brightness(),
+                options(100).contour_opacity_fraction(),
                 &|| false,
             )
             .unwrap();
@@ -777,7 +771,7 @@ mod tests {
             &endpoints_before_aa_change,
             &endpoints_after_aa_change
         ));
-        // Darkening changes painted ink and therefore rebuilds this bounded
+        // Opacity changes contour compositing and therefore rebuilds this bounded
         // endpoint pair, while the foreground estimate stays cached.
         session
             .resize(
@@ -787,7 +781,7 @@ mod tests {
                 &cancel,
             )
             .unwrap();
-        let endpoints_after_darkening_change = session
+        let endpoints_after_opacity_change = session
             .aa_endpoints
             .lock()
             .expect("AA endpoint cache poisoned")
@@ -796,7 +790,7 @@ mod tests {
             .clone();
         assert!(!Arc::ptr_eq(
             &endpoints_after_aa_change,
-            &endpoints_after_darkening_change
+            &endpoints_after_opacity_change
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 5);
         // A different preview size replaces the bounded pair but reuses the
@@ -816,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn contour_darkening_changes_only_painted_ink_and_not_alpha() {
+    fn contour_opacity_blends_contours_without_recoloring_fill() {
         let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
             if !(16..48).contains(&x) || !(16..48).contains(&y) {
                 image::Rgba([240, 230, 220, 255])
@@ -831,7 +825,7 @@ mod tests {
             Arc::new(remove_flat_background_with_soft_subject_edge),
         );
         let cancel = CancellationToken::default();
-        let plain = session
+        let no_contours = session
             .resize(
                 32,
                 32,
@@ -839,15 +833,15 @@ mod tests {
                 &cancel,
             )
             .unwrap();
-        let default_darkening = session
+        let half_contours = session
             .resize(
                 32,
                 32,
-                GameAssetOptions::new(GameAssetAa::new(50), 20),
+                GameAssetOptions::new(GameAssetAa::new(50), 50),
                 &cancel,
             )
             .unwrap();
-        let black = session
+        let full_contours = session
             .resize(
                 32,
                 32,
@@ -857,45 +851,44 @@ mod tests {
             .unwrap();
 
         assert!(
-            plain
+            no_contours
                 .pixels()
-                .zip(default_darkening.pixels())
+                .zip(half_contours.pixels())
                 .any(|(a, b)| a != b)
         );
         assert!(
-            default_darkening
+            half_contours
                 .pixels()
-                .zip(black.pixels())
+                .zip(full_contours.pixels())
                 .any(|(a, b)| a != b)
         );
         // This interior subject pixel is away from the border and centerline,
-        // so changing contour darkness cannot alter the Lanczos fill.
-        assert_eq!(plain.get_pixel(12, 12), default_darkening.get_pixel(12, 12));
-        assert_eq!(plain.get_pixel(12, 12), black.get_pixel(12, 12));
-        assert!(plain.get_pixel(12, 12)[3] > 0);
-        for ((plain, default_darkening), black) in plain
+        // so opacity cannot alter its Lanczos fill or opaque alpha.
+        assert_eq!(
+            no_contours.get_pixel(12, 12),
+            half_contours.get_pixel(12, 12)
+        );
+        assert_eq!(
+            no_contours.get_pixel(12, 12),
+            full_contours.get_pixel(12, 12)
+        );
+        assert_eq!(no_contours.get_pixel(12, 12)[3], 255);
+        for ((no_contours, half_contours), full_contours) in no_contours
             .pixels()
-            .zip(default_darkening.pixels())
-            .zip(black.pixels())
+            .zip(half_contours.pixels())
+            .zip(full_contours.pixels())
         {
-            assert_eq!(plain[3], default_darkening[3]);
-            assert_eq!(plain[3], black[3]);
-            if plain == default_darkening && default_darkening == black {
-                continue;
+            // Any fully opaque fill pixel remains opaque. Partially transparent
+            // contour destinations may gain alpha through normal compositing.
+            if no_contours[3] == 255 {
+                assert_eq!(half_contours[3], 255);
+                assert_eq!(full_contours[3], 255);
             }
-            assert!(
-                black[0] <= default_darkening[0]
-                    && default_darkening[0] <= plain[0]
-                    && black[1] <= default_darkening[1]
-                    && default_darkening[1] <= plain[1]
-                    && black[2] <= default_darkening[2]
-                    && default_darkening[2] <= plain[2]
-            );
         }
     }
 
     #[test]
-    fn zero_aa_darkening_uses_solid_foreground_ink() {
+    fn contour_opacity_uses_original_donor_color_and_compositing_alpha() {
         let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
             if !(16..48).contains(&x) || !(16..48).contains(&y) {
                 image::Rgba([240, 230, 220, 255])
@@ -910,15 +903,15 @@ mod tests {
             Arc::new(remove_flat_background_with_soft_subject_edge),
         );
         let cancel = CancellationToken::default();
-        let dark_twenty = session
+        let no_contours = session
             .resize(
                 32,
                 32,
-                GameAssetOptions::new(GameAssetAa::new(0), 20),
+                GameAssetOptions::new(GameAssetAa::new(0), 0),
                 &cancel,
             )
             .unwrap();
-        let black = session
+        let full_contours = session
             .resize(
                 32,
                 32,
@@ -927,16 +920,100 @@ mod tests {
             )
             .unwrap();
 
-        assert!(black.pixels().all(|pixel| pixel[3] == 0 || pixel[3] == 255));
         assert!(
-            dark_twenty
+            full_contours
                 .pixels()
-                .any(|pixel| pixel.0 == [176, 56, 40, 255]),
-            "AA 0% uses the 80%-bright deterministic foreground donor on a core"
+                .all(|pixel| pixel[3] == 0 || pixel[3] == 255)
         );
         assert!(
-            black.pixels().any(|pixel| pixel.0 == [0, 0, 0, 255]),
-            "AA 0% with Darken 100% must paint a fully opaque black core"
+            full_contours
+                .pixels()
+                .filter(|pixel| pixel[3] == 255)
+                .all(|pixel| pixel.0 != [0, 0, 0, 255]),
+            "full opacity must not turn opaque contour donors black"
+        );
+        assert!(
+            no_contours
+                .pixels()
+                .zip(full_contours.pixels())
+                .any(|(without, with)| without != with),
+            "zero opacity leaves the fill while full opacity adds contour paint"
+        );
+    }
+
+    #[test]
+    fn half_contour_opacity_is_premultiplied_linear_midpoint_on_partial_alpha() {
+        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+            if !(12..52).contains(&x) || !(12..52).contains(&y) {
+                image::Rgba([0; 4])
+            } else if (y as i32 - (x as i32 / 2 + 12)).abs() <= 2 {
+                image::Rgba([12, 10, 8, 160])
+            } else {
+                image::Rgba([180, 60, 40, 160])
+            }
+        }));
+        let session =
+            Session::with_background_remover(source, Arc::new(|image, _| Ok(image.clone())));
+        let cancel = CancellationToken::default();
+        let without = session
+            .resize(
+                32,
+                32,
+                GameAssetOptions::new(GameAssetAa::new(100), 0),
+                &cancel,
+            )
+            .unwrap();
+        let half = session
+            .resize(
+                32,
+                32,
+                GameAssetOptions::new(GameAssetAa::new(100), 50),
+                &cancel,
+            )
+            .unwrap();
+        let full = session
+            .resize(
+                32,
+                32,
+                GameAssetOptions::new(GameAssetAa::new(100), 100),
+                &cancel,
+            )
+            .unwrap();
+
+        assert!(
+            without
+                .pixels()
+                .zip(full.pixels())
+                .any(|(fill, painted)| fill != painted)
+        );
+        let mut saw_partial_alpha_change = false;
+        for ((fill, half), painted) in without.pixels().zip(half.pixels()).zip(full.pixels()) {
+            let fill_alpha = f64::from(fill[3]) / 255.;
+            let painted_alpha = f64::from(painted[3]) / 255.;
+            let expected_alpha = (fill_alpha + painted_alpha) * 0.5;
+            assert!(half[3].abs_diff((expected_alpha * 255.).round() as u8) <= 1);
+            if fill[3] != painted[3] && (1..255).contains(&fill[3]) {
+                saw_partial_alpha_change = true;
+            }
+            if half[3] == 0 {
+                assert_eq!(half.0, [0; 4]);
+                continue;
+            }
+            let actual_alpha = f64::from(half[3]) / 255.;
+            for channel in 0..3 {
+                let expected = (srgb_to_linear(fill[channel]) * fill_alpha
+                    + srgb_to_linear(painted[channel]) * painted_alpha)
+                    * 0.5
+                    / actual_alpha;
+                assert!(
+                    half[channel].abs_diff(linear_to_srgb(expected)) <= 2,
+                    "channel {channel} was not the opacity midpoint"
+                );
+            }
+        }
+        assert!(
+            saw_partial_alpha_change,
+            "fixture must exercise contour compositing over partial alpha"
         );
     }
 
@@ -985,18 +1062,21 @@ mod tests {
         )
         .unwrap();
         assert!(hard.pixels().all(|pixel| pixel[3] == 0 || pixel[3] == 255));
-        let foreground = remove_flat_background_with_soft_subject_edge(&source, &cancel).unwrap();
-        let without_original_contours =
-            asset_scaler::resize(&foreground, 32, 32, GameAssetAa::new(0), &|| false).unwrap();
-        assert!(hard.pixels().zip(without_original_contours.pixels()).any(
-            |(with_contours, without_contours)| {
-                with_contours[3] == 255
-                    && without_contours[3] > 0
-                    // The source geometry selects this contour; the aligned
-                    // foreground supplies its red donor, darkened by 20%.
-                    && u16::from(with_contours[0]) + 20 < u16::from(without_contours[0])
-            }
-        ));
+        let without_contours = resize_with_background_remover(
+            &source,
+            32,
+            32,
+            GameAssetOptions::new(GameAssetAa::new(0), 0),
+            &cancel,
+            remove_background.clone(),
+        )
+        .unwrap();
+        assert!(
+            hard.pixels()
+                .zip(without_contours.pixels())
+                .any(|(with_contours, fill)| with_contours != fill),
+            "full opacity must add source-derived contour paint"
+        );
 
         let softened = resize_with_background_remover(
             &source,
