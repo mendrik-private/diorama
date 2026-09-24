@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 build = "build.rs"
 
 [dependencies]
-asset-scaler = { git = "https://github.com/mendrik-private/asset-scaler", rev = "cff93b5e626270be4a3cf923f01109ee9eab452a" }
+asset-scaler = { git = "https://github.com/mendrik-private/asset-scaler", rev = "b6bc785ef76380dc32f8205919051cbe7249b1a7" }
 fast_image_resize = "6.0.0"
 flate2 = "1.1.9"
 gio = { version = "0.22.8", features = ["v2_80"] }

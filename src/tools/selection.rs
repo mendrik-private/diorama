@@ -979,4 +979,20 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(error.to_string().contains("timed out"));
     }
+
+    /// Manual export of the production BiRefNet cutout, used as the real
+    /// foreground when reviewing Game Asset contours outside the app:
+    /// `DIORAMA_CUTOUT_INPUT=in.png DIORAMA_CUTOUT_OUTPUT=out.png cargo test
+    /// export_birefnet_cutout -- --ignored`
+    #[test]
+    #[ignore = "runs the local BiRefNet model on a caller-supplied image"]
+    fn export_birefnet_cutout() {
+        let input = std::env::var("DIORAMA_CUTOUT_INPUT").expect("DIORAMA_CUTOUT_INPUT");
+        let output = std::env::var("DIORAMA_CUTOUT_OUTPUT").expect("DIORAMA_CUTOUT_OUTPUT");
+        let image = image::open(input).unwrap().into_rgba8();
+        super::birefnet_cutout(&image, &crate::document::CancellationToken::default())
+            .unwrap()
+            .save(output)
+            .unwrap();
+    }
 }

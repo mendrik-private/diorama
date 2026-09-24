@@ -115,7 +115,7 @@ dependencies = [
 [[package]]
 name = "asset-scaler"
 version = "0.1.1"
-source = "git+https://github.com/mendrik-private/asset-scaler?rev=cff93b5e626270be4a3cf923f01109ee9eab452a#cff93b5e626270be4a3cf923f01109ee9eab452a"
+source = "git+https://github.com/mendrik-private/asset-scaler?rev=b6bc785ef76380dc32f8205919051cbe7249b1a7#b6bc785ef76380dc32f8205919051cbe7249b1a7"
 dependencies = [
  "image",
  "thiserror",

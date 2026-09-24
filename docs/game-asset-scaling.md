@@ -47,18 +47,26 @@ Lanczos resampling remain separate methods.
 
 ## Source analysis
 
-Five Gaussian scales and four scan directions find dark ridges. Supported local
-samples fit quadratic patches. Source rasterization and topology-preserving thinning
-provide a trace graph. Direction-compatible continuations merge across small junction
-loops; supported endpoints bridge small gaps. Ambiguous branches remain separate.
-Each ordered trace is then fit as bounded cubic geometry with shared tangent directions
-at joined pieces; real corners and shared junctions remain fixed fit anchors. Target
+Five Gaussian scales and four scan directions find dark ridges. Aligned ridge
+samples joined by continuous ink collapse to the darkest one, so a wide outline
+beside dark shading yields one centerline instead of parallel tracks. Supported
+local samples fit quadratic patches. Source rasterization fills the narrow slivers
+between overlapping patches, and topology-preserving thinning then provides a
+one-pixel trace graph; spurs of up to four pixels are pruned unless they continue
+a longer branch straight through its junction. Direction-compatible continuations
+merge across small junction loops; supported endpoints bridge small gaps.
+Ambiguous branches remain separate. Each ordered trace is lightly smoothed between
+its anchors and fit as bounded cubic geometry with shared tangent directions at
+joined pieces; only turns that persist over three source pixels count as corners,
+and real corners and shared junctions remain fixed fit anchors. The approved
+geometry is locked by the crate's `locked_elf_source_vectors` test. Target
 rasterization adaptively converts that geometry to quadratics.
 
 Source ink is the detected shoulder-supported footprint plus the thinned centerline.
 Each visible detector sample near a trace measures the contiguous ink span along its
-normal in quarter-pixel steps, capped at 32 source pixels on each side. The mean of
-all supported measurements gives that contour's source thickness. Analysis and widths
+normal in quarter-pixel steps, capped at 32 source pixels on each side. The median of
+all supported measurements gives that contour's source thickness, so a sample
+measuring along a crossing stroke cannot thicken it. Analysis and widths
 are cached once per immutable source. A live Diorama session also caches one successful
 BiRefNet foreground estimate, keyed by that immutable source. It keeps two completed
 renders for the active target size and Darken setting at AA 0% and 100%; changing
@@ -68,9 +76,10 @@ for its new contour RGB, while retaining the prepared contours and cached foregr
 
 ## Target contours
 
-A contour must project to more than three distinct target Bresenham pixels; one,
-two, and three projected pixels are rejected. The same source trace can therefore
-drop as the target becomes smaller. Rejection removes its explicit contour redraw
+A contour must project to at least five distinct target Bresenham pixels. A
+shorter contour survives only as a connector whose both ends join longer kept
+contours, so a line split at junctions is not interrupted. The same source trace
+can therefore drop as the target becomes smaller. Rejection removes its explicit contour redraw
 and its halo evidence, while its original pixels can still contribute to the ordinary
 resampled Lanczos fill. Target coordinates use pixel-center alignment independently on each axis.
 The fitted cubic traces preserve shared tangent directions, then are adaptively
@@ -79,9 +88,23 @@ is rasterized with canonical-direction Zingl/Bresenham quadratics and thinned in
 its own target bounding box. Cleanup cannot replace a black contour connection
 with a route through a different, green contour. Only digital core construction
 rounds coordinates; geometric AA samples retain the subpixel curve coordinates.
-At crowded reductions, source strength and width rank competing parallel detail while
-outer alpha edges retain priority, including holes and gaps in the background-removed
-foreground, keeping the silhouette readable before interior detail.
+Crowding is decided after rendering against the background-removed foreground.
+Outer alpha edges always stay, including holes and gaps in that foreground. Other
+contours are ranked purely geometrically: longer first, then isolated over
+tangled, thicker in the source, and continuous over interrupted. A contour is
+dropped when most of its core runs parallel within two target pixels of, or
+directly touches, a higher-ranked kept contour. At targets of 128 pixels or less,
+an interior contour (less than half of its core on the removed background) also
+needs 15 drawn core pixels, easing linearly to five pixels at 512; a short
+interior contour touching two kept contours stays as a connector. Tiny sprites
+therefore keep their outlines and long interior lines only.
+
+Beside a drawn core that edges the removed background, the resampled outline ink
+is repaired so the silhouette outline stays one pixel wide. A neighbouring
+interior pixel takes the local ink-free fill colour, or the painted interior just
+beyond a wide outline; a silhouette-edge pixel is never refilled and becomes
+transparent only when it holds nothing but outline ink and background. Interior
+contours and every pixel beside them keep the resampled fill untouched.
 
 Rasterization assigns contour ownership before color lookup. Core pixels always
 win over another contour's fringe. At a genuine core overlap, the greater intrinsic
