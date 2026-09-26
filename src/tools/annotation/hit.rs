@@ -1,10 +1,8 @@
-use crate::document::{
-    Annotation, AnnotationId, Axis, HIGHLIGHT_STROKE_WIDTH, PencilGeometry, Point, Rect, Shape,
-};
+use crate::document::{Annotation, AnnotationId, Axis, PencilGeometry, Point, Rect, Shape};
 
 use super::arrow::curve_points;
 use super::geometry::{distance_to_polyline, distance_to_segment, polyline_length};
-use super::highlight::{rotated_rect_points, rotated_sloppy_ellipse};
+use super::highlight::{highlight_stroke_width, rotated_rect_points, rotated_sloppy_ellipse};
 use super::pencil::{geometry_bounds, outline_points};
 use super::text::baseline;
 
@@ -342,10 +340,13 @@ fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
             distance_to_polyline(point, &outline_points(geometry)) <= tolerance + style.width / 2.0
         }
         Shape::Highlight {
-            rect, angle, seed, ..
+            rect,
+            angle,
+            seed,
+            style,
         } => {
             distance_to_polyline(point, &rotated_sloppy_ellipse(*rect, *seed, *angle))
-                <= tolerance + HIGHLIGHT_STROKE_WIDTH / 2.0
+                <= tolerance + highlight_stroke_width(style.width) / 2.0
         }
         Shape::Arrow {
             start,

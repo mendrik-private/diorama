@@ -13,9 +13,8 @@ use crate::compare::{SplitOrientation, choose_split};
 use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
-    GameAssetAa, GameAssetOptions, HIGHLIGHT_STROKE_WIDTH, LineLink, LineVertex,
-    MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect, Resampling, Rotation, Shape,
-    StrokePath, StrokeStyle,
+    GameAssetAa, GameAssetOptions, LineLink, LineVertex, MEASUREMENT_STROKE_WIDTH, Operation,
+    PencilGeometry, Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -26,7 +25,6 @@ use crate::navigation::{DirectorySequence, find_matching_file};
 #[cfg(test)]
 use crate::settings::ColorFormat;
 use crate::settings::{Settings, ZoomMode};
-use crate::tools::annotation::highlight::highlight_stroke_width;
 use crate::tools::crop::CropBounds;
 use adw::prelude::{
     ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
@@ -2483,7 +2481,7 @@ impl ViewerWindow {
                             seed: id.0 ^ 0xD10A_AA73_9E37_79B9,
                             style: StrokeStyle {
                                 color,
-                                width: HIGHLIGHT_STROKE_WIDTH,
+                                width: stroke_width,
                             },
                         }
                     }
@@ -2891,13 +2889,6 @@ impl ViewerWindow {
             }
         }
 
-        let highlight_width = self
-            .0
-            .rendered
-            .borrow()
-            .as_ref()
-            .map(image::GenericImageView::dimensions)
-            .map_or(HIGHLIGHT_STROKE_WIDTH, highlight_stroke_width);
         let (lower, upper, value, tooltip, size_sensitive) = match tool {
             Tool::Text => (
                 6.0,
@@ -2907,11 +2898,11 @@ impl ViewerWindow {
                 true,
             ),
             Tool::Highlight => (
-                f64::from(highlight_width),
-                f64::from(highlight_width),
-                f64::from(highlight_width),
-                gettext("Automatic highlight width for this image"),
-                false,
+                1.0,
+                128.0,
+                self.0.line_width.get(),
+                gettext("Highlight thickness (1 = 2 image pixels)"),
+                true,
             ),
             Tool::Arrow | Tool::Pencil => (
                 1.0,
@@ -3052,7 +3043,7 @@ impl ViewerWindow {
                         .0
                         .settings
                         .set_annotation_text_size(spinner.value().round() as u16),
-                    Tool::Highlight | Tool::Measure => return,
+                    Tool::Measure => return,
                     _ => {
                         this.0.line_width.set(spinner.value());
                         this.0
@@ -9870,6 +9861,7 @@ mod tests {
             .register(gio::Cancellable::NONE)
             .expect("application registration");
         let window = ViewerWindow::new(&application, None);
+        let original_width = window.0.settings.pencil_size();
         let image = image::RgbaImage::from_pixel(100, 80, image::Rgba([1, 2, 3, 255]));
         let texture = texture_from_rgba(&image).expect("image texture");
         window.0.canvas.set_texture(Some(&texture));
@@ -9885,44 +9877,59 @@ mod tests {
 
         window.set_tool(Tool::Highlight);
         window.0.pencil_size.set_value(14.0);
-        assert_eq!(window.0.pencil_size.value(), 1.0);
-        assert!(!window.0.pencil_size.is_sensitive());
+        assert_eq!(window.0.pencil_size.value(), 14.0);
+        assert!(window.0.pencil_size.is_sensitive());
         window.0.keyboard_tool_cursor.set(Some((50, 40)));
         window.activate_keyboard_tool();
-        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
-        assert!(matches!(
-            annotations[0].shape,
-            Shape::Highlight {
-                rect: crate::document::Rect {
-                    width: 64.0,
-                    height: 40.0,
+        {
+            let document = window.0.document.borrow();
+            let annotations = document.as_ref().unwrap().annotations();
+            assert!(matches!(
+                annotations[0].shape,
+                Shape::Highlight {
+                    rect: crate::document::Rect {
+                        width: 64.0,
+                        height: 40.0,
+                        ..
+                    },
                     ..
-                },
-                ..
-            }
-        ));
+                }
+            ));
+            let Shape::Highlight { style, .. } = &annotations[0].shape else {
+                unreachable!()
+            };
+            assert_eq!(style.width, 14.0);
+        }
+        window.0.pencil_size.set_value(15.0);
+        let document = window.0.document.borrow();
+        let annotations = document.as_ref().unwrap().annotations();
         let Shape::Highlight { style, .. } = &annotations[0].shape else {
             unreachable!()
         };
-        assert_eq!(style.width, 1.0);
+        assert_eq!(style.width, 15.0);
+        drop(document);
 
         window.select_annotation(None);
         window.set_tool(Tool::Arrow);
         window.0.keyboard_tool_cursor.set(Some((50, 40)));
         window.activate_keyboard_tool();
         let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
-        let Shape::Arrow { start, end, .. } = annotations[1].shape else {
+        let Shape::Arrow {
+            start, end, style, ..
+        } = annotations[1].shape
+        else {
             panic!("keyboard Arrow did not create an arrow")
         };
         assert_eq!(end.x - start.x, 80.0);
         assert_eq!(end.y, start.y);
+        assert_eq!(style.width, 15.0);
 
         window.select_annotation(None);
         window.set_tool(Tool::Pencil);
         window.0.keyboard_tool_cursor.set(Some((12, 14)));
         window.activate_keyboard_tool();
-        let document = window.0.document.borrow();
-        let document = document.as_ref().expect("document");
+        let document_ref = window.0.document.borrow();
+        let document = document_ref.as_ref().expect("document");
         let annotations = document.annotations();
         assert!(matches!(
             &annotations[2].shape,
@@ -9941,6 +9948,8 @@ mod tests {
                 .iter()
                 .all(|operation| matches!(operation, Operation::Annotate(_)))
         );
+        drop(document_ref);
+        window.0.settings.set_pencil_size(original_width);
     }
 
     #[test]

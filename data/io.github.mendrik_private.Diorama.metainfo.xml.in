@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.21" date="2026-09-26">
+      <description>
+        <p>Makes highlight thickness follow the shared pen setting: a setting of 1 renders at 2 image pixels, and the setting now persists through creation, editing, and image transforms.</p>
+      </description>
+    </release>
     <release version="0.3.20" date="2026-09-24">
       <description>
         <p>Improves vector contour extraction for Game Asset scaling, replaces contour darkening with opacity, and uses the pen tool’s antialiasing algorithm while retaining adjustable AA strength. Pinch zoom also continues after keyboard zoom across viewport margins.</p>

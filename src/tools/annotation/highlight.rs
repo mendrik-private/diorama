@@ -5,13 +5,9 @@ use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 use crate::document::{CancellationToken, Point, Rect};
 use crate::error::{AppError, Result};
 
-// An 8.4-pixel crayon at 1024 px, with enough body for grain on small images.
-const WIDTH_RATIO: f32 = 8.4 / 1024.0;
-
 #[must_use]
-pub fn highlight_stroke_width(image_dimensions: (u32, u32)) -> f32 {
-    let longest_side = image_dimensions.0.max(image_dimensions.1);
-    (longest_side as f32 * WIDTH_RATIO).max(2.8)
+pub fn highlight_stroke_width(pen_width: f32) -> f32 {
+    pen_width * 2.0
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -415,7 +411,7 @@ mod tests {
                     angle: 0.0,
                     seed,
                 },
-                highlight_stroke_width((1000, 720)),
+                highlight_stroke_width(4.0),
                 [225, 25, 30, 255],
                 Transform::identity(),
                 &CancellationToken::default(),
@@ -448,13 +444,10 @@ mod tests {
     }
 
     #[test]
-    fn stroke_width_scales_continuously_with_image_resolution() {
-        assert_eq!(highlight_stroke_width((1, 1)), 2.8);
-        assert_eq!(highlight_stroke_width((512, 300)), 4.2);
-        assert_eq!(highlight_stroke_width((1024, 512)), 8.4);
-        assert_eq!(highlight_stroke_width((512, 2048)), 16.8);
-        assert_eq!(highlight_stroke_width((4096, 2048)), 33.6);
-        assert!(highlight_stroke_width((1024, 512)) - highlight_stroke_width((1023, 512)) < 0.02);
+    fn stroke_width_is_twice_the_pen_setting() {
+        assert_eq!(highlight_stroke_width(1.0), 2.0);
+        assert_eq!(highlight_stroke_width(4.0), 8.0);
+        assert_eq!(highlight_stroke_width(128.0), 256.0);
     }
 
     #[test]

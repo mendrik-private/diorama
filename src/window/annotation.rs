@@ -3,8 +3,8 @@ use gtk::prelude::*;
 use super::{ViewerWindow, texture_from_owned_rgba, texture_from_rgba};
 use crate::canvas::{AnnotationOverlay, SelectionHandles};
 use crate::document::{
-    Annotation, AnnotationEdit, AnnotationId, Axis, HIGHLIGHT_STROKE_WIDTH,
-    MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry, Point, Rect, Shape, StrokeStyle,
+    Annotation, AnnotationEdit, AnnotationId, Axis, MEASUREMENT_STROKE_WIDTH, Operation,
+    PencilGeometry, Point, Rect, Shape, StrokeStyle,
 };
 use crate::tools::annotation::edit::{handle_drag, moved, rotated};
 use crate::tools::annotation::hit::{HitKind, cursor_for_hit, hit_test};
@@ -403,7 +403,7 @@ impl ViewerWindow {
                         seed: id.0 ^ 0xD10A_AA73_9E37_79B9,
                         style: StrokeStyle {
                             color,
-                            width: HIGHLIGHT_STROKE_WIDTH,
+                            width: stroke_width,
                         },
                     },
                     Tool::Arrow => Shape::Arrow {
@@ -707,7 +707,9 @@ impl ViewerWindow {
                 if let Some(color) = color {
                     style.color = color;
                 }
-                style.width = HIGHLIGHT_STROKE_WIDTH;
+                if let Some(size) = size {
+                    style.width = size;
+                }
             }
             Shape::Arrow { style, .. } => {
                 if let Some(color) = color {

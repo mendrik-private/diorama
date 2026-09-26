@@ -212,7 +212,7 @@ fn draw_annotation(
                     angle: *angle,
                     seed: *seed,
                 },
-                highlight_stroke_width(dimensions),
+                highlight_stroke_width(style.width),
                 style.color,
                 transform,
                 cancellation,
@@ -785,13 +785,16 @@ fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<
             Some(bounds)
         }
         Shape::Highlight {
-            rect, angle, seed, ..
+            rect,
+            angle,
+            seed,
+            style,
         } => {
             let mut points =
                 super::highlight::rotated_sloppy_ellipse(*rect, *seed, *angle).into_iter();
             let mut bounds = Bounds::point(points.next()?);
             points.for_each(|point| bounds.include(point));
-            bounds.expand(highlight_stroke_width(dimensions) / 2.0 + 2.0);
+            bounds.expand(highlight_stroke_width(style.width) / 2.0 + 2.0);
             Some(bounds)
         }
         Shape::Arrow {
@@ -1084,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_width_follows_image_size_and_ignores_stored_width() {
+    fn highlight_width_uses_the_stored_pen_setting_independent_of_image_size() {
         let render = |dimensions, width| {
             render_bounded_overlay(
                 dimensions,
@@ -1115,12 +1118,12 @@ mod tests {
             .sum::<u64>()
         };
 
-        let normal = render((1024, 300), 1.0);
-        assert_eq!(normal, render((1024, 300), 12.0));
-        let doubled = render((2048, 300), 1.0);
+        let thin = render((1024, 300), 1.0);
+        assert_eq!(thin, render((2048, 300), 1.0));
+        let thick = render((1024, 300), 12.0);
         assert!(
-            doubled > normal * 3 / 2,
-            "doubling resolution should increase crayon coverage: {normal} -> {doubled}"
+            thick > thin * 3 / 2,
+            "increasing the pen setting should increase crayon coverage: {thin} -> {thick}"
         );
     }
 

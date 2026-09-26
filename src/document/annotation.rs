@@ -5,7 +5,6 @@ use std::{
 
 use super::{BrushPoint, Operation, Rotation};
 
-pub const HIGHLIGHT_STROKE_WIDTH: f32 = 1.0;
 pub const MEASUREMENT_STROKE_WIDTH: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -571,7 +570,7 @@ fn transform_annotation(annotation: &mut Annotation, transform: TransformKind) {
             rect, angle, style, ..
         } => {
             transform_highlight(rect, angle, transform);
-            style.width = HIGHLIGHT_STROKE_WIDTH;
+            style.width *= transform.width_scale();
         }
         Shape::Arrow {
             start,
@@ -769,7 +768,7 @@ mod tests {
                 seed: 7,
                 style: StrokeStyle {
                     color: [255, 0, 0, 255],
-                    width: HIGHLIGHT_STROKE_WIDTH,
+                    width: 1.0,
                 },
             },
         }
@@ -1049,7 +1048,11 @@ mod tests {
 
     #[test]
     fn canvas_resize_translates_annotations_without_scaling() {
-        let original = highlight();
+        let mut original = highlight();
+        let Shape::Highlight { style, .. } = &mut original.shape else {
+            unreachable!()
+        };
+        style.width = 3.0;
         let operations = [
             Operation::Annotate(AnnotationEdit::Create(original.clone())),
             Operation::ResizeCanvas {
@@ -1182,11 +1185,16 @@ mod tests {
     }
 
     #[test]
-    fn scaling_keeps_the_legacy_highlight_width_field_canonical() {
+    fn scaling_scales_highlight_pen_setting() {
+        let mut annotation = highlight();
+        let Shape::Highlight { style, .. } = &mut annotation.shape else {
+            unreachable!()
+        };
+        style.width = 3.0;
         let folded = fold_annotations(
             (100, 100),
             &[
-                Operation::Annotate(AnnotationEdit::Create(highlight())),
+                Operation::Annotate(AnnotationEdit::Create(annotation)),
                 Operation::Scale {
                     width: 400,
                     height: 100,
@@ -1197,8 +1205,7 @@ mod tests {
         let Shape::Highlight { style, .. } = folded[0].shape else {
             unreachable!()
         };
-        // Rendering derives the effective width from the resulting image size.
-        assert_eq!(style.width, 1.0);
+        assert_eq!(style.width, 6.0);
     }
 
     #[test]

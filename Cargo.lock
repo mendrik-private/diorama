@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "diorama"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "asset-scaler",
  "base64",
