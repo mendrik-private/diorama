@@ -148,6 +148,25 @@ impl Settings {
         );
     }
 
+    /// The clipboard resize tools deliberately offer only the high-quality
+    /// filters. Pixel-art and Game Asset scaling are document-wide workflows.
+    pub fn pasted_image_resampling(&self) -> Resampling {
+        match self.string("pasted-image-resampling").as_deref() {
+            Some("lanczos") => Resampling::Lanczos,
+            _ => Resampling::Bicubic,
+        }
+    }
+
+    pub fn set_pasted_image_resampling(&self, resampling: Resampling) {
+        self.set_string(
+            "pasted-image-resampling",
+            match resampling {
+                Resampling::Lanczos => "lanczos",
+                Resampling::Bicubic | Resampling::Nearest | Resampling::GameAsset(_) => "bicubic",
+            },
+        );
+    }
+
     pub fn game_asset_aa(&self) -> GameAssetAa {
         GameAssetAa::new(self.integer("game-asset-aa").unwrap_or(50).clamp(0, 100) as u8)
     }
@@ -412,7 +431,7 @@ fn has_key(settings: &gio::Settings, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ColorFormat, Settings, ZoomMode};
-    use crate::document::{GameAssetAa, GameAssetOptions};
+    use crate::document::{GameAssetAa, GameAssetOptions, Resampling};
 
     #[test]
     fn color_format_defaults_to_hex() {
@@ -430,6 +449,9 @@ mod tests {
         assert_eq!(settings.mesh_grid_offset_x(), 0);
         assert_eq!(settings.mesh_grid_offset_y(), 0);
         assert_eq!(settings.game_asset_options(), GameAssetOptions::default());
+        assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
+        settings.set_pasted_image_resampling(Resampling::Lanczos);
+        assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
         settings.set_game_asset_options(GameAssetOptions::new(GameAssetAa::new(100), 0));
         assert_eq!(settings.game_asset_contour_opacity(), 100);
         settings.set_pencil_size(128);
@@ -457,5 +479,8 @@ mod tests {
         assert_eq!(settings.mesh_grid_size(), 1);
         settings.set_mesh_grid_size(u32::MAX);
         assert_eq!(settings.mesh_grid_size(), 1_000_000);
+        assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
+        settings.set_pasted_image_resampling(Resampling::Lanczos);
+        assert_eq!(settings.pasted_image_resampling(), Resampling::Lanczos);
     }
 }

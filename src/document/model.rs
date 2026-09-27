@@ -273,6 +273,7 @@ fn apply_operation(
     let dynamic = DynamicImage::ImageRgba8(pixels);
     let rendered = match operation {
         Operation::SelectionEdit { pixels, .. } => return Ok(pixels.as_ref().clone()),
+        Operation::ExtractSelection { background, .. } => return Ok(background.as_ref().clone()),
         Operation::ResizeCanvas {
             width,
             height,
@@ -613,6 +614,104 @@ mod tests {
                 .pixels,
             edited
         );
+    }
+
+    #[test]
+    fn extracted_image_uses_shared_transforms_and_atomic_undo_without_compositing_trails() {
+        use crate::document::Resampling;
+        use crate::tools::annotation::{
+            edit::{handle_drag, moved},
+            hit::{HandleKind, handles},
+        };
+        let cancel = CancellationToken::default();
+        let mut document = annotation_document();
+        let prior = highlight(90, 8.0);
+        document.apply(Operation::Annotate(AnnotationEdit::Create(prior.clone())));
+        let before = document.render(&cancel).unwrap().pixels;
+        let background = Arc::new(RgbaImage::from_pixel(64, 64, Rgba([20, 40, 60, 128])));
+        let pixels = Arc::new(RgbaImage::from_fn(3, 2, |x, _| {
+            Rgba([220, 10, 30, [255, 0, 128][x as usize]])
+        }));
+        let annotation = Annotation {
+            id: document.allocate_annotation_id(),
+            shape: Shape::Image {
+                pixels: pixels.clone(),
+                corners: [
+                    Point { x: 5.0, y: 6.0 },
+                    Point { x: 8.0, y: 6.0 },
+                    Point { x: 8.0, y: 8.0 },
+                    Point { x: 5.0, y: 8.0 },
+                ],
+                resampling: Resampling::Nearest,
+            },
+        };
+        document.apply(Operation::ExtractSelection {
+            background: background.clone(),
+            flattened_annotations: vec![prior.id],
+            annotation: annotation.clone(),
+        });
+        assert_eq!(document.annotations(), vec![annotation.clone()]);
+        assert_eq!(handles(&annotation).len(), 8);
+        assert_eq!(
+            document
+                .render_excluding(annotation.id, &cancel)
+                .unwrap()
+                .pixels,
+            *background
+        );
+        let extracted = document.render(&cancel).unwrap().pixels;
+        assert_eq!(extracted.get_pixel(5, 6).0, [220, 10, 30, 255]);
+        assert_eq!(extracted.get_pixel(6, 6), background.get_pixel(6, 6));
+        assert!(extracted.get_pixel(7, 6)[3] > 128 && extracted.get_pixel(7, 6)[3] < 255);
+        assert!(document.undo());
+        assert_eq!(document.annotations(), vec![prior]);
+        assert_eq!(document.render(&cancel).unwrap().pixels, before);
+        assert!(document.redo());
+        assert_eq!(document.render(&cancel).unwrap().pixels, extracted);
+
+        for delta in [
+            Point { x: -100.0, y: 0.0 },
+            Point { x: 0.0, y: -100.0 },
+            Point { x: 100.0, y: 0.0 },
+            Point { x: 0.0, y: 100.0 },
+        ] {
+            document.apply(Operation::Annotate(AnnotationEdit::Set(moved(
+                &annotation,
+                delta,
+                false,
+            ))));
+            assert_eq!(document.render(&cancel).unwrap().pixels, *background);
+        }
+        document.apply(Operation::Annotate(AnnotationEdit::Set(annotation.clone())));
+        assert_eq!(document.render(&cancel).unwrap().pixels, extracted);
+        let resized = handle_drag(
+            &annotation,
+            HandleKind::SouthEast,
+            Point { x: 11.0, y: 10.0 },
+            false,
+        );
+        let Shape::Image {
+            pixels: retained,
+            corners,
+            ..
+        } = &resized.shape
+        else {
+            panic!("image shape");
+        };
+        assert!(Arc::ptr_eq(retained, &pixels));
+        assert_eq!(corners[2], Point { x: 11.0, y: 10.0 });
+        document.apply(Operation::Annotate(AnnotationEdit::Set(resized.clone())));
+        let mut expected = background.as_ref().clone();
+        crate::tools::annotation::composite_annotations(&mut expected, &[resized], &cancel)
+            .unwrap();
+        assert_eq!(document.render(&cancel).unwrap().pixels, expected);
+        assert_ne!(expected, extracted);
+        document.apply(Operation::Annotate(AnnotationEdit::Delete(annotation.id)));
+        assert_eq!(document.render(&cancel).unwrap().pixels, *background);
+        assert!(document.undo());
+        assert_eq!(document.render(&cancel).unwrap().pixels, expected);
+        assert!(document.undo());
+        assert_eq!(document.render(&cancel).unwrap().pixels, extracted);
     }
 
     #[test]

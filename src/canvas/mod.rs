@@ -1360,6 +1360,9 @@ mod imp {
         };
         let mut outline = Vec::new();
         match &selection.annotation.shape {
+            Shape::Image { corners, .. } => {
+                outline.extend(corners.iter().copied().chain(std::iter::once(corners[0])));
+            }
             Shape::Pencil {
                 geometry: PencilGeometry::Freehand(_),
                 ..
@@ -2280,6 +2283,20 @@ impl ImageCanvas {
         })
     }
 
+    /// Maps a widget coordinate into image coordinates without requiring that
+    /// coordinate to fall inside the base canvas. This is used by persistent
+    /// objects which may be moved partly outside the image bounds.
+    pub fn unclamped_image_point_at(&self, x: f64, y: f64) -> Option<Point> {
+        let texture = self.imp().texture.borrow();
+        let texture = texture.as_ref()?;
+        image_point_for_bounds(
+            x,
+            y,
+            self.image_bounds_for_texture(texture),
+            (texture.width() as u32, texture.height() as u32),
+        )
+    }
+
     pub fn widget_point_for_image(&self, point: Point) -> Option<gtk::graphene::Point> {
         let texture = self.texture()?;
         let bounds = self.image_bounds_for_texture(&texture);
@@ -2400,6 +2417,34 @@ impl ImageCanvas {
     pub fn set_accessible_label(&self, label: &str) {
         self.update_property(&[gtk::accessible::Property::Label(label)]);
     }
+}
+
+fn image_point_for_bounds(
+    x: f64,
+    y: f64,
+    bounds: gtk::graphene::Rect,
+    dimensions: (u32, u32),
+) -> Option<Point> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !bounds.x().is_finite()
+        || !bounds.y().is_finite()
+        || !bounds.width().is_finite()
+        || !bounds.height().is_finite()
+        || bounds.width() <= 0.0
+        || bounds.height() <= 0.0
+    {
+        return None;
+    }
+    let x = x as f32;
+    let y = y as f32;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(Point {
+        x: (x - bounds.x()) * dimensions.0.max(1) as f32 / bounds.width(),
+        y: (y - bounds.y()) * dimensions.1.max(1) as f32 / bounds.height(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3538,5 +3583,18 @@ mod tests {
             (1, 1)
         );
         assert_eq!(pixel_boundary_from_normalized((1.0, 1.0), (4, 4)), (4, 4));
+    }
+
+    #[test]
+    fn unclamped_image_coordinates_round_trip_outside_the_canvas() {
+        let bounds = gtk::graphene::Rect::new(50.0, 10.0, 200.0, 100.0);
+        let dimensions = (100, 50);
+        let original = Point { x: -20.25, y: 75.5 };
+        let widget_x = bounds.x() + original.x * bounds.width() / dimensions.0 as f32;
+        let widget_y = bounds.y() + original.y * bounds.height() / dimensions.1 as f32;
+        let restored = image_point_for_bounds(widget_x.into(), widget_y.into(), bounds, dimensions)
+            .expect("finite positive bounds map coordinates");
+        assert!((restored.x - original.x).abs() <= f32::EPSILON);
+        assert!((restored.y - original.y).abs() <= f32::EPSILON);
     }
 }

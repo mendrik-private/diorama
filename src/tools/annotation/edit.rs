@@ -18,6 +18,12 @@ pub fn moved(annotation: &Annotation, delta: Point, snap: bool) -> Annotation {
     };
     let mut changed = annotation.clone();
     match &mut changed.shape {
+        Shape::Image { corners, .. } => {
+            for point in corners {
+                point.x += delta.x;
+                point.y += delta.y;
+            }
+        }
         Shape::Pencil { geometry, .. } => match geometry {
             PencilGeometry::Freehand(points) => {
                 for point in points {
@@ -25,7 +31,7 @@ pub fn moved(annotation: &Annotation, delta: Point, snap: bool) -> Annotation {
                     point.y += delta.y;
                 }
             }
-            PencilGeometry::RotatedRectangle(points) => {
+            PencilGeometry::RotatedRectangle(points) | PencilGeometry::RotatedEllipse(points) => {
                 for point in points {
                     point.x += delta.x;
                     point.y += delta.y;
@@ -88,48 +94,12 @@ pub fn handle_drag(
 ) -> Annotation {
     let mut changed = annotation.clone();
     match &mut changed.shape {
+        Shape::Image { corners, .. } => {
+            resize_affine_frame(corners, kind, pointer, preserve_aspect);
+        }
         Shape::Pencil { geometry, .. } => match geometry {
-            PencilGeometry::RotatedRectangle(points) => {
-                // Resize in the rectangle's own basis, including after image scaling/flipping.
-                let origin = points[0];
-                let u = Point {
-                    x: points[1].x - origin.x,
-                    y: points[1].y - origin.y,
-                };
-                let v = Point {
-                    x: points[3].x - origin.x,
-                    y: points[3].y - origin.y,
-                };
-                let width = u.x.hypot(u.y);
-                let height = v.x.hypot(v.y);
-                let determinant = u.x * v.y - u.y * v.x;
-                if determinant.abs() > f32::EPSILON {
-                    let dx = pointer.x - origin.x;
-                    let dy = pointer.y - origin.y;
-                    let local = Point {
-                        x: (dx * v.y - dy * v.x) / determinant * width,
-                        y: (u.x * dy - u.y * dx) / determinant * height,
-                    };
-                    let resized = resized_rect(
-                        Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            width,
-                            height,
-                        },
-                        kind,
-                        local,
-                        preserve_aspect,
-                    );
-                    for (point, local) in points.iter_mut().zip(super::pencil::outline_points(
-                        &PencilGeometry::Rectangle(resized),
-                    )) {
-                        *point = Point {
-                            x: origin.x + u.x * local.x / width + v.x * local.y / height,
-                            y: origin.y + u.y * local.x / width + v.y * local.y / height,
-                        };
-                    }
-                }
+            PencilGeometry::RotatedRectangle(points) | PencilGeometry::RotatedEllipse(points) => {
+                resize_affine_frame(points, kind, pointer, preserve_aspect);
             }
             PencilGeometry::Line(points) => {
                 let previous = match kind {
@@ -276,6 +246,12 @@ fn resize_freehand(points: &mut [crate::document::BrushPoint], original: Rect, r
 #[must_use]
 pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotation {
     let mut changed = annotation.clone();
+    if let Shape::Image { corners, .. } = &mut changed.shape {
+        let center = corners[0].midpoint(corners[2]);
+        let delta = rotation_delta(delta_angle, snap);
+        *corners = corners.map(|point| rotate_point(point, center, delta));
+        return changed;
+    }
     if let Shape::Pencil { geometry, .. } = &mut changed.shape {
         if matches!(
             geometry,
@@ -287,6 +263,24 @@ pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotat
             *geometry = PencilGeometry::RotatedRectangle(std::array::from_fn(|i| {
                 rotate_point(outline[i], center, delta)
             }));
+        }
+        if matches!(
+            geometry,
+            PencilGeometry::Ellipse(_) | PencilGeometry::RotatedEllipse(_)
+        ) {
+            let points = match geometry {
+                PencilGeometry::Ellipse(rect) => {
+                    let outline = super::pencil::outline_points(&PencilGeometry::Rectangle(*rect));
+                    std::array::from_fn(|i| outline[i])
+                }
+                PencilGeometry::RotatedEllipse(points) => *points,
+                _ => unreachable!(),
+            };
+            let center = points[0].midpoint(points[2]);
+            let delta = rotation_delta(delta_angle, snap);
+            *geometry = PencilGeometry::RotatedEllipse(
+                points.map(|point| rotate_point(point, center, delta)),
+            );
         }
         return changed;
     }
@@ -327,6 +321,57 @@ pub fn rotated(annotation: &Annotation, delta_angle: f32, snap: bool) -> Annotat
     *anchor = rotate_point(*anchor, midpoint, delta);
     *angle += delta;
     changed
+}
+
+fn resize_affine_frame(
+    points: &mut [Point; 4],
+    kind: HandleKind,
+    pointer: Point,
+    preserve_aspect: bool,
+) {
+    // Resize in the object's own basis, including after document scaling and
+    // flipping. A non-singular parallelogram can always map its pointer into
+    // that local rectangle and map the resized frame back without touching the
+    // immutable image source.
+    let origin = points[0];
+    let u = Point {
+        x: points[1].x - origin.x,
+        y: points[1].y - origin.y,
+    };
+    let v = Point {
+        x: points[3].x - origin.x,
+        y: points[3].y - origin.y,
+    };
+    let width = u.x.hypot(u.y);
+    let height = v.x.hypot(v.y);
+    let determinant = u.x * v.y - u.y * v.x;
+    if width <= f32::EPSILON || height <= f32::EPSILON || determinant.abs() <= f32::EPSILON {
+        return;
+    }
+    let dx = pointer.x - origin.x;
+    let dy = pointer.y - origin.y;
+    let local = Point {
+        x: (dx * v.y - dy * v.x) / determinant * width,
+        y: (u.x * dy - u.y * dx) / determinant * height,
+    };
+    let resized = resized_rect(
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+        kind,
+        local,
+        preserve_aspect,
+    );
+    let local_corners = super::pencil::outline_points(&PencilGeometry::Rectangle(resized));
+    for (point, local) in points.iter_mut().zip(local_corners) {
+        *point = Point {
+            x: origin.x + u.x * local.x / width + v.x * local.y / height,
+            y: origin.y + u.y * local.x / width + v.y * local.y / height,
+        };
+    }
 }
 
 fn rotation_delta(delta: f32, snap: bool) -> f32 {
@@ -529,6 +574,159 @@ mod tests {
         let stroke = stroke_for(geometry, *style, *anti_aliasing);
         assert_eq!(stroke.points.len(), 5);
         for (point, expected) in stroke.points.iter().zip(outline) {
+            close(
+                Point {
+                    x: point.x,
+                    y: point.y,
+                },
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn circle_rotation_keeps_circle_rendering_and_rotates_handles() {
+        use super::super::{hit::handles, pencil::stroke_for};
+        let original = Annotation {
+            id: AnnotationId(12),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Ellipse(Rect {
+                    x: 40.0,
+                    y: 40.0,
+                    width: 80.0,
+                    height: 80.0,
+                }),
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        let turned = rotated(&original, 0.7, false);
+        assert!(handles(&original)[0].1.distance(handles(&turned)[0].1) > 10.0);
+        let Shape::Pencil {
+            geometry,
+            style,
+            anti_aliasing,
+        } = &turned.shape
+        else {
+            unreachable!()
+        };
+        let stroke = stroke_for(geometry, *style, *anti_aliasing);
+        assert_eq!(stroke.path, crate::document::StrokePath::Circle);
+        assert!((stroke.points[0].x - 80.0).abs() < 0.001);
+        assert!((stroke.points[0].y - 80.0).abs() < 0.001);
+        assert!((stroke.points[1].x - 120.0).abs() < 0.001);
+        let resized = handle_drag(
+            &turned,
+            HandleKind::SouthEast,
+            Point { x: 140.0, y: 180.0 },
+            false,
+        );
+        assert!(
+            handles(&resized)[4]
+                .1
+                .distance(Point { x: 140.0, y: 180.0 })
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn ellipse_rotation_keeps_editing_and_closed_stroke_geometry() {
+        use super::super::hit::{HitKind, handles, hit_test};
+        use super::super::pencil::{outline_points, stroke_for};
+
+        let original = Annotation {
+            id: AnnotationId(9),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Ellipse(Rect {
+                    x: 40.0,
+                    y: 40.0,
+                    width: 120.0,
+                    height: 80.0,
+                }),
+                style: StrokeStyle {
+                    color: [255, 0, 0, 255],
+                    width: 3.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        let close = |a: Point, b: Point| assert!(a.distance(b) < 0.001, "{a:?} != {b:?}");
+        for annotation in [
+            original.clone(),
+            rotated(&original, 37.0_f32.to_radians(), false),
+        ] {
+            let corner = handles(&annotation)[0].1;
+            assert_eq!(
+                hit_test(
+                    std::slice::from_ref(&annotation),
+                    Some(annotation.id),
+                    corner,
+                    8.0
+                )
+                .unwrap()
+                .kind,
+                HitKind::Handle(HandleKind::NorthWest)
+            );
+            let nearby = Point {
+                x: corner.x - 12.0,
+                y: corner.y,
+            };
+            assert_eq!(
+                hit_test(
+                    std::slice::from_ref(&annotation),
+                    Some(annotation.id),
+                    nearby,
+                    8.0
+                )
+                .unwrap()
+                .kind,
+                HitKind::Rotate
+            );
+            assert!(
+                !matches!(hit_test(std::slice::from_ref(&annotation), None, nearby, 8.0), Some(hit) if hit.kind == HitKind::Rotate)
+            );
+        }
+        let turned = rotated(&original, std::f32::consts::FRAC_PI_2, false);
+        let positions = handles(&turned);
+        close(positions[0].1, Point { x: 140.0, y: 20.0 });
+        close(positions[4].1, Point { x: 60.0, y: 140.0 });
+        let resized = handle_drag(
+            &turned,
+            HandleKind::SouthEast,
+            Point { x: 40.0, y: 180.0 },
+            false,
+        );
+        close(handles(&resized)[0].1, positions[0].1);
+        close(handles(&resized)[4].1, Point { x: 40.0, y: 180.0 });
+        let restored = rotated(&turned, -std::f32::consts::FRAC_PI_2, false);
+        for (actual, expected) in handles(&restored).iter().zip(handles(&original)) {
+            close(actual.1, expected.1);
+        }
+        let snapped = rotated(&original, 38.0_f32.to_radians(), true);
+        let expected = rotated(&original, 45.0_f32.to_radians(), false);
+        for (actual, expected) in handles(&snapped).iter().zip(handles(&expected)) {
+            close(actual.1, expected.1);
+        }
+        let translated = moved(&turned, Point { x: 10.0, y: -5.0 }, false);
+        close(handles(&translated)[0].1, Point { x: 150.0, y: 15.0 });
+        let Shape::Pencil {
+            geometry,
+            style,
+            anti_aliasing,
+        } = &turned.shape
+        else {
+            unreachable!()
+        };
+        let outline = outline_points(geometry);
+        assert_eq!(outline.len(), 65);
+        assert_eq!(outline.first(), outline.last());
+        let stroke = stroke_for(geometry, *style, *anti_aliasing);
+        assert!(stroke.points.len() > 65);
+        assert_eq!(stroke.points.first(), stroke.points.last());
+        for (point, expected) in stroke.points.iter().take(1).zip(outline) {
             close(
                 Point {
                     x: point.x,
@@ -966,5 +1164,47 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn image_edits_change_only_its_affine_frame() {
+        let pixels = std::sync::Arc::new(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([80, 40, 20, 255]),
+        ));
+        let original = Annotation {
+            id: AnnotationId(42),
+            shape: Shape::Image {
+                pixels: pixels.clone(),
+                corners: [
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 40.0, y: 20.0 },
+                    Point { x: 40.0, y: 40.0 },
+                    Point { x: 10.0, y: 40.0 },
+                ],
+                resampling: crate::document::Resampling::Lanczos,
+            },
+        };
+        let resized = handle_drag(
+            &original,
+            HandleKind::SouthEast,
+            Point { x: 70.0, y: 60.0 },
+            false,
+        );
+        let turned = rotated(&resized, std::f32::consts::FRAC_PI_2, false);
+        let moved = moved(&turned, Point { x: 5.0, y: -10.0 }, false);
+        let Shape::Image {
+            pixels: retained,
+            corners,
+            resampling,
+        } = moved.shape
+        else {
+            panic!("expected image annotation");
+        };
+        assert!(std::sync::Arc::ptr_eq(&pixels, &retained));
+        assert_eq!(resampling, crate::document::Resampling::Lanczos);
+        assert!(corners[0].distance(Point { x: 65.0, y: 0.0 }) < 0.001);
+        assert!(corners[2].distance(Point { x: 25.0, y: 60.0 }) < 0.001);
     }
 }

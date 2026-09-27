@@ -20,6 +20,9 @@ pub fn outline_points(geometry: &PencilGeometry) -> Vec<Point> {
             points.iter().copied().chain([points[0]]).collect()
         }
         PencilGeometry::Ellipse(rect) => ellipse_points(*rect, SELECTION_ELLIPSE_SEGMENTS),
+        PencilGeometry::RotatedEllipse(points) => {
+            framed_ellipse_points(points, SELECTION_ELLIPSE_SEGMENTS)
+        }
     }
 }
 
@@ -32,6 +35,25 @@ pub fn geometry_bounds(geometry: &PencilGeometry) -> Rect {
         })),
         PencilGeometry::Line(points) => point_bounds(points.iter().copied()),
         PencilGeometry::RotatedRectangle(points) => point_bounds(points.iter().copied()),
+        PencilGeometry::RotatedEllipse(points) => {
+            let center = points[0].midpoint(points[2]);
+            let u = Point {
+                x: (points[1].x - points[0].x) / 2.0,
+                y: (points[1].y - points[0].y) / 2.0,
+            };
+            let v = Point {
+                x: (points[3].x - points[0].x) / 2.0,
+                y: (points[3].y - points[0].y) / 2.0,
+            };
+            let rx = u.x.hypot(v.x);
+            let ry = u.y.hypot(v.y);
+            Rect {
+                x: center.x - rx,
+                y: center.y - ry,
+                width: rx * 2.0,
+                height: ry * 2.0,
+            }
+        }
         PencilGeometry::Rectangle(rect) | PencilGeometry::Ellipse(rect) => *rect,
     }
 }
@@ -65,6 +87,47 @@ pub fn stroke_for(geometry: &PencilGeometry, style: StrokeStyle, anti_aliasing: 
                 StrokePath::Circle,
             )
         }
+        PencilGeometry::RotatedEllipse(points) => {
+            let u = Point {
+                x: points[1].x - points[0].x,
+                y: points[1].y - points[0].y,
+            };
+            let v = Point {
+                x: points[3].x - points[0].x,
+                y: points[3].y - points[0].y,
+            };
+            let width = u.x.hypot(u.y);
+            let height = v.x.hypot(v.y);
+            if (width - height).abs() <= width.max(height) * 1e-6
+                && (u.x * v.x + u.y * v.y).abs() <= width * height * 1e-6
+            {
+                let center = points[0].midpoint(points[2]);
+                return Stroke {
+                    points: vec![
+                        brush(center),
+                        brush(Point {
+                            x: center.x + width / 2.0,
+                            y: center.y,
+                        }),
+                    ],
+                    path: StrokePath::Circle,
+                    color: style.color,
+                    width: style.width,
+                    anti_aliasing,
+                    opacity: 1.0,
+                    hardness: 1.0,
+                };
+            }
+            let radius = (points[0].distance(points[1]) + points[0].distance(points[3])) / 2.0;
+            let segments = (TAU * radius).ceil().clamp(16.0, 4_096.0) as usize;
+            (
+                framed_ellipse_points(points, segments)
+                    .into_iter()
+                    .map(brush)
+                    .collect(),
+                StrokePath::Linear,
+            )
+        }
         PencilGeometry::Ellipse(rect) => {
             let radius = rect.width.max(rect.height) / 2.0;
             let segments = (TAU * radius).ceil().clamp(16.0, 4_096.0) as usize;
@@ -86,6 +149,27 @@ pub fn stroke_for(geometry: &PencilGeometry, style: StrokeStyle, anti_aliasing: 
         opacity: 1.0,
         hardness: 1.0,
     }
+}
+
+// Keep the local frame affine so nonuniform image scaling and flips preserve the oval.
+fn framed_ellipse_points(frame: &[Point; 4], segments: usize) -> Vec<Point> {
+    let center = frame[0].midpoint(frame[2]);
+    let mut points: Vec<_> = (0..segments)
+        .map(|step| {
+            let angle = TAU * step as f32 / segments as f32;
+            let (sin, cos) = angle.sin_cos();
+            Point {
+                x: center.x
+                    + (frame[1].x - frame[0].x) * cos / 2.0
+                    + (frame[3].x - frame[0].x) * sin / 2.0,
+                y: center.y
+                    + (frame[1].y - frame[0].y) * cos / 2.0
+                    + (frame[3].y - frame[0].y) * sin / 2.0,
+            }
+        })
+        .collect();
+    points.push(points[0]);
+    points
 }
 
 fn point_bounds(points: impl IntoIterator<Item = Point>) -> Rect {

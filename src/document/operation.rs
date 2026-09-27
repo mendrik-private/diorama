@@ -1,4 +1,4 @@
-use super::{AnnotationEdit, AnnotationId};
+use super::{Annotation, AnnotationEdit, AnnotationId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
@@ -88,6 +88,13 @@ pub struct ProtectedColor(pub [u8; 4]);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
+    /// Remove a foreground from the raster and lift it into an editable image
+    /// in one undo entry. The repaired background includes flattened annotations.
+    ExtractSelection {
+        background: std::sync::Arc<image::RgbaImage>,
+        flattened_annotations: Vec<AnnotationId>,
+        annotation: Annotation,
+    },
     /// A flattened selection edit. `pixels` is a complete, post-edit canvas so
     /// the operation remains a single undo entry even when it cuts annotations.
     SelectionEdit {

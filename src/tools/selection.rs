@@ -412,62 +412,6 @@ pub fn clear_masked(
     Ok(())
 }
 
-/// Composites a full prepared cutout at a signed origin, clipping only the
-/// pixels outside the fixed-size canvas. The source and matte are never
-/// cropped, so a foreground moved fully off-canvas can return unchanged.
-pub fn paste_cutout_at(
-    image: &mut RgbaImage,
-    x: i64,
-    y: i64,
-    source_pixels: &RgbaImage,
-    mask: &GrayImage,
-) -> Result<()> {
-    if mask.dimensions() != source_pixels.dimensions() {
-        return Err(AppError::InvalidDimensions);
-    }
-    for (mask_x, mask_y, alpha) in mask.enumerate_pixels() {
-        if alpha[0] == 0 {
-            continue;
-        }
-        let Some(target_x) = x.checked_add(i64::from(mask_x)) else {
-            continue;
-        };
-        let Some(target_y) = y.checked_add(i64::from(mask_y)) else {
-            continue;
-        };
-        if target_x < 0
-            || target_y < 0
-            || target_x >= i64::from(image.width())
-            || target_y >= i64::from(image.height())
-        {
-            continue;
-        }
-        let foreground = source_pixels.get_pixel(mask_x, mask_y).0;
-        if foreground[3] == 0 {
-            continue;
-        }
-        // Source-over keeps destination pixels visible through soft mask edges.
-        let background = image.get_pixel(target_x as u32, target_y as u32).0;
-        let a = u16::from(foreground[3]);
-        let inverse = 255 - a;
-        let out_a = a + u16::from(background[3]) * inverse / 255;
-        let mut out = [0; 4];
-        for channel in 0..3 {
-            let premultiplied = u32::from(foreground[channel]) * u32::from(a)
-                + u32::from(background[channel]) * u32::from(background[3]) * u32::from(inverse)
-                    / 255;
-            out[channel] = if out_a == 0 {
-                0
-            } else {
-                (premultiplied / u32::from(out_a)).min(255) as u8
-            };
-        }
-        out[3] = out_a as u8;
-        image.put_pixel(target_x as u32, target_y as u32, Rgba(out));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -530,116 +474,25 @@ mod tests {
     }
 
     #[test]
-    fn pasting_on_a_clean_base_keeps_holes_and_handles_overlap() {
+    fn clearing_a_mask_keeps_holes_and_soft_edges_do_not_leave_source_pixels() {
         let mut image = RgbaImage::from_pixel(5, 1, Rgba([1, 2, 3, 255]));
-        image.put_pixel(0, 0, Rgba([200, 0, 0, 255]));
-        image.put_pixel(2, 0, Rgba([0, 200, 0, 255]));
-        let bounds = CropBounds {
-            x: 0,
-            y: 0,
-            width: 3,
-            height: 1,
-        };
-        let mask = GrayImage::from_fn(3, 1, |x, _| Luma([[255, 0, 255][x as usize]]));
-        let cutout = super::crop(&image, bounds).unwrap();
-        super::clear_masked(&mut image, bounds, &mask, [9, 9, 9, 255]).unwrap();
-        super::paste_cutout_at(&mut image, 1, 0, &cutout, &mask).unwrap();
-        assert_eq!(image.get_pixel(0, 0).0, [9, 9, 9, 255]);
-        assert_eq!(image.get_pixel(1, 0).0, [200, 0, 0, 255]);
-        assert_eq!(
-            image.get_pixel(2, 0).0,
+        let mask = GrayImage::from_raw(3, 1, vec![255, 0, 128]).unwrap();
+        super::clear_masked(
+            &mut image,
+            CropBounds {
+                x: 1,
+                y: 0,
+                width: 3,
+                height: 1,
+            },
+            &mask,
             [9, 9, 9, 255],
-            "destination hole keeps the cleared canvas"
-        );
-        assert_eq!(image.get_pixel(3, 0).0, [0, 200, 0, 255]);
-    }
-
-    #[test]
-    fn signed_paste_composites_soft_cutout_alpha_source_over_destination() {
-        let mut image = RgbaImage::from_pixel(2, 1, Rgba([0, 0, 200, 128]));
-        image.put_pixel(0, 0, Rgba([200, 0, 0, 128]));
-        let source = CropBounds {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        };
-        let cutout = super::crop(&image, source).unwrap();
-        let mask = GrayImage::from_pixel(1, 1, Luma([128]));
-
-        super::paste_cutout_at(&mut image, 1, 0, &cutout, &mask).unwrap();
-
-        assert_eq!(image.get_pixel(0, 0).0, [200, 0, 0, 128]);
-        assert_eq!(image.get_pixel(1, 0).0, [134, 0, 66, 191]);
-    }
-
-    #[test]
-    fn signed_paste_accepts_a_transparent_clean_base() {
-        let mut image = RgbaImage::from_pixel(2, 1, Rgba([20, 30, 40, 255]));
-        image.put_pixel(0, 0, Rgba([200, 0, 0, 255]));
-        let source = CropBounds {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        };
-        let cutout = super::crop(&image, source).unwrap();
-        let mask = GrayImage::from_pixel(1, 1, Luma([255]));
-
-        super::clear_masked(&mut image, source, &mask, [0; 4]).unwrap();
-        super::paste_cutout_at(&mut image, 1, 0, &cutout, &mask).unwrap();
-
-        assert_eq!(image.get_pixel(0, 0).0, [0; 4]);
-        assert_eq!(image.get_pixel(1, 0).0, [200, 0, 0, 255]);
-    }
-
-    #[test]
-    fn signed_paste_rejects_only_a_mismatched_matte() {
-        let original = RgbaImage::from_fn(3, 1, |x, _| Rgba([x as u8, 2, 3, 255]));
-        let source = CropBounds {
-            x: 0,
-            y: 0,
-            width: 2,
-            height: 1,
-        };
-        let cutout = super::crop(&original, source).unwrap();
-        let mut image = original.clone();
-        assert!(matches!(
-            super::paste_cutout_at(&mut image, -20, 0, &cutout, &GrayImage::new(1, 1)),
-            Err(crate::error::AppError::InvalidDimensions)
-        ));
-        assert_eq!(image, original);
-    }
-
-    #[test]
-    fn pasting_a_cutout_clips_at_every_canvas_edge_without_losing_the_source() {
-        let cutout = RgbaImage::from_fn(3, 3, |x, y| Rgba([20 + x as u8, 40 + y as u8, 60, 255]));
-        let mask = GrayImage::from_fn(3, 3, |x, y| Luma([if (x, y) == (1, 1) { 0 } else { 255 }]));
-        let cases = [(-2, 0), (0, -2), (3, 0), (0, 3), (-4, -4)];
-
-        for (x, y) in cases {
-            let mut image = RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255]));
-            super::paste_cutout_at(&mut image, x, y, &cutout, &mask).unwrap();
-            for canvas_y in 0..image.height() {
-                for canvas_x in 0..image.width() {
-                    let cutout_x = i64::from(canvas_x) - x;
-                    let cutout_y = i64::from(canvas_y) - y;
-                    let expected = if (0..3).contains(&cutout_x)
-                        && (0..3).contains(&cutout_y)
-                        && mask.get_pixel(cutout_x as u32, cutout_y as u32)[0] != 0
-                    {
-                        *cutout.get_pixel(cutout_x as u32, cutout_y as u32)
-                    } else {
-                        Rgba([1, 2, 3, 255])
-                    };
-                    assert_eq!(
-                        *image.get_pixel(canvas_x, canvas_y),
-                        expected,
-                        "origin {x},{y}"
-                    );
-                }
-            }
-        }
+        )
+        .unwrap();
+        assert_eq!(image.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        assert_eq!(image.get_pixel(1, 0).0, [9, 9, 9, 255]);
+        assert_eq!(image.get_pixel(2, 0).0, [1, 2, 3, 255]);
+        assert_eq!(image.get_pixel(3, 0).0, [9, 9, 9, 255]);
     }
 
     #[test]

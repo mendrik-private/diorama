@@ -1,8 +1,9 @@
 use image::{Rgba, RgbaImage};
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::document::{
-    Annotation, AnnotationId, Axis, CancellationToken, MEASUREMENT_STROKE_WIDTH, Point, Rect, Shape,
+    Annotation, AnnotationId, Axis, CancellationToken, MEASUREMENT_STROKE_WIDTH, Point, Rect,
+    Resampling, Shape,
 };
 use crate::error::{AppError, Result};
 use crate::tools::pencil::{blend, paint_stroke};
@@ -178,6 +179,11 @@ fn draw_annotation(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     match &annotation.shape {
+        Shape::Image {
+            pixels,
+            corners,
+            resampling,
+        } => draw_image(pixmap, pixels, *corners, *resampling, bounds, cancellation)?,
         Shape::Pencil {
             geometry,
             style,
@@ -310,6 +316,250 @@ fn draw_annotation(
         ),
     }
     Ok(())
+}
+
+fn draw_image(
+    pixmap: &mut Pixmap,
+    pixels: &RgbaImage,
+    corners: [Point; 4],
+    resampling: Resampling,
+    bounds: Rect,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if pixels.width() == 0 || pixels.height() == 0 {
+        return Ok(());
+    }
+    let u = Point {
+        x: corners[1].x - corners[0].x,
+        y: corners[1].y - corners[0].y,
+    };
+    let v = Point {
+        x: corners[3].x - corners[0].x,
+        y: corners[3].y - corners[0].y,
+    };
+    let determinant = u.x * v.y - u.y * v.x;
+    if determinant.abs() <= f32::EPSILON {
+        return Ok(());
+    }
+    let pixmap_width = pixmap.width() as usize;
+    let pixmap_height = pixmap.height() as usize;
+    let min_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let start_x = (min_x.floor() - bounds.x).max(0.0) as usize;
+    let end_x = (max_x.ceil() - bounds.x).min(pixmap_width as f32).max(0.0) as usize;
+    let start_y = (min_y.floor() - bounds.y).max(0.0) as usize;
+    let end_y = (max_y.ceil() - bounds.y).min(pixmap_height as f32).max(0.0) as usize;
+    // Do not prefilter an image whose frame is outside this bounded overlay.
+    if start_x >= end_x || start_y >= end_y {
+        return Ok(());
+    }
+    // Filtering occurs straight from the immutable source into the bounded
+    // overlay. No intermediate image is allocated for a giant or mostly
+    // off-canvas frame.
+    // First prefilter only the axes that are shrinking. This delegates the
+    // requested Bicubic/Lanczos filter to the established scaler and prevents
+    // an anisotropic reduction from turning the affine sampler into an
+    // unbounded two-dimensional kernel. The temporary is never larger than
+    // the immutable source, even when most of the frame is off canvas.
+    let target_dimensions = (
+        pixels.width().min(u.x.hypot(u.y).ceil().max(1.0) as u32),
+        pixels.height().min(v.x.hypot(v.y).ceil().max(1.0) as u32),
+    );
+    let scaled = (target_dimensions != pixels.dimensions())
+        .then(|| {
+            crate::tools::scale::resize(
+                pixels,
+                target_dimensions.0,
+                target_dimensions.1,
+                resampling,
+                cancellation,
+            )
+        })
+        .transpose()?;
+    let source = scaled.as_ref().unwrap_or(pixels);
+    let mask_width = end_x - start_x;
+    let mask_height = end_y - start_y;
+    let mut mask =
+        Mask::new(mask_width as u32, mask_height as u32).ok_or(AppError::InvalidDimensions)?;
+    let mask_origin = Point {
+        x: bounds.x + start_x as f32,
+        y: bounds.y + start_y as f32,
+    };
+    let mut builder = PathBuilder::new();
+    builder.move_to(corners[0].x - mask_origin.x, corners[0].y - mask_origin.y);
+    for point in &corners[1..] {
+        builder.line_to(point.x - mask_origin.x, point.y - mask_origin.y);
+    }
+    builder.close();
+    let Some(path) = builder.finish() else {
+        return Ok(());
+    };
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    for y in start_y..end_y {
+        cancellation.check()?;
+        for x in start_x..end_x {
+            let index = y * pixmap_width + x;
+            let coverage = mask.data()[(y - start_y) * mask_width + x - start_x];
+            if coverage == 0 {
+                continue;
+            }
+            let destination = &mut pixmap.data_mut()[index * 4..index * 4 + 4];
+            let point = Point {
+                x: bounds.x + x as f32 + 0.5,
+                y: bounds.y + y as f32 + 0.5,
+            };
+            let dx = point.x - corners[0].x;
+            let dy = point.y - corners[0].y;
+            let local_x = (dx * v.y - dy * v.x) / determinant;
+            let local_y = (u.x * dy - u.y * dx) / determinant;
+            // The antialiased mask can cover a pixel whose center is just
+            // outside the frame. Clamp that sample to the source edge so the
+            // coverage fades the real edge color instead of a transparent rim.
+            if coverage == 255 && (!(0.0..1.0).contains(&local_x) || !(0.0..1.0).contains(&local_y))
+            {
+                continue;
+            }
+            let sample = sample_image(
+                source,
+                local_x.clamp(0.0, 1.0) * source.width() as f32 - 0.5,
+                local_y.clamp(0.0, 1.0) * source.height() as f32 - 0.5,
+                resampling,
+            );
+            composite_premultiplied(destination, apply_coverage(sample, coverage));
+        }
+    }
+    Ok(())
+}
+
+fn apply_coverage(mut source: [u8; 4], coverage: u8) -> [u8; 4] {
+    for channel in &mut source {
+        *channel = ((u16::from(*channel) * u16::from(coverage) + 127) / 255) as u8;
+    }
+    source
+}
+
+fn composite_premultiplied(destination: &mut [u8], source: [u8; 4]) {
+    let inverse_alpha = u16::from(255 - source[3]);
+    for channel in 0..4 {
+        destination[channel] = (u16::from(source[channel])
+            + (u16::from(destination[channel]) * inverse_alpha + 127) / 255)
+            .min(255) as u8;
+    }
+}
+
+fn sample_image(
+    pixels: &RgbaImage,
+    source_x: f32,
+    source_y: f32,
+    resampling: Resampling,
+) -> [u8; 4] {
+    let near_integer = |value: f32| (value - value.round()).abs() < 0.000_01;
+    if near_integer(source_x)
+        && near_integer(source_y)
+        && source_x >= 0.0
+        && source_y >= 0.0
+        && source_x < pixels.width() as f32
+        && source_y < pixels.height() as f32
+    {
+        return premultiply(*pixels.get_pixel(source_x.round() as u32, source_y.round() as u32));
+    }
+    let radius = match resampling {
+        Resampling::Lanczos => 3,
+        Resampling::Nearest => 0,
+        Resampling::Bicubic | Resampling::GameAsset(_) => 2,
+    };
+    if radius == 0 {
+        return premultiply(*pixels.get_pixel(
+            source_x.round().clamp(0.0, pixels.width() as f32 - 1.0) as u32,
+            source_y.round().clamp(0.0, pixels.height() as f32 - 1.0) as u32,
+        ));
+    }
+    let mut total = [0.0; 4];
+    let mut weights = 0.0;
+    let start_x = (source_x - radius as f32).floor() as i32;
+    let start_y = (source_y - radius as f32).floor() as i32;
+    let end_x = (source_x + radius as f32).ceil() as i32;
+    let end_y = (source_y + radius as f32).ceil() as i32;
+    for y in start_y..=end_y {
+        let weight_y = filter_weight(source_y - y as f32, resampling);
+        if weight_y == 0.0 {
+            continue;
+        }
+        for x in start_x..=end_x {
+            let weight_x = filter_weight(source_x - x as f32, resampling);
+            let weight = weight_x * weight_y;
+            if weight == 0.0 {
+                continue;
+            }
+            let sample = premultiply(*pixels.get_pixel(
+                x.clamp(0, pixels.width() as i32 - 1) as u32,
+                y.clamp(0, pixels.height() as i32 - 1) as u32,
+            ));
+            for channel in 0..4 {
+                total[channel] += f32::from(sample[channel]) * weight;
+            }
+            weights += weight;
+        }
+    }
+    if weights.abs() <= f32::EPSILON {
+        return [0; 4];
+    }
+    let mut sample =
+        std::array::from_fn(|channel| (total[channel] / weights).round().clamp(0.0, 255.0) as u8);
+    for channel in 0..3 {
+        sample[channel] = sample[channel].min(sample[3]);
+    }
+    sample
+}
+
+fn filter_weight(distance: f32, resampling: Resampling) -> f32 {
+    let distance = distance.abs();
+    match resampling {
+        Resampling::Nearest => (distance < 0.5) as u8 as f32,
+        Resampling::Bicubic | Resampling::GameAsset(_) => {
+            if distance < 1.0 {
+                (1.5 * distance - 2.5) * distance * distance + 1.0
+            } else if distance < 2.0 {
+                ((-0.5 * distance + 2.5) * distance - 4.0) * distance + 2.0
+            } else {
+                0.0
+            }
+        }
+        Resampling::Lanczos if distance < 3.0 => {
+            let pi_distance = std::f32::consts::PI * distance;
+            if distance <= f32::EPSILON {
+                1.0
+            } else {
+                (pi_distance.sin() / pi_distance)
+                    * ((pi_distance / 3.0).sin() / (pi_distance / 3.0))
+            }
+        }
+        Resampling::Lanczos => 0.0,
+    }
+}
+
+fn premultiply(pixel: Rgba<u8>) -> [u8; 4] {
+    let alpha = u16::from(pixel[3]);
+    [
+        ((u16::from(pixel[0]) * alpha + 127) / 255) as u8,
+        ((u16::from(pixel[1]) * alpha + 127) / 255) as u8,
+        ((u16::from(pixel[2]) * alpha + 127) / 255) as u8,
+        pixel[3],
+    ]
 }
 
 fn draw_gap_markers(
@@ -769,6 +1019,12 @@ pub(crate) fn contained_in(annotation: &Annotation, dimensions: (u32, u32), rect
 
 fn annotation_bounds(annotation: &Annotation, dimensions: (u32, u32)) -> Option<Bounds> {
     match &annotation.shape {
+        Shape::Image { corners, .. } => {
+            let mut points = corners.iter().copied();
+            let mut bounds = Bounds::point(points.next()?);
+            points.for_each(|point| bounds.include(point));
+            Some(bounds)
+        }
         Shape::Pencil {
             geometry, style, ..
         } => {
@@ -1297,5 +1553,159 @@ mod tests {
         .expect("small measurement overlay");
         assert!(rendered.pixels().any(|pixel| pixel[3] == 255));
         assert!(rendered.pixels().all(|pixel| matches!(pixel[3], 0 | 255)));
+    }
+
+    #[test]
+    fn image_rotation_keeps_source_pixel_orientation_and_alpha() {
+        let annotation = Annotation {
+            id: AnnotationId(91),
+            shape: Shape::Image {
+                pixels: std::sync::Arc::new(RgbaImage::from_fn(2, 1, |x, _| {
+                    if x == 0 {
+                        Rgba([200, 30, 10, 128])
+                    } else {
+                        Rgba([10, 40, 220, 255])
+                    }
+                })),
+                // A clockwise quarter turn around the source frame's center.
+                corners: [
+                    Point { x: 1.0, y: 0.0 },
+                    Point { x: 1.0, y: 2.0 },
+                    Point { x: 0.0, y: 2.0 },
+                    Point { x: 0.0, y: 0.0 },
+                ],
+                resampling: Resampling::Lanczos,
+            },
+        };
+        let image = render_overlay(
+            (2, 2),
+            std::slice::from_ref(&annotation),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let top = image.get_pixel(0, 0);
+        assert_eq!(top[3], 128);
+        assert!((i16::from(top[0]) - 200).abs() <= 2);
+        assert_eq!(*image.get_pixel(0, 1), Rgba([10, 40, 220, 255]));
+    }
+
+    #[test]
+    fn image_downscaling_prefilters_per_axis_without_an_unbounded_affine_kernel() {
+        let source = RgbaImage::from_fn(4_000, 1, |x, _| {
+            let value = if x % 2 == 0 { 0 } else { 255 };
+            Rgba([value, value, value, 255])
+        });
+        for resampling in [Resampling::Bicubic, Resampling::Lanczos] {
+            let annotation = Annotation {
+                id: AnnotationId(92),
+                shape: Shape::Image {
+                    pixels: std::sync::Arc::new(source.clone()),
+                    corners: [
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 1.0, y: 0.0 },
+                        Point { x: 1.0, y: 1.0 },
+                        Point { x: 0.0, y: 1.0 },
+                    ],
+                    resampling,
+                },
+            };
+            let image = render_overlay(
+                (1, 1),
+                std::slice::from_ref(&annotation),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            let expected = crate::tools::scale::resize(
+                &source,
+                1,
+                1,
+                resampling,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            assert_eq!(*image.get_pixel(0, 0), *expected.get_pixel(0, 0));
+        }
+    }
+
+    #[test]
+    fn rotated_image_edges_are_antialiased_without_transparent_color_fringes() {
+        let center = Point { x: 2.0, y: 2.0 };
+        let angle = 0.31_f32;
+        let rotate = |point: Point| {
+            let (sin, cos) = angle.sin_cos();
+            let x = point.x - center.x;
+            let y = point.y - center.y;
+            Point {
+                x: center.x + x * cos - y * sin,
+                y: center.y + x * sin + y * cos,
+            }
+        };
+        let annotation = Annotation {
+            id: AnnotationId(93),
+            shape: Shape::Image {
+                pixels: std::sync::Arc::new(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]))),
+                corners: [
+                    rotate(Point { x: 1.0, y: 1.0 }),
+                    rotate(Point { x: 3.0, y: 1.0 }),
+                    rotate(Point { x: 3.0, y: 3.0 }),
+                    rotate(Point { x: 1.0, y: 3.0 }),
+                ],
+                resampling: Resampling::Bicubic,
+            },
+        };
+        let image = render_overlay(
+            (4, 4),
+            std::slice::from_ref(&annotation),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(image.pixels().any(|pixel| (1..255).contains(&pixel[3])));
+        for pixel in image.pixels().filter(|pixel| pixel[3] != 0) {
+            assert_eq!(pixel[0], 255);
+            assert_eq!(pixel[1], 0);
+            assert_eq!(pixel[2], 0);
+        }
+    }
+
+    #[test]
+    fn fully_offcanvas_image_skips_its_filter_and_leaves_the_overlay_unchanged() {
+        let mut pixmap = Pixmap::new(2, 2).unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        // A cancelled prefilter would return `Cancelled`; the frame rejection
+        // must happen first for a distant image sharing an overlay with other
+        // annotations.
+        draw_image(
+            &mut pixmap,
+            &RgbaImage::from_pixel(4_000, 1, Rgba([255, 0, 0, 255])),
+            [
+                Point {
+                    x: -10_000.0,
+                    y: -10_000.0,
+                },
+                Point {
+                    x: -9_999.0,
+                    y: -10_000.0,
+                },
+                Point {
+                    x: -9_999.0,
+                    y: -9_999.0,
+                },
+                Point {
+                    x: -10_000.0,
+                    y: -9_999.0,
+                },
+            ],
+            Resampling::Lanczos,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+            },
+            &cancellation,
+        )
+        .unwrap();
+        assert!(pixmap.data().iter().all(|value| *value == 0));
     }
 }

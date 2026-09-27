@@ -7,7 +7,7 @@ use crate::document::{
     PencilGeometry, Point, Rect, Shape, StrokeStyle,
 };
 use crate::tools::annotation::edit::{handle_drag, moved, rotated};
-use crate::tools::annotation::hit::{HitKind, cursor_for_hit, hit_test};
+use crate::tools::annotation::hit::{HitKind, cursor_for_hit, handles, hit_test};
 use crate::tools::annotation::render_annotation_preview;
 use crate::window::tool::Tool;
 
@@ -68,6 +68,7 @@ pub(super) enum AnnotationDrag {
         kind: crate::tools::annotation::hit::HandleKind,
         original: Annotation,
         start: Point,
+        pointer_offset: Point,
     },
     Rotate {
         original: Annotation,
@@ -118,7 +119,7 @@ impl ViewerWindow {
             let this = self.clone();
             move |gesture, x, y| {
                 let tool = this.0.tool.get();
-                if !tool.is_annotation() {
+                if !annotation_editing_active(tool) {
                     return;
                 }
                 // Ctrl is the pencil line gesture. Leave node hits unclaimed so
@@ -133,7 +134,7 @@ impl ViewerWindow {
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                     return;
                 }
-                let Some(point) = this.0.canvas.image_point_at(x, y) else {
+                let Some(point) = this.annotation_point_at(x, y) else {
                     return;
                 };
                 let annotations = this
@@ -142,31 +143,51 @@ impl ViewerWindow {
                     .borrow()
                     .as_ref()
                     .map_or_else(Vec::new, crate::document::Document::annotations);
+                let editable = editable_annotations(&annotations, tool);
                 let tolerance = 8.0 / this.0.canvas.image_scale().max(0.01);
                 if let Some(hit) = hit_test(
-                    &annotations,
-                    this.0.selected_annotation.get(),
+                    &editable,
+                    selected_if_editable(&editable, this.0.selected_annotation.get()),
                     point,
                     tolerance,
                 ) {
-                    let Some(original) = annotations
+                    let Some(original) = editable
                         .into_iter()
                         .find(|annotation| annotation.id == hit.id)
                     else {
                         return;
                     };
                     let measurement = matches!(&original.shape, Shape::Measurement { .. });
+                    let image = matches!(&original.shape, Shape::Image { .. });
+                    if image && tool == Tool::Select {
+                        // A region selection and an object selection have
+                        // different Delete/Copy meanings. Selecting an image
+                        // therefore ends any pending cutout interaction.
+                        this.clear_region_selection();
+                    }
                     this.select_annotation(Some(original.id));
                     let state = match hit.kind {
                         HitKind::Body => AnnotationDrag::Move {
                             original,
                             start: point,
                         },
-                        HitKind::Handle(kind) => AnnotationDrag::Handle {
-                            kind,
-                            original,
-                            start: point,
-                        },
+                        HitKind::Handle(kind) => {
+                            let handle = handles(&original)
+                                .into_iter()
+                                .find_map(|(candidate, handle)| {
+                                    (candidate == kind).then_some(handle)
+                                })
+                                .unwrap_or(point);
+                            AnnotationDrag::Handle {
+                                kind,
+                                original,
+                                start: point,
+                                pointer_offset: Point {
+                                    x: point.x - handle.x,
+                                    y: point.y - handle.y,
+                                },
+                            }
+                        }
                         HitKind::Rotate => {
                             let center = rotation_center(&original);
                             AnnotationDrag::Rotate {
@@ -177,12 +198,23 @@ impl ViewerWindow {
                         }
                     };
                     this.0.annotation_drag.replace(Some(state));
-                    if measurement {
+                    this.0.annotation_drag_screen_start.set(Some((x, y)));
+                    if image {
+                        if !this.rendered_is_current() {
+                            this.cancel_annotation_drag();
+                            return;
+                        }
+                        this.cancel_document_render();
+                        // Image previews render the full scene to preserve
+                        // their original stacking position.
+                    } else if measurement {
                         this.show_measurement_drag_base(Some(hit.id));
                     } else {
                         this.show_render_excluding(hit.id);
                     }
                     gesture.set_state(gtk::EventSequenceState::Claimed);
+                } else if tool == Tool::Select {
+                    this.select_annotation(None);
                 } else if tool.is_vector_annotation() {
                     let id = {
                         let mut document = this.0.document.borrow_mut();
@@ -197,6 +229,7 @@ impl ViewerWindow {
                         id,
                         start: point,
                     }));
+                    this.0.annotation_drag_screen_start.set(Some((x, y)));
                     if tool == Tool::Measure {
                         this.show_measurement_drag_base(None);
                     }
@@ -207,16 +240,19 @@ impl ViewerWindow {
         drag.connect_drag_update({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.tool.get().is_annotation() {
+                if !annotation_editing_active(this.0.tool.get()) {
                     return;
                 }
-                let Some((origin_x, origin_y)) = gesture.start_point() else {
+                let Some((origin_x, origin_y)) = this
+                    .0
+                    .annotation_drag_screen_start
+                    .get()
+                    .or_else(|| gesture.start_point())
+                else {
                     return;
                 };
-                let Some(pointer) = this
-                    .0
-                    .canvas
-                    .image_point_at(origin_x + offset_x, origin_y + offset_y)
+                let Some(pointer) =
+                    this.annotation_point_at(origin_x + offset_x, origin_y + offset_y)
                 else {
                     return;
                 };
@@ -232,16 +268,19 @@ impl ViewerWindow {
         drag.connect_drag_end({
             let this = self.clone();
             move |gesture, offset_x, offset_y| {
-                if !this.0.tool.get().is_annotation() {
+                if !annotation_editing_active(this.0.tool.get()) {
                     this.cancel_annotation_drag();
                     return;
                 }
                 let Some(state) = this.0.annotation_drag.take() else {
                     return;
                 };
-                let pointer = gesture
-                    .start_point()
-                    .and_then(|(x, y)| this.0.canvas.image_point_at(x + offset_x, y + offset_y));
+                let pointer = this
+                    .0
+                    .annotation_drag_screen_start
+                    .take()
+                    .or_else(|| gesture.start_point())
+                    .and_then(|(x, y)| this.annotation_point_at(x + offset_x, y + offset_y));
                 this.0.annotation_preview_queue.borrow_mut().clear_pending();
                 let Some(pointer) = pointer else {
                     this.discard_annotation_preview();
@@ -252,8 +291,29 @@ impl ViewerWindow {
                     let start = state.start();
                     (pointer.x - start.x).abs() < 4.0 && (pointer.y - start.y).abs() < 4.0
                 };
-                let final_annotation =
-                    this.annotation_for_drag(&state, pointer, gesture.current_event_state());
+                // A released gesture with no screen displacement must be a
+                // true no-op. Reconstructing an affine resize or rotation at
+                // zero delta can otherwise introduce tiny float drift.
+                let final_annotation = if offset_x == 0.0 && offset_y == 0.0 {
+                    match &state {
+                        AnnotationDrag::Move { original, .. }
+                        | AnnotationDrag::Handle { original, .. }
+                        | AnnotationDrag::Rotate { original, .. } => Some(original.clone()),
+                        AnnotationDrag::Create { .. } => {
+                            this.annotation_for_drag(&state, pointer, gesture.current_event_state())
+                        }
+                    }
+                } else {
+                    this.annotation_for_drag(&state, pointer, gesture.current_event_state())
+                };
+                let unchanged = final_annotation
+                    .as_ref()
+                    .is_some_and(|annotation| match &state {
+                        AnnotationDrag::Move { original, .. }
+                        | AnnotationDrag::Handle { original, .. }
+                        | AnnotationDrag::Rotate { original, .. } => annotation == original,
+                        AnnotationDrag::Create { .. } => false,
+                    });
                 match state {
                     AnnotationDrag::Create {
                         tool: Tool::Text,
@@ -285,6 +345,10 @@ impl ViewerWindow {
                         this.apply(Operation::Annotate(AnnotationEdit::Create(annotation)));
                         this.select_annotation(Some(id));
                     }
+                    _ if unchanged => {
+                        this.discard_annotation_preview();
+                        this.render_document();
+                    }
                     _ => {
                         let Some(annotation) = final_annotation else {
                             this.discard_annotation_preview();
@@ -297,6 +361,12 @@ impl ViewerWindow {
                         this.select_annotation(Some(id));
                     }
                 }
+            }
+        });
+        drag.connect_cancel({
+            let this = self.clone();
+            move |_, _| {
+                this.cancel_annotation_drag();
             }
         });
         self.0.canvas.add_controller(drag);
@@ -327,10 +397,10 @@ impl ViewerWindow {
         double_click.connect_pressed({
             let this = self.clone();
             move |gesture, presses, x, y| {
-                if presses != 2 || !this.0.tool.get().is_annotation() {
+                if presses != 2 || !annotation_editing_active(this.0.tool.get()) {
                     return;
                 }
-                let Some(point) = this.0.canvas.image_point_at(x, y) else {
+                let Some(point) = this.annotation_point_at(x, y) else {
                     return;
                 };
                 let annotations = this
@@ -339,16 +409,17 @@ impl ViewerWindow {
                     .borrow()
                     .as_ref()
                     .map_or_else(Vec::new, crate::document::Document::annotations);
+                let editable = editable_annotations(&annotations, this.0.tool.get());
                 let tolerance = 8.0 / this.0.canvas.image_scale().max(0.01);
                 let Some(hit) = hit_test(
-                    &annotations,
-                    this.0.selected_annotation.get(),
+                    &editable,
+                    selected_if_editable(&editable, this.0.selected_annotation.get()),
                     point,
                     tolerance,
                 ) else {
                     return;
                 };
-                let Some(mut annotation) = annotations
+                let Some(mut annotation) = editable
                     .into_iter()
                     .find(|annotation| annotation.id == hit.id)
                 else {
@@ -465,12 +536,28 @@ impl ViewerWindow {
                 },
                 matches!(original.shape, Shape::Measurement { .. }),
             ),
-            AnnotationDrag::Handle { original, kind, .. } => handle_drag(
+            AnnotationDrag::Handle {
                 original,
-                *kind,
-                pointer,
-                modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
-            ),
+                kind,
+                pointer_offset,
+                ..
+            } => {
+                let mut changed = handle_drag(
+                    original,
+                    *kind,
+                    Point {
+                        x: pointer.x - pointer_offset.x,
+                        y: pointer.y - pointer_offset.y,
+                    },
+                    modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                );
+                if changed != *original
+                    && let Shape::Image { resampling, .. } = &mut changed.shape
+                {
+                    *resampling = self.0.settings.pasted_image_resampling();
+                }
+                changed
+            }
             AnnotationDrag::Rotate {
                 original,
                 center,
@@ -523,36 +610,39 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .map_or_else(Vec::new, crate::document::Document::annotations);
-        // A linked line node can change several independent annotations. Render
-        // a complete same-sized document preview so no stationary endpoint is
-        // left behind beneath the overlay.
-        if matches!(
-            &annotation.shape,
-            Shape::Pencil {
-                geometry: PencilGeometry::Line(_),
-                ..
-            }
-        ) && let Some(mut preview) = self.0.document.borrow().as_ref().cloned()
-        {
-            let linked = preview.line_links().iter().any(|link| {
-                link.first.annotation == annotation.id || link.second.annotation == annotation.id
-            });
-            if linked {
-                preview.apply(Operation::Annotate(AnnotationEdit::Set(annotation.clone())));
-                if let Ok(rendered) = preview.render(&crate::document::CancellationToken::default())
-                    && let Ok(texture) = texture_from_rgba(&rendered.pixels)
-                {
-                    self.0.canvas.clear_annotation_previews();
-                    self.0.canvas.set_texture(Some(&texture));
-                    self.0.annotation_preview.replace(Some(annotation.clone()));
-                    self.0
-                        .canvas
-                        .set_annotation_selection(Some(SelectionHandles {
-                            annotation,
-                            hot: None,
-                        }));
-                    return;
+        // Images may sit below later annotations. A separate overlay would
+        // always be painted on top, so preview the complete scene to retain
+        // document stacking while their affine frame changes. Linked lines
+        // need the same treatment because one node can update another line.
+        let full_scene_preview = matches!(annotation.shape, Shape::Image { .. })
+            || matches!(
+                &annotation.shape,
+                Shape::Pencil {
+                    geometry: PencilGeometry::Line(_),
+                    ..
                 }
+            ) && self.0.document.borrow().as_ref().is_some_and(|document| {
+                document.line_links().iter().any(|link| {
+                    link.first.annotation == annotation.id
+                        || link.second.annotation == annotation.id
+                })
+            });
+        if full_scene_preview && let Some(mut preview) = self.0.document.borrow().as_ref().cloned()
+        {
+            preview.apply(Operation::Annotate(AnnotationEdit::Set(annotation.clone())));
+            if let Ok(rendered) = preview.render(&crate::document::CancellationToken::default())
+                && let Ok(texture) = texture_from_rgba(&rendered.pixels)
+            {
+                self.0.canvas.clear_annotation_previews();
+                self.0.canvas.set_texture(Some(&texture));
+                self.0.annotation_preview.replace(Some(annotation.clone()));
+                self.0
+                    .canvas
+                    .set_annotation_selection(Some(SelectionHandles {
+                        annotation,
+                        hot: None,
+                    }));
+                return;
             }
         }
         if let Ok(Some(overlay)) = render_annotation_preview(
@@ -634,6 +724,7 @@ impl ViewerWindow {
         self.refresh_annotation_selection();
         if let Some(annotation) = self.selected_annotation() {
             let kind = match annotation.shape {
+                Shape::Image { .. } => crate::i18n::gettext("Image"),
                 Shape::Pencil {
                     geometry: PencilGeometry::Freehand(_),
                     ..
@@ -647,7 +738,7 @@ impl ViewerWindow {
                     ..
                 } => crate::i18n::gettext("Pencil rectangle"),
                 Shape::Pencil {
-                    geometry: PencilGeometry::Ellipse(_),
+                    geometry: PencilGeometry::Ellipse(_) | PencilGeometry::RotatedEllipse(_),
                     ..
                 } => crate::i18n::gettext("Pencil ellipse"),
                 Shape::Highlight { .. } => crate::i18n::gettext("Highlight"),
@@ -675,7 +766,7 @@ impl ViewerWindow {
             }));
     }
 
-    fn selected_annotation(&self) -> Option<Annotation> {
+    pub(super) fn selected_annotation(&self) -> Option<Annotation> {
         let id = self.0.selected_annotation.get()?;
         self.0
             .document
@@ -695,6 +786,7 @@ impl ViewerWindow {
             return;
         };
         match &mut annotation.shape {
+            Shape::Image { .. } => return,
             Shape::Pencil { style, .. } => {
                 if let Some(color) = color {
                     style.color = color;
@@ -742,7 +834,7 @@ impl ViewerWindow {
     }
 
     fn update_annotation_hover(&self, x: f64, y: f64) {
-        if !self.0.tool.get().is_annotation() {
+        if !annotation_editing_active(self.0.tool.get()) {
             return;
         }
         if self.0.tool.get() == Tool::Measure {
@@ -758,7 +850,7 @@ impl ViewerWindow {
         if self.0.annotation_drag.borrow().is_some() {
             return;
         }
-        let Some(point) = self.0.canvas.image_point_at(x, y) else {
+        let Some(point) = self.annotation_point_at(x, y) else {
             return;
         };
         let annotations = self
@@ -767,12 +859,24 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .map_or_else(Vec::new, crate::document::Document::annotations);
+        let editable = editable_annotations(&annotations, self.0.tool.get());
         let hit = hit_test(
-            &annotations,
-            self.0.selected_annotation.get(),
+            &editable,
+            selected_if_editable(&editable, self.0.selected_annotation.get()),
             point,
             8.0 / self.0.canvas.image_scale().max(0.01),
         );
+        if self.0.tool.get() == Tool::Select && hit.is_none() {
+            if let Some(selected) = self.selected_annotation() {
+                self.0
+                    .canvas
+                    .set_annotation_selection(Some(SelectionHandles {
+                        annotation: selected,
+                        hot: None,
+                    }));
+            }
+            return;
+        }
         if let Some(selected) = self.selected_annotation() {
             self.0
                 .canvas
@@ -793,7 +897,7 @@ impl ViewerWindow {
     }
 
     pub(super) fn annotation_hit_at(&self, x: f64, y: f64) -> bool {
-        let Some(point) = self.0.canvas.image_point_at(x, y) else {
+        let Some(point) = self.annotation_point_at(x, y) else {
             return false;
         };
         let annotations = self
@@ -802,17 +906,27 @@ impl ViewerWindow {
             .borrow()
             .as_ref()
             .map_or_else(Vec::new, crate::document::Document::annotations);
+        let editable = editable_annotations(&annotations, self.0.tool.get());
         hit_test(
-            &annotations,
-            self.0.selected_annotation.get(),
+            &editable,
+            selected_if_editable(&editable, self.0.selected_annotation.get()),
             point,
             8.0 / self.0.canvas.image_scale().max(0.01),
         )
         .is_some()
     }
 
+    fn annotation_point_at(&self, x: f64, y: f64) -> Option<Point> {
+        if self.0.tool.get() == Tool::Select {
+            self.0.canvas.unclamped_image_point_at(x, y)
+        } else {
+            self.0.canvas.image_point_at(x, y)
+        }
+    }
+
     pub(super) fn cancel_annotation_drag(&self) -> bool {
         if self.0.annotation_drag.take().is_some() {
+            self.0.annotation_drag_screen_start.set(None);
             self.discard_annotation_preview();
             self.render_document();
             true
@@ -1097,7 +1211,44 @@ impl ViewerWindow {
     }
 }
 
+fn annotation_editing_active(tool: Tool) -> bool {
+    tool.is_annotation() || tool == Tool::Select
+}
+
+fn annotation_is_editable(annotations: &[Annotation], id: AnnotationId, tool: Tool) -> bool {
+    let Some(annotation) = annotations.iter().find(|annotation| annotation.id == id) else {
+        return false;
+    };
+    match tool {
+        // The Select tool continues to own pixel-region selection. It only
+        // delegates persistent clipboard images to the annotation controller.
+        Tool::Select => matches!(annotation.shape, Shape::Image { .. }),
+        // Drawing tools retain their existing object-editing behavior while
+        // avoiding accidental image moves when a user switches back to draw.
+        tool if tool.is_annotation() => !matches!(annotation.shape, Shape::Image { .. }),
+        _ => false,
+    }
+}
+
+fn editable_annotations(annotations: &[Annotation], tool: Tool) -> Vec<Annotation> {
+    annotations
+        .iter()
+        .filter(|annotation| annotation_is_editable(annotations, annotation.id, tool))
+        .cloned()
+        .collect()
+}
+
+fn selected_if_editable(
+    annotations: &[Annotation],
+    selected: Option<AnnotationId>,
+) -> Option<AnnotationId> {
+    selected.filter(|id| annotations.iter().any(|annotation| annotation.id == *id))
+}
+
 fn rotation_center(annotation: &Annotation) -> Point {
+    if let Shape::Image { corners, .. } = &annotation.shape {
+        return corners[0].midpoint(corners[2]);
+    }
     if let Shape::Arrow { start, end, .. } = &annotation.shape {
         return start.midpoint(*end);
     }
@@ -1168,6 +1319,518 @@ mod tests {
         assert_eq!(queue.take(), Some(1));
         assert!(!queue.push(1, Some(&1)));
         assert!(queue.push(3, Some(&1)));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pasted_images_are_reselectable_transformable_and_cancel_cleanly() {
+        use crate::document::{Document, ImageSource, Metadata};
+        use libadwaita as adw;
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        fn canvas_pixels(window: &ViewerWindow) -> image::RgbaImage {
+            let texture = window.0.canvas.texture().expect("canvas texture");
+            let bytes = texture.save_to_png_bytes();
+            image::load_from_memory(bytes.as_ref())
+                .expect("decode canvas texture")
+                .to_rgba8()
+        }
+
+        fn wait_for_render(window: &ViewerWindow, context: &glib::MainContext) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !window.rendered_is_current() && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::yield_now();
+            }
+            assert!(window.rendered_is_current(), "document render completed");
+        }
+
+        fn widget(window: &ViewerWindow, point: Point) -> (f64, f64) {
+            let point = window
+                .0
+                .canvas
+                .widget_point_for_image(point)
+                .expect("image point maps to the presented canvas");
+            (f64::from(point.x()), f64::from(point.y()))
+        }
+
+        fn image_annotation(window: &ViewerWindow, id: AnnotationId) -> Annotation {
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .expect("document")
+                .annotations()
+                .into_iter()
+                .find(|annotation| annotation.id == id)
+                .expect("pasted image annotation")
+        }
+
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PastedImageObjectGestureTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let context = glib::MainContext::default();
+        let base = image::RgbaImage::from_pixel(64, 64, image::Rgba([245, 245, 245, 255]));
+        window.0.document.replace(Some(Document::new(ImageSource {
+            pixels: Arc::new(base.clone()),
+            path: None,
+            metadata: Metadata::default(),
+        })));
+        window.0.rendered.replace(Some(base.clone()));
+        window
+            .0
+            .rendered_generation
+            .set(window.0.render_generation.get());
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&base).expect("base texture")));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.present();
+        while context.pending() {
+            context.iteration(false);
+        }
+        window.0.canvas.allocate(64, 64, -1, None);
+        window.set_tool(Tool::Select);
+
+        window.paste_rgba_image(image::RgbaImage::from_fn(16, 12, |x, y| {
+            image::Rgba([220, x as u8 * 8, y as u8 * 12, 255])
+        }));
+        wait_for_render(&window, &context);
+        let a = window.selected_annotation().expect("first pasted image");
+        let (a_id, a_pixels) = match &a.shape {
+            Shape::Image { pixels, .. } => (a.id, Arc::clone(pixels)),
+            _ => unreachable!(),
+        };
+
+        window.paste_rgba_image(image::RgbaImage::from_fn(16, 12, |x, _y| {
+            image::Rgba([x as u8 * 10, 80, 235, 160])
+        }));
+        wait_for_render(&window, &context);
+        let b = window.selected_annotation().expect("second pasted image");
+        let b_id = b.id;
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .len(),
+            2,
+            "two independent pasted-image objects survive"
+        );
+
+        // A sits below B. Image previews must render the full document, not
+        // a top-most overlay, so B remains above a proposed edit of A.
+        let proposed_a = moved(&a, Point { x: 3.0, y: -2.0 }, false);
+        let mut expected_document = window.0.document.borrow().as_ref().unwrap().clone();
+        expected_document.apply(Operation::Annotate(AnnotationEdit::Set(proposed_a.clone())));
+        let expected_preview = expected_document
+            .render(&crate::document::CancellationToken::default())
+            .expect("stacked preview render")
+            .pixels;
+        window.preview_annotation_now(proposed_a);
+        assert_eq!(canvas_pixels(&window), expected_preview);
+        window.discard_annotation_preview();
+        window.restore_rendered_canvas_texture();
+
+        // Move B away so all subsequent pointer gestures can target A.
+        window.apply(Operation::Annotate(AnnotationEdit::Set(moved(
+            &b,
+            Point { x: 22.0, y: -14.0 },
+            false,
+        ))));
+        wait_for_render(&window, &context);
+
+        let body = widget(&window, rotation_center(&a));
+        let drags: Vec<_> = (0..window.0.canvas.observe_controllers().n_items())
+            .filter_map(|index| window.0.canvas.observe_controllers().item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureDrag>().ok())
+            .collect();
+        window.select_annotation(None);
+        let annotation_drag = drags
+            .into_iter()
+            .find(|candidate| {
+                candidate.emit_by_name::<()>("drag-begin", &[&body.0, &body.1]);
+                let matched = window.0.annotation_drag.borrow().is_some();
+                if matched {
+                    candidate
+                        .emit_by_name::<()>("cancel", &[&Option::<gtk::gdk::EventSequence>::None]);
+                    wait_for_render(&window, &context);
+                }
+                matched
+            })
+            .expect("annotation drag controller identified by its real begin callback");
+        window.select_annotation(None);
+
+        // Selecting an object clears an existing pixel-region selection. A
+        // click with no motion only changes selection, never history.
+        window.set_region_selection(Some(crate::canvas::CropOverlay {
+            x: 1,
+            y: 1,
+            width: 6,
+            height: 5,
+            image_width: 64,
+            image_height: 64,
+        }));
+        let history_before_click = window
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .operations()
+            .len();
+        annotation_drag.emit_by_name::<()>("drag-begin", &[&body.0, &body.1]);
+        assert!(
+            matches!(
+                window.0.annotation_drag.borrow().as_ref(),
+                Some(AnnotationDrag::Move { original, .. }) if original.id == a_id
+            ),
+            "body drag state: {:?}",
+            window.0.annotation_drag.borrow()
+        );
+        assert_eq!(window.0.annotation_drag_screen_start.get(), Some(body));
+        annotation_drag.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
+        wait_for_render(&window, &context);
+        assert_eq!(window.0.selected_annotation.get(), Some(a_id));
+        assert_eq!(window.0.region_selection.get(), None);
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            history_before_click,
+            "a stationary selection click is not an annotation edit"
+        );
+
+        let before_rotation = image_annotation(&window, a_id);
+        let Shape::Image { corners, .. } = &before_rotation.shape else {
+            unreachable!()
+        };
+        let center = corners[0].midpoint(corners[2]);
+        let rotate_start = Point {
+            x: corners[0].x - 9.0,
+            y: corners[0].y - 9.0,
+        };
+        let vector = Point {
+            x: rotate_start.x - center.x,
+            y: rotate_start.y - center.y,
+        };
+        let rotate_end = Point {
+            x: center.x - vector.y,
+            y: center.y + vector.x,
+        };
+        let rotate_start_widget = widget(&window, rotate_start);
+        let rotate_end_widget = widget(&window, rotate_end);
+        annotation_drag.emit_by_name::<()>(
+            "drag-begin",
+            &[&rotate_start_widget.0, &rotate_start_widget.1],
+        );
+        assert!(matches!(
+            window.0.annotation_drag.borrow().as_ref(),
+            Some(AnnotationDrag::Rotate { original, .. }) if original.id == a_id
+        ));
+        annotation_drag.emit_by_name::<()>(
+            "drag-update",
+            &[
+                &(rotate_end_widget.0 - rotate_start_widget.0),
+                &(rotate_end_widget.1 - rotate_start_widget.1),
+            ],
+        );
+        annotation_drag.emit_by_name::<()>(
+            "drag-end",
+            &[
+                &(rotate_end_widget.0 - rotate_start_widget.0),
+                &(rotate_end_widget.1 - rotate_start_widget.1),
+            ],
+        );
+        wait_for_render(&window, &context);
+        let rotated_a = image_annotation(&window, a_id);
+        let Shape::Image {
+            pixels: rotated_pixels,
+            corners: rotated_corners,
+            ..
+        } = &rotated_a.shape
+        else {
+            unreachable!()
+        };
+        assert_ne!(
+            rotated_corners, corners,
+            "rotation changes the affine frame"
+        );
+        assert!(
+            Arc::ptr_eq(rotated_pixels, &a_pixels),
+            "rotation retains source pixels"
+        );
+
+        let resize_start = widget(&window, rotated_corners[2]);
+        let resize_end = widget(
+            &window,
+            Point {
+                x: rotated_corners[2].x + 5.0,
+                y: rotated_corners[2].y + 3.0,
+            },
+        );
+        annotation_drag.emit_by_name::<()>("drag-begin", &[&resize_start.0, &resize_start.1]);
+        assert!(matches!(
+            window.0.annotation_drag.borrow().as_ref(),
+            Some(AnnotationDrag::Handle { original, .. }) if original.id == a_id
+        ));
+        annotation_drag.emit_by_name::<()>(
+            "drag-update",
+            &[
+                &(resize_end.0 - resize_start.0),
+                &(resize_end.1 - resize_start.1),
+            ],
+        );
+        annotation_drag.emit_by_name::<()>(
+            "drag-end",
+            &[
+                &(resize_end.0 - resize_start.0),
+                &(resize_end.1 - resize_start.1),
+            ],
+        );
+        wait_for_render(&window, &context);
+        let resized_a = image_annotation(&window, a_id);
+        let Shape::Image {
+            pixels: resized_pixels,
+            corners: resized_corners,
+            ..
+        } = &resized_a.shape
+        else {
+            unreachable!()
+        };
+        assert_ne!(
+            resized_corners, rotated_corners,
+            "handle drag resizes the frame"
+        );
+        assert!(
+            Arc::ptr_eq(resized_pixels, &a_pixels),
+            "resize retains source pixels"
+        );
+
+        let history_before_handle_click = window
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .operations()
+            .len();
+        let handle = widget(&window, resized_corners[2]);
+        annotation_drag.emit_by_name::<()>("drag-begin", &[&handle.0, &handle.1]);
+        annotation_drag.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
+        wait_for_render(&window, &context);
+        assert_eq!(image_annotation(&window, a_id), resized_a);
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            history_before_handle_click,
+            "a stationary off-center handle click is also a no-op"
+        );
+
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "undo", None);
+        wait_for_render(&window, &context);
+        assert_eq!(image_annotation(&window, a_id), rotated_a);
+        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "redo", None);
+        wait_for_render(&window, &context);
+        assert_eq!(image_annotation(&window, a_id), resized_a);
+
+        let history_before_cancel = window
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .operations()
+            .len();
+        let move_start = widget(&window, rotation_center(&resized_a));
+        window.select_annotation(None);
+        annotation_drag.emit_by_name::<()>("drag-begin", &[&move_start.0, &move_start.1]);
+        annotation_drag.emit_by_name::<()>("drag-update", &[&4.0_f64, &2.0_f64]);
+        annotation_drag.emit_by_name::<()>("cancel", &[&Option::<gtk::gdk::EventSequence>::None]);
+        wait_for_render(&window, &context);
+        let after_cancel = image_annotation(&window, a_id);
+        assert_eq!(after_cancel, resized_a, "cancel restores image geometry");
+        let Shape::Image { pixels, .. } = &after_cancel.shape else {
+            unreachable!()
+        };
+        assert!(
+            Arc::ptr_eq(pixels, &a_pixels),
+            "cancel retains original source pixels"
+        );
+        assert_eq!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .operations()
+                .len(),
+            history_before_cancel,
+            "cancel does not write annotation history"
+        );
+
+        window.set_region_selection(Some(crate::canvas::CropOverlay {
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 4,
+            image_width: 64,
+            image_height: 64,
+        }));
+        window.select_annotation(None);
+        let body = widget(&window, rotation_center(&resized_a));
+        annotation_drag.emit_by_name::<()>("drag-begin", &[&body.0, &body.1]);
+        annotation_drag.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
+        wait_for_render(&window, &context);
+        assert_eq!(window.0.region_selection.get(), None);
+        assert!(
+            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
+        );
+        wait_for_render(&window, &context);
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .iter()
+                .all(|annotation| annotation.id != a_id),
+            "Delete targets the selected image after it replaces a region selection"
+        );
+        assert!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .iter()
+                .any(|annotation| annotation.id == b_id),
+            "deleting A keeps the independently pasted B object"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn ctrl_drag_from_an_existing_node_starts_a_linked_branch() {
+        use crate::document::{BrushPoint, Document, ImageSource, Metadata};
+        use crate::window::PencilDragMode;
+        use libadwaita as adw;
+        use std::sync::Arc;
+        adw::init().unwrap();
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.CtrlNodeBranchTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([0; 4]));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+        window.0.canvas.allocate(64, 64, -1, None);
+        window.0.rendered.replace(Some(image.clone()));
+        window.0.document.replace(Some(Document::new(ImageSource {
+            pixels: Arc::new(image),
+            path: None,
+            metadata: Metadata::default(),
+        })));
+        let point = |x, y| BrushPoint {
+            x,
+            y,
+            pressure: 1.0,
+        };
+        window.commit_editable_pencil_stroke(
+            &[point(12.5, 12.5), point(48.5, 12.5)],
+            PencilDragMode::Line,
+        );
+        let original = window.0.document.borrow().as_ref().unwrap().annotations()[0].clone();
+        // The current endpoint and empty canvas still continue the active chain.
+        for pointer in [Point { x: 48.5, y: 12.5 }, Point { x: 32.5, y: 40.5 }] {
+            let screen = window.0.canvas.widget_point_for_image(pointer).unwrap();
+            window.begin_pencil_drag(
+                &window.0.canvas,
+                1,
+                screen.x().into(),
+                screen.y().into(),
+                gtk::gdk::ModifierType::CONTROL_MASK,
+                0,
+            );
+            assert_eq!(
+                window.0.pencil_drag.borrow().as_ref().unwrap().line_start,
+                point(48.5, 12.5)
+            );
+            assert_eq!(window.0.pencil_line_annotation.get(), Some(original.id));
+        }
+        let start = window
+            .0
+            .canvas
+            .widget_point_for_image(Point { x: 12.5, y: 12.5 })
+            .unwrap();
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            1,
+            start.x().into(),
+            start.y().into(),
+            gtk::gdk::ModifierType::CONTROL_MASK,
+            0,
+        );
+        let drag = window.0.pencil_drag.borrow();
+        assert_eq!(drag.as_ref().unwrap().line_start, point(12.5, 12.5));
+        drop(drag);
+        let end = window
+            .0
+            .canvas
+            .widget_point_for_image(Point { x: 12.5, y: 48.5 })
+            .unwrap();
+        let (points, _, mode) = window
+            .finish_pencil_drag(&window.0.canvas, end.x().into(), end.y().into(), 1)
+            .unwrap();
+        window.commit_editable_pencil_stroke(&points, mode);
+        let document = window.0.document.borrow();
+        let document = document.as_ref().unwrap();
+        assert_eq!(document.annotations().len(), 2);
+        assert_eq!(document.annotations()[0], original);
+        assert_eq!(document.line_links().len(), 1);
+        let Shape::Pencil {
+            geometry: PencilGeometry::Line(vertices),
+            ..
+        } = &document.annotations()[1].shape
+        else {
+            panic!("expected branch")
+        };
+        assert_eq!(
+            vertices,
+            &[Point { x: 12.5, y: 12.5 }, Point { x: 12.5, y: 48.5 }]
+        );
     }
 
     #[test]

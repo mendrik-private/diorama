@@ -126,16 +126,30 @@ struct TargetContours {
     colors: Vec<[f64; 3]>,
 }
 
-fn binary_contour_image(mask: &raster::Mask) -> Result<GrayImage> {
-    GrayImage::from_vec(
-        mask.w as u32,
-        mask.h as u32,
-        mask.data
-            .iter()
-            .map(|&on| if on { 0 } else { 255 })
-            .collect(),
-    )
-    .ok_or_else(|| Error::Scaling("Invalid contour mask dimensions".into()))
+/// Render a contour core on white, mapping the compositor's per-contour
+/// opacity strength to `round(255 * (1 - strength))` grayscale.
+fn strength_contour_image(
+    core: &GrayImage,
+    owners: &[Option<usize>],
+    strengths: &[f64],
+    cancel: &dyn Cancellation,
+) -> Result<GrayImage> {
+    if owners.len() != core.as_raw().len() {
+        return Err(Error::Scaling("Invalid contour mask dimensions".into()));
+    }
+    let mut pixels = Vec::with_capacity(owners.len());
+    for (i, (&value, owner)) in core.as_raw().iter().zip(owners).enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        let strength = match owner {
+            Some(id) if value != 0 => strengths[*id],
+            _ => 0.,
+        };
+        pixels.push((255. * (1. - strength)).round() as u8);
+    }
+    GrayImage::from_vec(core.width(), core.height(), pixels)
+        .ok_or_else(|| Error::Scaling("Invalid contour mask dimensions".into()))
 }
 
 /// Fade a completed contour render over its completed fill in premultiplied
@@ -456,11 +470,8 @@ impl Prepared {
             GameAssetAa::new(0),
             cancel,
         )?;
-        binary_contour_image(&raster::Mask {
-            w: w as usize,
-            h: h as usize,
-            data: strokes.core.as_raw().iter().map(|&v| v != 0).collect(),
-        })
+        let strengths = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
+        strength_contour_image(&strokes.core, &strokes.owners, &strengths, cancel)
     }
 
     fn foreground_contour_mask(
@@ -508,18 +519,19 @@ impl Prepared {
             aa,
             cancel,
         )?;
-        let raw = raster::Mask {
-            w: w as usize,
-            h: h as usize,
-            data: contours
-                .strokes
-                .core
-                .as_raw()
-                .iter()
-                .map(|&v| v != 0)
-                .collect(),
-        };
-        binary_contour_image(&raw)
+        // Show the intrinsic (AA100) strength: the AA-hardened strength is
+        // uniformly opaque at AA0 and would hide the established opacity.
+        let strengths = opacity::calculate(
+            &self.widths,
+            &contours.strokes.core,
+            &contours.strokes.owners,
+        );
+        strength_contour_image(
+            &contours.strokes.core,
+            &contours.strokes.owners,
+            &strengths,
+            cancel,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1083,7 +1095,8 @@ impl Session {
         cancel.check()
     }
 
-    /// Render the vector-fitted source traces as a binary diagnostic mask.
+    /// Render the vector-fitted source traces as a white-background diagnostic
+    /// mask with grayscale weighted by each contour's established opacity.
     pub fn polished_contour_mask(
         &self,
         w: u32,
@@ -1103,7 +1116,8 @@ impl Session {
         Ok(mask)
     }
 
-    /// Return the canonical, foreground-supported target contour core.
+    /// Return the canonical, foreground-supported target contour core with
+    /// grayscale weighted by each contour's established intrinsic opacity.
     pub fn foreground_contour_mask(
         &self,
         foreground: &RgbaImage,

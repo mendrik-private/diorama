@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn outlined_fixture(transparent: bool) -> RgbaImage {
     RgbaImage::from_fn(64, 60, |x, y| {
@@ -1065,4 +1066,28 @@ fn cancelled_cached_requests_and_working_set_preflight_are_rejected() {
         }
     ));
     assert!(large.cache.lock().unwrap().prepared.is_none());
+}
+
+#[test]
+fn contour_inspection_shades_core_ink_by_contour_strength() {
+    let core = GrayImage::from_raw(4, 1, vec![255, 255, 0, 255]).unwrap();
+    let owners = [Some(0), Some(1), Some(0), None];
+    let image = strength_contour_image(&core, &owners, &[1.0, 0.95], &|| false).unwrap();
+    assert_eq!(image.as_raw(), &[0, 13, 255, 255]);
+    assert!(strength_contour_image(&core, &owners[..3], &[1.0, 0.95], &|| false).is_err());
+}
+
+#[test]
+fn contour_strength_render_checks_cancellation_during_large_masks() {
+    let core = GrayImage::from_pixel(4097, 1, image::Luma([255]));
+    let owners = vec![Some(0); 4097];
+    let checks = AtomicUsize::new(0);
+
+    assert!(matches!(
+        strength_contour_image(&core, &owners, &[1.0], &|| {
+            checks.fetch_add(1, Ordering::Relaxed) >= 1
+        }),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(checks.load(Ordering::Relaxed), 2);
 }

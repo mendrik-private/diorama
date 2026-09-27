@@ -1,9 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     f32::consts::FRAC_PI_2,
+    sync::Arc,
 };
 
-use super::{BrushPoint, Operation, Rotation};
+use image::RgbaImage;
+
+use super::{BrushPoint, Operation, Resampling, Rotation};
 
 pub const MEASUREMENT_STROKE_WIDTH: f32 = 1.0;
 
@@ -95,10 +98,22 @@ pub enum PencilGeometry {
     Rectangle(Rect),
     RotatedRectangle([Point; 4]),
     Ellipse(Rect),
+    /// Corners of the ellipse's affine frame, in rectangle outline order.
+    RotatedEllipse([Point; 4]),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
+    /// An immutable source image mapped through its editable affine frame.
+    ///
+    /// Corners are ordered top-left, top-right, bottom-right, bottom-left.
+    /// The source remains shared across edits and history entries; only this
+    /// frame changes during move, resize, rotate, or document transforms.
+    Image {
+        pixels: Arc<RgbaImage>,
+        corners: [Point; 4],
+        resampling: Resampling,
+    },
     Pencil {
         geometry: PencilGeometry,
         style: StrokeStyle,
@@ -187,6 +202,17 @@ fn fold_annotation_graph(
 
     for operation in operations {
         match operation {
+            Operation::ExtractSelection {
+                flattened_annotations,
+                annotation,
+                ..
+            } => {
+                graph
+                    .annotations
+                    .retain(|annotation| !flattened_annotations.contains(&annotation.id));
+                replace_annotation(&mut graph.annotations, annotation.clone());
+                normalize_link_groups(&graph.annotations, &mut graph.link_groups);
+            }
             Operation::SelectionEdit {
                 flattened_annotations,
                 ..
@@ -528,6 +554,11 @@ fn transform_all(annotations: &mut [Annotation], transform: TransformKind) {
 
 fn transform_annotation(annotation: &mut Annotation, transform: TransformKind) {
     match &mut annotation.shape {
+        Shape::Image { corners, .. } => {
+            for point in corners {
+                *point = transform.point(*point);
+            }
+        }
         Shape::Pencil {
             geometry, style, ..
         } => {
@@ -542,7 +573,8 @@ fn transform_annotation(annotation: &mut Annotation, transform: TransformKind) {
                         point.y = transformed.y;
                     }
                 }
-                PencilGeometry::RotatedRectangle(points) => {
+                PencilGeometry::RotatedRectangle(points)
+                | PencilGeometry::RotatedEllipse(points) => {
                     for point in points {
                         *point = transform.point(*point);
                     }
@@ -1242,6 +1274,44 @@ mod tests {
     }
 
     #[test]
+    fn rotated_ellipse_follows_affine_image_transforms() {
+        use crate::tools::annotation::{edit::rotated, pencil::outline_points};
+        let original = rotated(
+            &pencil(
+                7,
+                PencilGeometry::Ellipse(Rect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 60.0,
+                    height: 30.0,
+                }),
+            ),
+            0.7,
+            false,
+        );
+        let Shape::Pencil { geometry, .. } = &original.shape else {
+            unreachable!()
+        };
+        let outline = outline_points(geometry);
+        for transform in [
+            TransformKind::Scale(2.0, 0.5),
+            TransformKind::FlipHorizontal(200.0),
+            TransformKind::FlipVertical(200.0),
+            TransformKind::Clockwise90((200.0, 100.0)),
+            TransformKind::Crop(5.0, 10.0),
+        ] {
+            let mut changed = original.clone();
+            transform_annotation(&mut changed, transform);
+            let Shape::Pencil { geometry, .. } = &changed.shape else {
+                unreachable!()
+            };
+            for (actual, source) in outline_points(geometry).iter().zip(&outline) {
+                assert!(actual.distance(transform.point(*source)) < 0.001);
+            }
+        }
+    }
+
+    #[test]
     fn every_pencil_geometry_follows_image_scaling() {
         let annotations = [
             pencil(
@@ -1349,5 +1419,44 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(style.width, expected_width);
         }
+    }
+
+    #[test]
+    fn image_frame_follows_document_transforms_without_copying_its_source() {
+        let pixels = Arc::new(RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 128])));
+        let mut annotation = Annotation {
+            id: AnnotationId(80),
+            shape: Shape::Image {
+                pixels: pixels.clone(),
+                corners: [
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 30.0, y: 20.0 },
+                    Point { x: 30.0, y: 30.0 },
+                    Point { x: 10.0, y: 30.0 },
+                ],
+                resampling: Resampling::Lanczos,
+            },
+        };
+        transform_annotation(&mut annotation, TransformKind::Scale(2.0, 0.5));
+        transform_annotation(&mut annotation, TransformKind::FlipHorizontal(100.0));
+        let Shape::Image {
+            pixels: retained,
+            corners,
+            resampling,
+        } = annotation.shape
+        else {
+            panic!("expected image annotation");
+        };
+        assert!(Arc::ptr_eq(&pixels, &retained));
+        assert_eq!(resampling, Resampling::Lanczos);
+        assert_eq!(
+            corners,
+            [
+                Point { x: 80.0, y: 10.0 },
+                Point { x: 40.0, y: 10.0 },
+                Point { x: 40.0, y: 15.0 },
+                Point { x: 80.0, y: 15.0 },
+            ]
+        );
     }
 }

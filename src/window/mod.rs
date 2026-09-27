@@ -5,9 +5,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::canvas::{
-    Background, CropOverlay, ImageCanvas, LassoOverlay, MeshGrid, MiniMap, ZoomFilter,
-};
+use crate::canvas::{Background, CropOverlay, ImageCanvas, MeshGrid, MiniMap, ZoomFilter};
 use crate::compare::{SplitOrientation, choose_split};
 #[cfg(test)]
 use crate::document::Stroke;
@@ -109,117 +107,87 @@ enum RegionDrag {
         top: bool,
         bottom: bool,
     },
-    Moving {
-        crop: CropOverlay,
-        origin: ForegroundOrigin,
-        start_screen: (f64, f64),
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ForegroundOrigin {
-    x: i64,
-    y: i64,
 }
 
 #[derive(Clone)]
 struct PreparedSelection {
-    /// The original, in-bounds rectangle remains the selection provenance.
-    /// `origin` alone tracks the movable foreground.
     crop: CropOverlay,
-    origin: ForegroundOrigin,
-    mask: Arc<image::GrayImage>,
     cutout: Arc<image::RgbaImage>,
-    background: [u8; 4],
-    clean_background: Option<Arc<image::RgbaImage>>,
-    fallback_background: Arc<image::RgbaImage>,
+    background: Arc<image::RgbaImage>,
     operations: Arc<[Operation]>,
 }
 
-impl PreparedSelection {
-    fn image_at(
-        &self,
-        current: &image::RgbaImage,
-        origin: ForegroundOrigin,
-    ) -> crate::error::Result<image::RgbaImage> {
-        if origin == self.origin {
-            return Ok(current.clone());
+const MAX_COPIED_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_COPIED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+
+/// Renders only an image annotation into its own transparent bounding box.
+/// This keeps Copy useful after affine edits without leaking canvas pixels
+/// behind transparent or rotated parts of the object.
+fn copied_image_annotation(annotation: &Annotation) -> Option<Result<image::RgbaImage, String>> {
+    let Shape::Image { corners, .. } = &annotation.shape else {
+        return None;
+    };
+    let left = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let top = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let right = corners
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let floor_bound = |value: f32| {
+        let rounded = value.round();
+        if (value - rounded).abs() < 0.001 {
+            rounded
+        } else {
+            value.floor()
         }
-        // Both bases have the source foreground removed once. Rebuilding from
-        // this authoritative scene prevents preview trails and repeated soft
-        // edge compositing damage, including after an off-canvas move.
-        let mut image = self
-            .clean_background
-            .as_ref()
-            .unwrap_or(&self.fallback_background)
-            .as_ref()
-            .clone();
-        crate::tools::selection::paste_cutout_at(
+    };
+    let ceil_bound = |value: f32| {
+        let rounded = value.round();
+        if (value - rounded).abs() < 0.001 {
+            rounded
+        } else {
+            value.ceil()
+        }
+    };
+    let left = floor_bound(left);
+    let top = floor_bound(top);
+    let right = ceil_bound(right);
+    let bottom = ceil_bound(bottom);
+    let width = (right - left).max(1.0) as u32;
+    let height = (bottom - top).max(1.0) as u32;
+    if width > MAX_COPIED_IMAGE_DIMENSION
+        || height > MAX_COPIED_IMAGE_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_COPIED_IMAGE_PIXELS
+    {
+        return Some(Err(gettext("Pasted image is too large to copy")));
+    }
+    let mut image = image::RgbaImage::new(width, height);
+    let mut local = annotation.clone();
+    if let Shape::Image { corners, .. } = &mut local.shape {
+        for point in corners {
+            point.x -= left;
+            point.y -= top;
+        }
+    }
+    Some(
+        crate::tools::annotation::composite_annotation_shapes(
             &mut image,
-            origin.x,
-            origin.y,
-            &self.cutout,
-            &self.mask,
-        )?;
-        Ok(image)
-    }
-}
-
-fn lasso_overlay(prepared: &PreparedSelection) -> LassoOverlay {
-    LassoOverlay {
-        crop: prepared.crop,
-        mask: prepared.mask.clone(),
-        origin_x: prepared.origin.x,
-        origin_y: prepared.origin.y,
-    }
-}
-
-/// The crop remains the visible in-bounds provenance for the normal selection
-/// actions, while the cutout and alpha matte retain their complete dimensions
-/// for moving a clipboard image back across a canvas edge.
-fn pasted_crop(
-    canvas: (u32, u32),
-    cutout: (u32, u32),
-    origin: ForegroundOrigin,
-) -> Option<CropOverlay> {
-    let (canvas_width, canvas_height) = (i64::from(canvas.0), i64::from(canvas.1));
-    let right = origin.x.saturating_add(i64::from(cutout.0));
-    let bottom = origin.y.saturating_add(i64::from(cutout.1));
-    let left = origin.x.clamp(0, canvas_width);
-    let top = origin.y.clamp(0, canvas_height);
-    let right = right.clamp(0, canvas_width);
-    let bottom = bottom.clamp(0, canvas_height);
-    (right > left && bottom > top).then_some(CropOverlay {
-        x: left as u32,
-        y: top as u32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-        image_width: canvas.0,
-        image_height: canvas.1,
-    })
-}
-
-/// A fully off-canvas foreground cannot receive a pointer hit. While it is in
-/// that state, any canvas drag may pull it back; partially visible foregrounds
-/// still use their signed outline for hit testing.
-fn lasso_is_fully_off_canvas(canvas: &ImageCanvas, overlay: &LassoOverlay) -> bool {
-    let Some(foreground) = canvas.lasso_display_bounds(overlay) else {
-        return false;
-    };
-    let Some(image) = canvas.crop_display_bounds(CropOverlay {
-        x: 0,
-        y: 0,
-        width: overlay.crop.image_width,
-        height: overlay.crop.image_height,
-        image_width: overlay.crop.image_width,
-        image_height: overlay.crop.image_height,
-    }) else {
-        return false;
-    };
-    foreground.x() + foreground.width() <= image.x()
-        || foreground.x() >= image.x() + image.width()
-        || foreground.y() + foreground.height() <= image.y()
-        || foreground.y() >= image.y() + image.height()
+            &[local],
+            &CancellationToken::default(),
+        )
+        .map(|_| image)
+        .map_err(|error| error.to_string()),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -490,10 +458,17 @@ fn region_edge_hit(rect: gtk::graphene::Rect, x: f32, y: f32) -> (bool, bool, bo
     const EDGE: f32 = 12.0;
     let within_vertical_span = y >= rect.y() - EDGE && y <= rect.y() + rect.height() + EDGE;
     let within_horizontal_span = x >= rect.x() - EDGE && x <= rect.x() + rect.width() + EDGE;
-    let left = within_vertical_span && (x - rect.x()).abs() <= EDGE;
-    let right = within_vertical_span && (x - (rect.x() + rect.width())).abs() <= EDGE;
-    let top = within_horizontal_span && (y - rect.y()).abs() <= EDGE;
-    let bottom = within_horizontal_span && (y - (rect.y() + rect.height())).abs() <= EDGE;
+    let left_distance = (x - rect.x()).abs();
+    let right_distance = (x - (rect.x() + rect.width())).abs();
+    let top_distance = (y - rect.y()).abs();
+    let bottom_distance = (y - (rect.y() + rect.height())).abs();
+    // Small images can place opposite handles inside the same hit area. Pick
+    // the nearest one so a drag has one stable anchor on each axis.
+    let left = within_vertical_span && left_distance <= EDGE && left_distance <= right_distance;
+    let right = within_vertical_span && right_distance <= EDGE && right_distance < left_distance;
+    let top = within_horizontal_span && top_distance <= EDGE && top_distance <= bottom_distance;
+    let bottom =
+        within_horizontal_span && bottom_distance <= EDGE && bottom_distance < top_distance;
     (left, right, top, bottom)
 }
 
@@ -692,6 +667,7 @@ struct WindowState {
     selected_annotation: Cell<Option<AnnotationId>>,
     nudge_annotation: Cell<Option<AnnotationId>>,
     annotation_drag: RefCell<Option<AnnotationDrag>>,
+    annotation_drag_screen_start: Cell<Option<(f64, f64)>>,
     annotation_preview: RefCell<Option<Annotation>>,
     annotation_preview_queue: RefCell<annotation::PreviewQueue<Annotation>>,
     text_editor: RefCell<Option<InlineTextEditor>>,
@@ -718,7 +694,6 @@ struct WindowState {
     selection_preparation: RefCell<Option<CancellationToken>>,
     selection_preparation_generation: Cell<u64>,
     selection_activation_pending: Cell<bool>,
-    selection_foreground_active: Cell<bool>,
     region_controls: gtk::Box,
     mesh_controls: gtk::Box,
     square_grid_button: gtk::ToggleButton,
@@ -1058,7 +1033,7 @@ impl ViewerWindow {
         scale_show_contours.update_property(&[
             gtk::accessible::Property::Label(&gettext("Show contours")),
             gtk::accessible::Property::Description(&gettext(
-                "Preview the binary contour mask used for Game Asset scaling",
+                "Preview Game Asset contours shaded by their opacity strength",
             )),
         ]);
         scale_slider_row.append(&scale_show_contours);
@@ -1249,6 +1224,7 @@ impl ViewerWindow {
             selected_annotation: Cell::new(None),
             nudge_annotation: Cell::new(None),
             annotation_drag: RefCell::new(None),
+            annotation_drag_screen_start: Cell::new(None),
             annotation_preview: RefCell::new(None),
             annotation_preview_queue: RefCell::new(annotation::PreviewQueue::default()),
             text_editor: RefCell::new(None),
@@ -1275,7 +1251,6 @@ impl ViewerWindow {
             selection_preparation: RefCell::new(None),
             selection_preparation_generation: Cell::new(0),
             selection_activation_pending: Cell::new(false),
-            selection_foreground_active: Cell::new(false),
             region_controls,
             mesh_controls,
             square_grid_button,
@@ -1793,6 +1768,10 @@ impl ViewerWindow {
                 if this.0.tool.get() == Tool::MeshPoints {
                     this.set_tool(Tool::None);
                 }
+                // An annotation drag holds an uncommitted preview of a
+                // particular history state. Drop it before changing history
+                // so its eventual gesture end cannot commit that stale state.
+                this.cancel_annotation_drag();
                 this.clear_region_selection();
                 this.0.nudge_annotation.set(None);
                 let changed = this
@@ -1817,6 +1796,9 @@ impl ViewerWindow {
                 if this.0.tool.get() == Tool::MeshPoints {
                     this.set_tool(Tool::None);
                 }
+                // See undo above: an active object preview belongs to the
+                // history state that existed when its drag began.
+                this.cancel_annotation_drag();
                 this.clear_region_selection();
                 this.0.nudge_annotation.set(None);
                 let changed = this
@@ -2709,10 +2691,7 @@ impl ViewerWindow {
             self.set_action_enabled(action, region_selected);
         }
         for action in ["selection-zoom", "selection-crop"] {
-            self.set_action_enabled(
-                action,
-                region_selected && !self.0.selection_foreground_active.get(),
-            );
+            self.set_action_enabled(action, region_selected);
         }
         let vector_annotations_available = editable;
         for action in ["measure", "highlight", "arrow", "text"] {
@@ -2745,8 +2724,7 @@ impl ViewerWindow {
 
     fn apply(&self, operation: Operation) {
         // Any history mutation can make a cached cutout refer to pixels no
-        // longer displayed (undo/redo included). A move restores its freshly
-        // rebased cache immediately after applying its own snapshot.
+        // longer displayed (undo/redo included).
         if self.0.tool.get() == Tool::MeshPoints {
             self.set_tool(Tool::None);
         }
@@ -2760,7 +2738,6 @@ impl ViewerWindow {
                 .wrapping_add(1),
         );
         self.0.prepared_selection.borrow_mut().take();
-        self.0.selection_foreground_active.set(false);
         self.0.selection_activation_pending.set(false);
         self.0.deferred_selection_preparation.set(None);
         self.0.canvas.set_lasso_overlay(None);
@@ -2842,8 +2819,12 @@ impl ViewerWindow {
             self.0.return_tool.set(None);
         }
         self.0.tool.set(tool);
-        let keeps_annotation_selection =
-            tool.is_annotation() || tool == Tool::PickColor && self.0.return_tool.get().is_some();
+        let keeps_annotation_selection = tool.is_annotation()
+            || tool == Tool::Select
+                && self
+                    .selected_annotation()
+                    .is_some_and(|annotation| matches!(annotation.shape, Shape::Image { .. }))
+            || tool == Tool::PickColor && self.0.return_tool.get().is_some();
         if !keeps_annotation_selection {
             self.select_annotation(None);
         }
@@ -3833,6 +3814,18 @@ impl ViewerWindow {
     fn copy_current_selection_or_image_to_clipboard(&self) {
         if self.0.region_selection.get().is_some() {
             self.copy_selected_region();
+        } else if let Some(
+            annotation @ Annotation {
+                shape: Shape::Image { .. },
+                ..
+            },
+        ) = self.selected_annotation()
+        {
+            match copied_image_annotation(&annotation) {
+                Some(Ok(image)) => self.copy_image_to_clipboard(&image, &gettext("Copied image")),
+                Some(Err(error)) => self.0.toasts.add_toast(adw::Toast::new(&error)),
+                None => self.copy_current_image_to_clipboard(),
+            }
         } else {
             self.copy_current_image_to_clipboard();
         }
@@ -3913,72 +3906,90 @@ impl ViewerWindow {
             )));
             return;
         }
-        let Some(current) = self.0.rendered.borrow().as_ref().cloned() else {
-            return;
-        };
-        let origin = ForegroundOrigin {
-            x: (i64::from(current.width()) - i64::from(cutout.width())).div_euclid(2),
-            y: (i64::from(current.height()) - i64::from(cutout.height())).div_euclid(2),
-        };
-        let Some(crop) = pasted_crop(current.dimensions(), cutout.dimensions(), origin) else {
-            return;
-        };
-        let mask = image::GrayImage::from_fn(cutout.width(), cutout.height(), |x, y| {
-            image::Luma([cutout.get_pixel(x, y)[3]])
-        });
-        let mut pasted = current.clone();
-        if crate::tools::selection::paste_cutout_at(&mut pasted, origin.x, origin.y, &cutout, &mask)
-            .is_err()
-        {
-            return;
-        }
-        self.0.region_drag.set(None);
-        self.set_tool(Tool::Select);
-        let flattened_annotations =
-            self.0
-                .document
-                .borrow()
-                .as_ref()
-                .map_or_else(Vec::new, |document| {
-                    document
-                        .annotations()
-                        .into_iter()
-                        .map(|annotation| annotation.id)
-                        .collect()
-                });
-        self.apply(Operation::SelectionEdit {
-            pixels: Arc::new(pasted),
-            flattened_annotations,
-        });
-        let operations: Arc<[Operation]> = self
+        let Some((canvas_width, canvas_height)) = self
             .0
-            .document
+            .rendered
             .borrow()
             .as_ref()
-            .map_or_else(|| Arc::from([]), |document| document.operations().into());
-        let clean_background = Arc::new(current);
-        let prepared = PreparedSelection {
-            crop,
-            origin,
-            mask: Arc::new(mask),
-            cutout: Arc::new(cutout),
-            background: crate::tools::selection::detected_background(&clean_background)
-                .unwrap_or([0; 4]),
-            clean_background: Some(clean_background.clone()),
-            fallback_background: clean_background,
-            operations,
+            .map(image::GenericImageView::dimensions)
+        else {
+            return;
         };
-        self.0.prepared_selection.replace(Some(prepared.clone()));
-        self.0.selection_foreground_active.set(true);
-        self.0.region_selection.set(Some(crop));
-        self.0.canvas.set_crop_overlay(None);
-        self.0
-            .canvas
-            .set_lasso_overlay(Some(lasso_overlay(&prepared)));
-        self.update_action_states();
+        // Capture the visible center before changing tools or selection state.
+        let viewport = &self.0.canvas_viewport;
+        let center = (viewport.width() > 0 && viewport.height() > 0)
+            .then(|| {
+                viewport.compute_point(
+                    &self.0.canvas,
+                    &gtk::graphene::Point::new(
+                        viewport.width() as f32 / 2.0,
+                        viewport.height() as f32 / 2.0,
+                    ),
+                )
+            })
+            .flatten()
+            .and_then(|point| {
+                self.0
+                    .canvas
+                    .image_point_at(f64::from(point.x()), f64::from(point.y()))
+            })
+            .unwrap_or(Point {
+                x: canvas_width as f32 / 2.0,
+                y: canvas_height as f32 / 2.0,
+            });
+        self.0.region_drag.set(None);
+        self.set_tool(Tool::Select);
+        self.clear_region_selection();
+        let left = (center.x - cutout.width() as f32 / 2.0).floor();
+        let top = (center.y - cutout.height() as f32 / 2.0).floor();
+        let Some(annotation) =
+            self.new_image_annotation(Arc::new(cutout), Point { x: left, y: top })
+        else {
+            return;
+        };
+        let id = annotation.id;
+        self.apply(Operation::Annotate(AnnotationEdit::Create(annotation)));
+        self.select_annotation(Some(id));
         self.0.toasts.add_toast(adw::Toast::new(&gettext(
-            "Pasted image. Drag its outline to move it.",
+            "Pasted image. Drag it to move, its handles to resize, or just outside a corner to rotate.",
         )));
+    }
+
+    fn new_image_annotation(
+        &self,
+        pixels: Arc<image::RgbaImage>,
+        origin: Point,
+    ) -> Option<Annotation> {
+        let id = self
+            .0
+            .document
+            .borrow_mut()
+            .as_mut()?
+            .allocate_annotation_id();
+        let right = origin.x + pixels.width() as f32;
+        let bottom = origin.y + pixels.height() as f32;
+        Some(Annotation {
+            id,
+            shape: Shape::Image {
+                pixels,
+                corners: [
+                    origin,
+                    Point {
+                        x: right,
+                        y: origin.y,
+                    },
+                    Point {
+                        x: right,
+                        y: bottom,
+                    },
+                    Point {
+                        x: origin.x,
+                        y: bottom,
+                    },
+                ],
+                resampling: self.0.settings.pasted_image_resampling(),
+            },
+        })
     }
 
     fn open_with(&self) {
@@ -4041,7 +4052,6 @@ impl ViewerWindow {
             self.0.prepared_selection.borrow_mut().take();
             self.0.selection_activation_pending.set(false);
             self.0.deferred_selection_preparation.set(None);
-            self.0.selection_foreground_active.set(false);
             self.0.canvas.set_lasso_overlay(None);
         }
         self.0.region_selection.set(selection);
@@ -4059,10 +4069,8 @@ impl ViewerWindow {
     }
 
     fn clear_region_selection(&self) {
-        if matches!(self.0.region_drag.get(), Some(RegionDrag::Moving { .. })) {
-            self.restore_rendered_canvas_texture();
-        }
         self.0.region_drag.set(None);
+        self.0.keyboard_tool_anchor.set(None);
         self.set_region_selection(None);
     }
 
@@ -4077,7 +4085,6 @@ impl ViewerWindow {
     }
 
     fn start_selection_preparation(&self, crop: CropOverlay) {
-        self.0.selection_foreground_active.set(false);
         if self.0.rendered_generation.get() != self.0.render_generation.get() {
             self.0.deferred_selection_preparation.set(Some(crop));
             return;
@@ -4123,7 +4130,7 @@ impl ViewerWindow {
                 let cutout = crate::tools::selection::birefnet_cutout(&fragment, &cancellation)?;
                 // The effective matte follows the actual post-multiplication
                 // alpha, so originally transparent pixels never become part of
-                // a cut, fill, or lasso contour.
+                // a cut or fill.
                 let effective =
                     image::GrayImage::from_fn(cutout.width(), cutout.height(), |x, y| {
                         image::Luma([cutout.get_pixel(x, y)[3]])
@@ -4157,7 +4164,6 @@ impl ViewerWindow {
                     Err(error) => (None, Some(error.to_string())),
                 };
                 Ok::<_, crate::error::AppError>((
-                    effective,
                     cutout,
                     clean_background,
                     Arc::new(fallback_background),
@@ -4179,18 +4185,11 @@ impl ViewerWindow {
                 return;
             }
             match result {
-                Ok(Ok((mask, cutout, clean_background, fallback_background, warning))) => {
+                Ok(Ok((cutout, clean_background, fallback_background, warning))) => {
                     let prepared = PreparedSelection {
                         crop,
-                        origin: ForegroundOrigin {
-                            x: i64::from(crop.x),
-                            y: i64::from(crop.y),
-                        },
-                        mask: Arc::new(mask),
                         cutout: Arc::new(cutout),
-                        background,
-                        clean_background,
-                        fallback_background,
+                        background: clean_background.unwrap_or(fallback_background),
                         operations,
                     };
                     state.prepared_selection.replace(Some(prepared));
@@ -4237,15 +4236,38 @@ impl ViewerWindow {
         if !self.prepared_selection_is_current(&prepared) {
             return;
         }
-        self.0
-            .canvas
-            .set_lasso_overlay(Some(lasso_overlay(&prepared)));
-        self.0.canvas.set_crop_overlay(None);
-        self.0.selection_foreground_active.set(true);
-        self.set_action_enabled("selection-zoom", false);
-        self.set_action_enabled("selection-crop", false);
+        if !self.rendered_is_current() {
+            return;
+        }
+        let Some(annotation) = self.new_image_annotation(
+            prepared.cutout,
+            Point {
+                x: prepared.crop.x as f32,
+                y: prepared.crop.y as f32,
+            },
+        ) else {
+            return;
+        };
+        let id = annotation.id;
+        let flattened_annotations = self
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .annotations()
+            .into_iter()
+            .map(|annotation| annotation.id)
+            .collect();
+        self.clear_region_selection();
+        self.apply(Operation::ExtractSelection {
+            background: prepared.background,
+            flattened_annotations,
+            annotation,
+        });
+        self.select_annotation(Some(id));
         self.0.toasts.add_toast(adw::Toast::new(&gettext(
-            "Foreground selection ready. Drag it to move the cutout.",
+            "Cutout ready. Drag it to move, its handles to resize, or just outside a corner to rotate.",
         )));
     }
 
@@ -4259,34 +4281,9 @@ impl ViewerWindow {
         let Some(mut image) = self.0.rendered.borrow().as_ref().cloned() else {
             return;
         };
-        let prepared = self
-            .0
-            .selection_foreground_active
-            .get()
-            .then(|| {
-                self.0
-                    .prepared_selection
-                    .borrow()
-                    .clone()
-                    .filter(|prepared| self.prepared_selection_is_current(prepared))
-            })
-            .flatten();
-        let mask = prepared.as_ref().map_or_else(
-            || image::GrayImage::from_pixel(crop.width, crop.height, image::Luma([255])),
-            |prepared| prepared.mask.as_ref().clone(),
-        );
-        let fill = prepared.as_ref().map_or_else(
-            || crate::tools::selection::detected_background(&image).unwrap_or([0; 4]),
-            |prepared| prepared.background,
-        );
-        if let Some(prepared) = prepared.as_ref() {
-            image = prepared
-                .clean_background
-                .as_ref()
-                .unwrap_or(&prepared.fallback_background)
-                .as_ref()
-                .clone();
-        } else if crate::tools::selection::clear_masked(
+        let mask = image::GrayImage::from_pixel(crop.width, crop.height, image::Luma([255]));
+        let fill = crate::tools::selection::detected_background(&image).unwrap_or([0; 4]);
+        if crate::tools::selection::clear_masked(
             &mut image,
             CropBounds {
                 x: crop.x,
@@ -4564,6 +4561,15 @@ impl ViewerWindow {
             }) {
                 origin.x = point.x;
                 origin.y = point.y;
+                // An explicit node press starts here, even when another line
+                // chain is active. Retain the chain only at its current end.
+                let anchor = self
+                    .pencil_line_chain_end()
+                    .or_else(|| self.0.pencil_line_anchor.get());
+                if anchor.is_some_and(|anchor| anchor.x != point.x || anchor.y != point.y) {
+                    self.0.pencil_line_annotation.set(None);
+                    self.0.pencil_line_anchor.set(None);
+                }
             }
         }
         let line_start = pencil_line_start(
@@ -4720,7 +4726,7 @@ impl ViewerWindow {
     }
 
     fn crop_selected_region(&self) {
-        if self.0.tool.get() != Tool::Select || self.0.selection_foreground_active.get() {
+        if self.0.tool.get() != Tool::Select {
             return;
         }
         let Some(crop) = self.0.region_selection.get() else {
@@ -5409,6 +5415,22 @@ impl ViewerWindow {
             .model(&color_format_model)
             .selected(color_format_index(self.0.settings.color_picker_format()))
             .build();
+        let pasted_image_resampling_labels = [gettext("Bicubic"), gettext("Lanczos")];
+        let pasted_image_resampling_model = gtk::StringList::new(
+            &pasted_image_resampling_labels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let pasted_image_resampling = adw::ComboRow::builder()
+            .title(gettext("Pasted image scaling"))
+            .subtitle(gettext("Resampling used when resizing a pasted image"))
+            .model(&pasted_image_resampling_model)
+            .selected(match self.0.settings.pasted_image_resampling() {
+                Resampling::Lanczos => 1,
+                _ => 0,
+            })
+            .build();
         let mesh_grid_size = adw::SpinRow::with_range(1.0, 1_000_000.0, 1.0);
         mesh_grid_size.set_title(&gettext("Mesh grid size"));
         mesh_grid_size.set_subtitle(&gettext("Image pixels"));
@@ -5424,14 +5446,19 @@ impl ViewerWindow {
         let drawing_group = adw::PreferencesGroup::builder()
             .title(gettext("Drawing"))
             .build();
+        let editing_group = adw::PreferencesGroup::builder()
+            .title(gettext("Editing"))
+            .build();
         drawing_group.add(&anti_aliasing);
         drawing_group.add(&color_format);
         drawing_group.add(&mesh_grid_size);
         drawing_group.add(&mesh_grid_offset_x);
         drawing_group.add(&mesh_grid_offset_y);
+        editing_group.add(&pasted_image_resampling);
 
         page.add(&viewing_group);
         page.add(&drawing_group);
+        page.add(&editing_group);
         dialog.add(&page);
 
         filter.connect_active_notify({
@@ -5489,6 +5516,16 @@ impl ViewerWindow {
         color_format.connect_selected_notify({
             let settings = self.0.settings.clone();
             move |row| settings.set_color_picker_format(color_format_at(row.selected()))
+        });
+        pasted_image_resampling.connect_selected_notify({
+            let settings = self.0.settings.clone();
+            move |row| {
+                settings.set_pasted_image_resampling(if row.selected() == 1 {
+                    Resampling::Lanczos
+                } else {
+                    Resampling::Bicubic
+                });
+            }
         });
         mesh_grid_size.connect_value_notify({
             let this = self.clone();
@@ -6688,9 +6725,6 @@ impl ViewerWindow {
     }
 
     fn zoom_selected_region(&self) -> bool {
-        if self.0.selection_foreground_active.get() {
-            return false;
-        }
         let Some(selection) = self.0.region_selection.get() else {
             return false;
         };
@@ -6768,16 +6802,6 @@ impl ViewerWindow {
         let Some(selection) = self.0.region_selection.get() else {
             return;
         };
-        if self.0.selection_foreground_active.get()
-            && let Some(prepared) = self.0.prepared_selection.borrow().as_ref()
-            && self.prepared_selection_is_current(prepared)
-        {
-            self.copy_image_to_clipboard(
-                prepared.cutout.as_ref(),
-                &gettext("Copied selected foreground"),
-            );
-            return;
-        }
         if selection.width == 0 || selection.height == 0 {
             return;
         }
@@ -7530,43 +7554,16 @@ impl ViewerWindow {
                 if this.0.tool.get() != Tool::Select {
                     return;
                 }
-                let prepared = this
+                if this.annotation_hit_at(x, y) {
+                    return;
+                }
+                let rect = this
                     .0
-                    .selection_foreground_active
+                    .region_selection
                     .get()
-                    .then(|| {
-                        this.0
-                            .prepared_selection
-                            .borrow()
-                            .clone()
-                            .filter(|prepared| this.prepared_selection_is_current(prepared))
-                    })
-                    .flatten();
-                let lasso = prepared.as_ref().map(lasso_overlay);
-                let fully_off_canvas = lasso
-                    .as_ref()
-                    .is_some_and(|lasso| lasso_is_fully_off_canvas(&this.0.canvas, lasso));
-                let rect = lasso
-                    .as_ref()
-                    .and_then(|lasso| this.0.canvas.lasso_display_bounds(lasso))
-                    .or_else(|| {
-                        this.0
-                            .region_selection
-                            .get()
-                            .and_then(|crop| this.0.canvas.crop_display_bounds(crop))
-                    });
+                    .and_then(|crop| this.0.canvas.crop_display_bounds(crop));
                 let cursor = rect.map_or("crosshair", |rect| {
-                    if prepared.is_some()
-                        && (fully_off_canvas
-                            || (x as f32 >= rect.x()
-                                && x as f32 <= rect.x() + rect.width()
-                                && y as f32 >= rect.y()
-                                && y as f32 <= rect.y() + rect.height()))
-                    {
-                        "move"
-                    } else {
-                        region_resize_cursor(rect, x as f32, y as f32)
-                    }
+                    region_resize_cursor(rect, x as f32, y as f32)
                 });
                 this.0.canvas.set_cursor_from_name(Some(cursor));
             }
@@ -7594,49 +7591,18 @@ impl ViewerWindow {
                 if this.0.tool.get() != Tool::Select {
                     return;
                 }
+                if this.annotation_hit_at(x, y) {
+                    return;
+                }
                 if let Some(crop) = this.0.region_selection.get() {
-                    let prepared = this
-                        .0
-                        .selection_foreground_active
-                        .get()
-                        .then(|| {
-                            this.0
-                                .prepared_selection
-                                .borrow()
-                                .clone()
-                                .filter(|prepared| this.prepared_selection_is_current(prepared))
-                        })
-                        .flatten();
-                    let lasso = prepared.as_ref().map(lasso_overlay);
-                    let fully_off_canvas = lasso
-                        .as_ref()
-                        .is_some_and(|lasso| lasso_is_fully_off_canvas(&this.0.canvas, lasso));
-                    let rect = lasso
-                        .as_ref()
-                        .and_then(|lasso| this.0.canvas.lasso_display_bounds(lasso))
-                        .or_else(|| this.0.canvas.crop_display_bounds(crop));
+                    let rect = this.0.canvas.crop_display_bounds(crop);
                     if let Some(rect) = rect {
                         let inside = x as f32 >= rect.x()
                             && x as f32 <= rect.x() + rect.width()
                             && y as f32 >= rect.y()
                             && y as f32 <= rect.y() + rect.height();
-                        if let Some(prepared) =
-                            prepared.as_ref().filter(|_| inside || fully_off_canvas)
-                        {
-                            if !this.rendered_is_current() {
-                                return;
-                            }
-                            gesture.set_state(gtk::EventSequenceState::Claimed);
-                            this.0.region_drag.set(Some(RegionDrag::Moving {
-                                crop,
-                                origin: prepared.origin,
-                                start_screen: (x, y),
-                            }));
-                            return;
-                        }
-                        let active = prepared.is_some();
                         let (left, right, top, bottom) = region_edge_hit(rect, x as f32, y as f32);
-                        if !active && (left || right || top || bottom) {
+                        if left || right || top || bottom {
                             gesture.set_state(gtk::EventSequenceState::Claimed);
                             this.0.region_drag.set(Some(RegionDrag::Resizing {
                                 crop,
@@ -7727,49 +7693,6 @@ impl ViewerWindow {
                         let crop = resize_region(crop, x, y, left, right, top, bottom);
                         this.set_region_selection(Some(crop));
                     }
-                    RegionDrag::Moving {
-                        crop,
-                        origin,
-                        start_screen,
-                    } => {
-                        if !this.rendered_is_current() {
-                            this.restore_rendered_canvas_texture();
-                            return;
-                        }
-                        let Some(start) = this
-                            .0
-                            .canvas
-                            .unclamped_pixel_boundary_at(start_screen.0, start_screen.1)
-                        else {
-                            return;
-                        };
-                        let Some(end) = this
-                            .0
-                            .canvas
-                            .unclamped_pixel_boundary_at(start_screen.0 + dx, start_screen.1 + dy)
-                        else {
-                            return;
-                        };
-                        let target = ForegroundOrigin {
-                            x: origin.x.saturating_add(end.0.saturating_sub(start.0)),
-                            y: origin.y.saturating_add(end.1.saturating_sub(start.1)),
-                        };
-                        this.0.canvas.set_crop_overlay(None);
-                        if let Some(prepared) = this.0.prepared_selection.borrow().as_ref() {
-                            this.0.canvas.set_lasso_overlay(Some(LassoOverlay {
-                                crop,
-                                mask: prepared.mask.clone(),
-                                origin_x: target.x,
-                                origin_y: target.y,
-                            }));
-                            if let Some(current) = this.0.rendered.borrow().as_ref()
-                                && let Ok(image) = prepared.image_at(current, target)
-                                && let Ok(texture) = texture_from_rgba(&image)
-                            {
-                                this.0.canvas.set_texture(Some(&texture));
-                            }
-                        }
-                    }
                 }
             }
         });
@@ -7842,43 +7765,7 @@ impl ViewerWindow {
                             this.start_selection_preparation(crop);
                         }
                     }
-                    RegionDrag::Moving {
-                        crop,
-                        origin,
-                        start_screen,
-                    } => {
-                        if !this.rendered_is_current() {
-                            this.restore_rendered_canvas_texture();
-                            return;
-                        }
-                        let Some(prepared) = this.0.prepared_selection.borrow().clone().filter(|prepared| this.prepared_selection_is_current(prepared)) else { return; };
-                        let Some(start) = this.0.canvas.unclamped_pixel_boundary_at(start_screen.0, start_screen.1) else { return; };
-                        let Some(end) = this.0.canvas.unclamped_pixel_boundary_at(start_screen.0 + dx, start_screen.1 + dy) else { return; };
-                        let target = ForegroundOrigin {
-                            x: origin.x.saturating_add(end.0.saturating_sub(start.0)),
-                            y: origin.y.saturating_add(end.1.saturating_sub(start.1)),
-                        };
-                        if target == origin {
-                            this.0.canvas.set_crop_overlay(None);
-                            this.0.canvas.set_lasso_overlay(Some(lasso_overlay(&prepared)));
-                            this.restore_rendered_canvas_texture();
-                            return;
-                        }
-                        let image = {
-                            let current = this.0.rendered.borrow();
-                            let Some(current) = current.as_ref() else { return; };
-                            let Ok(image) = prepared.image_at(current, target) else { return; };
-                            image
-                        };
-                        let flattened_annotations = this.0.document.borrow().as_ref().map_or_else(Vec::new, |document| document.annotations().into_iter().map(|annotation| annotation.id).collect());
-                        this.apply(Operation::SelectionEdit { pixels: Arc::new(image), flattened_annotations });
-                        let operations: Arc<[Operation]> = this.0.document.borrow().as_ref().map_or_else(|| Arc::from([]), |document| document.operations().into());
-                        this.0.prepared_selection.replace(Some(PreparedSelection { origin: target, operations, ..prepared }));
-                        this.0.selection_foreground_active.set(true);
-                        this.0.region_selection.set(Some(crop));
-                        this.0.canvas.set_crop_overlay(None);
-                        if let Some(prepared) = this.0.prepared_selection.borrow().as_ref() { this.0.canvas.set_lasso_overlay(Some(lasso_overlay(prepared))); }
-                    }
+
                 }
             }
         });
@@ -7892,20 +7779,6 @@ impl ViewerWindow {
                     RegionDrag::Marking(_) => this.set_region_selection(None),
                     RegionDrag::Resizing { crop, .. } => {
                         this.set_region_selection(Some(crop));
-                    }
-                    RegionDrag::Moving { crop, .. } => {
-                        this.0.region_selection.set(Some(crop));
-                        this.0.canvas.set_crop_overlay(None);
-                        if let Some(prepared) = this.0.prepared_selection.borrow().as_ref() {
-                            this.0
-                                .canvas
-                                .set_lasso_overlay(Some(lasso_overlay(prepared)));
-                        }
-                        if let Some(image) = this.0.rendered.borrow().as_ref()
-                            && let Ok(texture) = texture_from_rgba(image)
-                        {
-                            this.0.canvas.set_texture(Some(&texture));
-                        }
                     }
                 }
             }
@@ -8448,6 +8321,49 @@ fn sync_adjustment(source: &gtk::Adjustment, target: &gtk::Adjustment) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copying_a_rotated_image_annotation_keeps_only_its_transformed_pixels() {
+        let source = Arc::new(image::RgbaImage::from_fn(2, 1, |x, _| {
+            image::Rgba(if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            })
+        }));
+        let annotation = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Image {
+                pixels: source,
+                corners: [
+                    Point { x: 4.0, y: 3.0 },
+                    Point { x: 6.0, y: 3.0 },
+                    Point { x: 6.0, y: 4.0 },
+                    Point { x: 4.0, y: 4.0 },
+                ],
+                resampling: Resampling::Nearest,
+            },
+        };
+        let rotated = crate::tools::annotation::edit::rotated(
+            &annotation,
+            std::f32::consts::FRAC_PI_2,
+            false,
+        );
+        let copied = copied_image_annotation(&rotated)
+            .expect("image annotation")
+            .expect("copy render");
+        assert_eq!(copied.dimensions(), (2, 3));
+        assert!(
+            copied
+                .pixels()
+                .any(|pixel| pixel[0] > pixel[2] && pixel[3] > 0)
+        );
+        assert!(
+            copied
+                .pixels()
+                .any(|pixel| pixel[2] > pixel[0] && pixel[3] > 0)
+        );
+    }
 
     struct DeleteFixture {
         _application: adw::Application,
@@ -10274,198 +10190,25 @@ mod tests {
     }
 
     #[test]
-    fn content_aware_moves_reuse_the_clean_scene_and_undo_exactly() {
-        let background = image::RgbaImage::from_fn(9, 3, |x, y| {
-            image::Rgba([20 * x as u8, 30 * y as u8, 80, 255])
-        });
-        let cutout = image::RgbaImage::from_fn(3, 1, |x, _| {
-            image::Rgba(match x {
-                0 => [240, 10, 20, 255],
-                1 => [0; 4],
-                _ => [200, 20, 30, 128],
-            })
-        });
-        let mask = image::GrayImage::from_fn(3, 1, |x, _| image::Luma([[255, 0, 128][x as usize]]));
-        let crop = CropOverlay {
-            x: 1,
-            y: 1,
-            width: 3,
-            height: 1,
-            image_width: 9,
-            image_height: 3,
-        };
-        let mut original = background.clone();
-        crate::tools::selection::paste_cutout_at(&mut original, 1, 1, &cutout, &mask).unwrap();
-        let mut prepared = PreparedSelection {
-            crop,
-            origin: ForegroundOrigin { x: 1, y: 1 },
-            mask: Arc::new(mask),
-            cutout: Arc::new(cutout),
-            background: [0; 4],
-            clean_background: Some(Arc::new(background.clone())),
-            fallback_background: Arc::new(background.clone()),
-            operations: Arc::from([]),
-        };
-        let first = prepared
-            .image_at(&original, ForegroundOrigin { x: 3, y: 1 })
-            .unwrap();
-        assert_eq!(first.get_pixel(1, 1), background.get_pixel(1, 1));
-        assert_eq!(
-            first.get_pixel(4, 1),
-            background.get_pixel(4, 1),
-            "destination hole preserves texture"
-        );
-        prepared.origin = ForegroundOrigin { x: 3, y: 1 };
-        let second = prepared
-            .image_at(&first, ForegroundOrigin { x: 5, y: 1 })
-            .unwrap();
-        assert_eq!(
-            second.get_pixel(3, 1),
-            background.get_pixel(3, 1),
-            "second move restores covered texture"
-        );
-        prepared.origin = ForegroundOrigin { x: 5, y: 1 };
-        let returned = prepared
-            .image_at(&second, ForegroundOrigin { x: 1, y: 1 })
-            .unwrap();
-        assert_eq!(
-            returned, original,
-            "soft edges and overlapping moves cannot accumulate damage"
-        );
-        for origin in [
-            ForegroundOrigin { x: -3, y: 1 },
-            ForegroundOrigin { x: 1, y: -1 },
-            ForegroundOrigin { x: 8, y: 1 },
-            ForegroundOrigin { x: 1, y: 3 },
-            ForegroundOrigin { x: -4, y: -2 },
-        ] {
-            prepared.origin = ForegroundOrigin { x: 1, y: 1 };
-            let moved = prepared.image_at(&original, origin).unwrap();
-            prepared.origin = origin;
-            assert_eq!(
-                prepared
-                    .image_at(&moved, ForegroundOrigin { x: 1, y: 1 })
-                    .unwrap(),
-                original,
-                "moving through off-canvas origin {origin:?} retains the full cutout"
-            );
-        }
-        let mut fallback = prepared.clone();
-        fallback.clean_background = None;
-        fallback.fallback_background = Arc::new(background.clone());
-        fallback.origin = ForegroundOrigin { x: 1, y: 1 };
-        let off_canvas = fallback
-            .image_at(&original, ForegroundOrigin { x: -4, y: -2 })
-            .unwrap();
-        fallback.origin = ForegroundOrigin { x: -4, y: -2 };
-        let second_off_canvas = fallback
-            .image_at(&off_canvas, ForegroundOrigin { x: 8, y: 1 })
-            .unwrap();
-        fallback.origin = ForegroundOrigin { x: 8, y: 1 };
-        assert_eq!(
-            fallback
-                .image_at(&second_off_canvas, ForegroundOrigin { x: 1, y: 1 })
-                .unwrap(),
-            original,
-            "the fallback base also keeps an off-canvas cutout lossless across repeated moves"
-        );
-        let mut document = Document::new(crate::document::ImageSource {
-            pixels: Arc::new(original.clone()),
-            path: None,
-            metadata: crate::document::Metadata::default(),
-        });
-        document.apply(Operation::SelectionEdit {
-            pixels: Arc::new(first.clone()),
-            flattened_annotations: vec![],
-        });
-        document.apply(Operation::SelectionEdit {
-            pixels: Arc::new(second.clone()),
-            flattened_annotations: vec![],
-        });
-        assert!(document.undo());
-        assert_eq!(
-            document
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            first
-        );
-        assert!(document.undo());
-        assert_eq!(
-            document
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            original
-        );
-        assert!(document.redo());
-        assert!(document.redo());
-        assert_eq!(
-            document
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            second
-        );
-    }
-
-    #[test]
     #[ignore = "requires a graphical display"]
-    fn region_drag_activates_small_cached_cutout_moves_twice_and_restores_preview_on_cancel() {
+    fn prepared_cutout_becomes_a_selected_image_with_shared_resize_handles() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik_private.Diorama.SelectionDragRegressionTest")
+            .application_id("io.github.mendrik_private.Diorama.CutoutObjectTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
         let window = ViewerWindow::new(&application, None);
-        let image =
-            image::RgbaImage::from_fn(16, 16, |x, y| image::Rgba([x as u8, y as u8, 20, 255]));
-        let selection = CropOverlay {
-            x: 2,
-            y: 2,
-            width: 2,
-            height: 2,
-            image_width: 16,
-            image_height: 16,
-        };
-        let mut cutout = crate::tools::selection::crop(
-            &image,
-            CropBounds {
-                x: 2,
-                y: 2,
-                width: 2,
-                height: 2,
-            },
-        )
-        .unwrap();
-        let mask = image::GrayImage::from_fn(2, 2, |x, y| {
-            image::Luma([[[255, 0], [128, 255]][y as usize][x as usize]])
-        });
-        crate::tools::selection::apply_alpha_mask(&mut cutout, &mask).unwrap();
-        let mut clean_background = image.clone();
-        crate::tools::selection::clear_masked(
-            &mut clean_background,
-            CropBounds {
-                x: 2,
-                y: 2,
-                width: 2,
-                height: 2,
-            },
-            &mask,
-            [9, 9, 9, 255],
-        )
-        .unwrap();
-        assert_eq!(cutout.get_pixel(0, 0).0, [2, 2, 20, 255]);
+        let source = image::RgbaImage::from_pixel(64, 64, image::Rgba([255; 4]));
         window
             .0
             .document
             .replace(Some(Document::new(crate::document::ImageSource {
-                pixels: Arc::new(image.clone()),
+                pixels: Arc::new(source.clone()),
                 path: None,
                 metadata: crate::document::Metadata::default(),
             })));
-        window.0.rendered.replace(Some(image.clone()));
+        window.0.rendered.replace(Some(source.clone()));
         window
             .0
             .rendered_generation
@@ -10473,260 +10216,68 @@ mod tests {
         window
             .0
             .canvas
-            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+            .set_texture(Some(&texture_from_rgba(&source).unwrap()));
         window.set_tool(Tool::Select);
-        window.set_region_selection(Some(selection));
+        let crop = CropOverlay {
+            x: 10,
+            y: 12,
+            width: 8,
+            height: 6,
+            image_width: 64,
+            image_height: 64,
+        };
+        window.set_region_selection(Some(crop));
+        let pixels = Arc::new(image::RgbaImage::from_pixel(
+            8,
+            6,
+            image::Rgba([220, 10, 20, 128]),
+        ));
+        let background = Arc::new(image::RgbaImage::new(64, 64));
         window.0.prepared_selection.replace(Some(PreparedSelection {
-            crop: selection,
-            origin: ForegroundOrigin {
-                x: i64::from(selection.x),
-                y: i64::from(selection.y),
-            },
-            mask: Arc::new(mask),
-            cutout: Arc::new(cutout),
-            background: [9, 9, 9, 255],
-            clean_background: Some(Arc::new(clean_background.clone())),
-            fallback_background: Arc::new(clean_background.clone()),
+            crop,
+            cutout: pixels.clone(),
+            background: background.clone(),
             operations: Arc::from([]),
         }));
-        window.present();
-        let context = glib::MainContext::default();
-        while context.pending() {
-            context.iteration(false);
-        }
-        let rect = window.0.canvas.crop_display_bounds(selection).unwrap();
-        let x = f64::from(rect.x() + rect.width() / 2.0);
-        let y = f64::from(rect.y() + rect.height() / 2.0);
-        let drags: Vec<_> = (0..window.0.canvas.observe_controllers().n_items())
-            .filter_map(|index| window.0.canvas.observe_controllers().item(index))
-            .filter_map(|controller| controller.downcast::<gtk::GestureDrag>().ok())
-            .collect();
-        // A tiny rectangle is all resize-hit area; identify the region drag by
-        // the state transition its real callback performs, not controller order.
-        let drag = drags
-            .into_iter()
-            .find(|candidate| {
-                candidate.emit_by_name::<()>("drag-begin", &[&x, &y]);
-                candidate.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
-                window.0.selection_foreground_active.get()
-            })
-            .expect("region drag controller");
-        assert!(window.0.selection_foreground_active.get());
-
-        let foreground_rect = || {
-            let prepared = window.0.prepared_selection.borrow();
-            window
-                .0
-                .canvas
-                .lasso_display_bounds(&lasso_overlay(prepared.as_ref().unwrap()))
-                .unwrap()
+        window.activate_prepared_selection();
+        assert!(window.0.region_selection.get().is_none());
+        assert!(window.0.prepared_selection.borrow().is_none());
+        let annotation = window
+            .selected_annotation()
+            .expect("selected cutout object");
+        let Shape::Image {
+            pixels: retained,
+            corners,
+            ..
+        } = &annotation.shape
+        else {
+            panic!("image shape");
         };
-        let move_once = |dx: f64, dy: f64| {
-            let rect = foreground_rect();
-            let lasso = {
-                let prepared = window.0.prepared_selection.borrow();
-                lasso_overlay(prepared.as_ref().unwrap())
-            };
-            let (sx, sy) = if lasso_is_fully_off_canvas(&window.0.canvas, &lasso) {
-                let image_bounds = window
-                    .0
-                    .canvas
-                    .crop_display_bounds(CropOverlay {
-                        x: 0,
-                        y: 0,
-                        width: selection.image_width,
-                        height: selection.image_height,
-                        image_width: selection.image_width,
-                        image_height: selection.image_height,
-                    })
-                    .unwrap();
-                (
-                    f64::from(image_bounds.x() + image_bounds.width() / 2.0),
-                    f64::from(image_bounds.y() + image_bounds.height() / 2.0),
-                )
-            } else {
-                (
-                    f64::from(rect.x() + rect.width() / 2.0),
-                    f64::from(rect.y() + rect.height() / 2.0),
-                )
-            };
-            drag.emit_by_name::<()>("drag-begin", &[&sx, &sy]);
-            drag.emit_by_name::<()>("drag-update", &[&dx, &dy]);
-            drag.emit_by_name::<()>("drag-end", &[&dx, &dy]);
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !window.rendered_is_current() && std::time::Instant::now() < deadline {
-                context.iteration(false);
-            }
-            assert!(window.rendered_is_current());
-        };
-        let screen_delta = f64::from(rect.width()) / f64::from(selection.width) * 3.0;
-        move_once(screen_delta, 0.0);
-        let first_destination = window
-            .0
-            .prepared_selection
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .origin;
-        assert!(
-            first_destination.x > i64::from(selection.x),
-            "drag advances the native selection"
+        assert!(Arc::ptr_eq(retained, &pixels));
+        assert_eq!(corners[0], Point { x: 10.0, y: 12.0 });
+        assert_eq!(corners[2], Point { x: 18.0, y: 18.0 });
+        assert_eq!(crate::tools::annotation::hit::handles(&annotation).len(), 8);
+        let changed = crate::tools::annotation::edit::handle_drag(
+            &annotation,
+            crate::tools::annotation::hit::HandleKind::SouthEast,
+            Point { x: 26.0, y: 24.0 },
+            false,
         );
-        let rendered = window.0.rendered.borrow();
-        let after_first = rendered.as_ref().unwrap();
-        assert_eq!(after_first.get_pixel(2, 2).0, [9, 9, 9, 255]);
+        window.apply(Operation::Annotate(AnnotationEdit::Set(changed.clone())));
+        assert_eq!(window.selected_annotation(), Some(changed));
+        let mut document = window.0.document.borrow_mut();
+        let document = document.as_mut().unwrap();
+        assert!(document.undo());
+        assert_eq!(document.annotations(), vec![annotation]);
+        assert!(document.undo());
+        assert!(document.annotations().is_empty());
         assert_eq!(
-            after_first.get_pixel(3, 2).0,
-            image.get_pixel(3, 2).0,
-            "mask hole remains in the vacated source"
-        );
-        assert_eq!(
-            after_first
-                .get_pixel(first_destination.x as u32, first_destination.y as u32)
-                .0,
-            image.get_pixel(2, 2).0,
-            "foreground reaches destination"
-        );
-        assert_eq!(
-            after_first
-                .get_pixel((first_destination.x + 1) as u32, first_destination.y as u32)
-                .0,
-            image
-                .get_pixel((first_destination.x + 1) as u32, first_destination.y as u32)
-                .0,
-            "mask hole leaves destination untouched"
-        );
-        drop(rendered);
-        move_once(screen_delta, 0.0);
-        assert!(
-            window
-                .0
-                .prepared_selection
-                .borrow()
-                .as_ref()
+            document
+                .render(&CancellationToken::default())
                 .unwrap()
-                .origin
-                .x
-                > first_destination.x,
-            "second drag remains a move"
+                .pixels,
+            source
         );
-        let before_cancel = window.0.rendered.borrow().as_ref().unwrap().clone();
-        assert_eq!(
-            before_cancel.get_pixel(first_destination.x as u32, first_destination.y as u32),
-            clean_background.get_pixel(first_destination.x as u32, first_destination.y as u32),
-            "the next move restores the scene under the previous position"
-        );
-        let rect = foreground_rect();
-        drag.emit_by_name::<()>(
-            "drag-begin",
-            &[&f64::from(rect.x() + 1.0), &f64::from(rect.y() + 1.0)],
-        );
-        drag.emit_by_name::<()>("drag-update", &[&1.0_f64, &0.0_f64]);
-        drag.emit_by_name::<()>("cancel", &[&Option::<gtk::gdk::EventSequence>::None]);
-        assert_eq!(
-            rgba_from_texture(&window.0.canvas.texture().unwrap()),
-            Some(before_cancel)
-        );
-        let history_before_zero = window
-            .0
-            .document
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .operations()
-            .len();
-        let rect = foreground_rect();
-        drag.emit_by_name::<()>(
-            "drag-begin",
-            &[&f64::from(rect.x() + 1.0), &f64::from(rect.y() + 1.0)],
-        );
-        drag.emit_by_name::<()>("drag-end", &[&0.0_f64, &0.0_f64]);
-        assert_eq!(
-            window
-                .0
-                .document
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .operations()
-                .len(),
-            history_before_zero
-        );
-
-        let pixels_per_native = f64::from(rect.width()) / f64::from(selection.width);
-        let move_to = |target: ForegroundOrigin| {
-            let current = window
-                .0
-                .prepared_selection
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .origin;
-            move_once(
-                (target.x - current.x) as f64 * pixels_per_native,
-                (target.y - current.y) as f64 * pixels_per_native,
-            );
-            assert_eq!(
-                window
-                    .0
-                    .prepared_selection
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .origin,
-                target,
-                "gesture stores signed off-canvas origin"
-            );
-        };
-        for target in [
-            ForegroundOrigin { x: -3, y: 2 },
-            ForegroundOrigin { x: 2, y: -3 },
-            ForegroundOrigin { x: 16, y: 2 },
-            ForegroundOrigin { x: 2, y: 16 },
-            ForegroundOrigin { x: -4, y: -4 },
-        ] {
-            move_to(target);
-        }
-        assert_eq!(
-            window.0.rendered.borrow().as_ref().unwrap(),
-            &clean_background,
-            "a fully off-canvas foreground leaves the repaired base unchanged"
-        );
-        move_to(ForegroundOrigin { x: 2, y: 2 });
-        let mut restored = clean_background.clone();
-        {
-            let prepared = window.0.prepared_selection.borrow();
-            let prepared = prepared.as_ref().unwrap();
-            crate::tools::selection::paste_cutout_at(
-                &mut restored,
-                2,
-                2,
-                &prepared.cutout,
-                &prepared.mask,
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            window.0.rendered.borrow().as_ref().unwrap(),
-            &restored,
-            "the complete cutout returns after crossing every edge"
-        );
-
-        let before_delete = window.0.rendered.borrow().as_ref().unwrap().clone();
-        assert!(
-            window.handle_annotation_key(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty())
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !window.rendered_is_current() && std::time::Instant::now() < deadline {
-            context.iteration(false);
-        }
-        assert_ne!(window.0.rendered.borrow().as_ref().unwrap(), &before_delete);
-        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "undo", None);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !window.rendered_is_current() && std::time::Instant::now() < deadline {
-            context.iteration(false);
-        }
-        assert_eq!(window.0.rendered.borrow().as_ref().unwrap(), &before_delete);
     }
 
     #[test]
@@ -10986,129 +10537,84 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
-    fn paste_image_action_composites_alpha_and_keeps_the_clipboard_cutout_movable() {
+    fn pasted_image_is_centered_in_the_panned_zoomed_viewport() {
         adw::init().expect("GTK display initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik_private.Diorama.PasteImageTest")
+            .application_id("io.github.mendrik_private.Diorama.ViewportPasteTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
-        application
-            .register(gio::Cancellable::NONE)
-            .expect("application registration");
+        application.register(gio::Cancellable::NONE).unwrap();
         let window = ViewerWindow::new(&application, None);
-        let background = image::RgbaImage::from_fn(5, 3, |x, y| {
-            image::Rgba([10 + x as u8, 20 + y as u8, 30, 255])
-        });
-        let cutout = image::RgbaImage::from_fn(3, 2, |x, y| {
-            image::Rgba(match (x, y) {
-                (0, 0) => [240, 10, 20, 255],
-                (1, 0) => [1, 2, 3, 0],
-                (2, 0) => [20, 230, 40, 128],
-                (1, 1) => [220, 210, 10, 255],
-                _ => [1, 2, 3, 0],
-            })
-        });
+        window.0.window.set_default_size(820, 620);
+        let image = image::RgbaImage::from_pixel(1600, 1200, image::Rgba([255; 4]));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+        window.0.rendered.replace(Some(image.clone()));
         window
             .0
             .document
             .replace(Some(Document::new(crate::document::ImageSource {
-                pixels: Arc::new(background.clone()),
+                pixels: Arc::new(image),
                 path: None,
                 metadata: crate::document::Metadata::default(),
             })));
-        window.0.rendered.replace(Some(background.clone()));
-        window
-            .0
-            .rendered_generation
-            .set(window.0.render_generation.get());
-        window
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.present();
+        window.0.canvas.set_zoom(2.0);
+        let context = glib::MainContext::default();
+        let settle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::yield_now();
+            }
+        };
+        settle();
+        window.0.scrolled.hadjustment().set_value(1800.0);
+        window.0.scrolled.vadjustment().set_value(1300.0);
+        settle();
+        let viewport = &window.0.canvas_viewport;
+        let visible_center = gtk::graphene::Point::new(
+            viewport.width() as f32 / 2.0,
+            viewport.height() as f32 / 2.0,
+        );
+        let global_center = window
             .0
             .canvas
-            .set_texture(Some(&texture_from_rgba(&background).unwrap()));
-        window.set_tool(Tool::Select);
-        window.set_region_selection(Some(CropOverlay {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            image_width: 5,
-            image_height: 3,
-        }));
-        window.update_action_states();
-        window
+            .widget_point_for_image(Point { x: 800.0, y: 600.0 })
+            .unwrap();
+        let global_center = window
             .0
-            .window
-            .clipboard()
-            .set_texture(&texture_from_rgba(&cutout).unwrap());
-
-        gio::prelude::ActionGroupExt::activate_action(&window.0.window, "paste-image", None);
-        let context = glib::MainContext::default();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while (!window.rendered_is_current() || !window.0.selection_foreground_active.get())
-            && std::time::Instant::now() < deadline
-        {
-            context.iteration(false);
-            std::thread::yield_now();
-        }
-
-        assert!(window.rendered_is_current());
-        assert!(window.0.selection_foreground_active.get());
-        let prepared = window.0.prepared_selection.borrow().clone().unwrap();
-        assert_eq!(prepared.origin, ForegroundOrigin { x: 1, y: 0 });
-        assert_eq!(prepared.mask.dimensions(), cutout.dimensions());
-        assert_eq!(prepared.mask.get_pixel(1, 0)[0], 0, "transparent hole");
-        assert_eq!(prepared.crop.width, 3);
-        assert_eq!(prepared.crop.height, 2);
-        let mut expected = background.clone();
-        crate::tools::selection::paste_cutout_at(&mut expected, 1, 0, &cutout, &prepared.mask)
+            .canvas
+            .compute_point(viewport, &global_center)
             .unwrap();
-        assert_eq!(window.0.rendered.borrow().as_ref(), Some(&expected));
-        assert_eq!(
-            expected.get_pixel(3, 0).0,
-            [16, 125, 35, 255],
-            "a half-alpha clipboard pixel is composited once"
-        );
+        assert!((global_center.x() - visible_center.x()).abs() > 100.0);
 
-        let moved = prepared
-            .image_at(&expected, ForegroundOrigin { x: 2, y: 1 })
-            .unwrap();
-        assert_eq!(
-            moved.get_pixel(1, 0),
-            background.get_pixel(1, 0),
-            "moving restores the previous opaque pasted pixel"
-        );
-        let mut history = window.0.document.borrow().as_ref().unwrap().clone();
-        history.apply(Operation::SelectionEdit {
-            pixels: Arc::new(moved),
-            flattened_annotations: vec![],
-        });
-        assert!(history.undo());
-        assert_eq!(
-            history
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            expected,
-            "undo returns to the pasted position"
-        );
-        assert!(history.undo());
-        assert_eq!(
-            history
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            background,
-            "a second undo removes the pasted image"
-        );
-        assert!(history.redo());
-        assert_eq!(
-            history
-                .render(&CancellationToken::default())
-                .unwrap()
-                .pixels,
-            expected,
-            "redo restores the pasted image"
-        );
+        window.paste_rgba_image(image::RgbaImage::from_pixel(
+            40,
+            30,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        let Shape::Image { corners, .. } = &annotations[0].shape else {
+            panic!("paste must create an image annotation");
+        };
+        let center = Point {
+            x: (corners[0].x + corners[2].x) / 2.0,
+            y: (corners[0].y + corners[2].y) / 2.0,
+        };
+        let center = window.0.canvas.widget_point_for_image(center).unwrap();
+        let center = window.0.canvas.compute_point(viewport, &center).unwrap();
+        let tolerance = window.0.canvas.image_scale() + 0.01;
+        assert!((center.x() - visible_center.x()).abs() < tolerance);
+        assert!((center.y() - visible_center.y()).abs() < tolerance);
+        assert_eq!(corners[2].x - corners[0].x, 40.0);
+        assert_eq!(corners[2].y - corners[0].y, 30.0);
+        window.0.window.close();
     }
 
     #[test]
@@ -11155,7 +10661,23 @@ mod tests {
                 .operations()
                 .is_empty()
         );
-        assert!(!window.0.selection_foreground_active.get());
+        let pasted = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 8, 7, 255]));
+        window.paste_rgba_image(pasted.clone());
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        assert_eq!(annotations.len(), 1);
+        let Shape::Image {
+            pixels,
+            corners,
+            resampling,
+        } = &annotations[0].shape
+        else {
+            panic!("paste must create an editable image annotation");
+        };
+        assert_eq!(pixels.as_ref(), &pasted);
+        assert_eq!(corners[0], Point { x: 0.0, y: 0.0 });
+        assert_eq!(*resampling, window.0.settings.pasted_image_resampling());
+        assert_eq!(window.0.selected_annotation.get(), Some(annotations[0].id));
+        assert!(window.0.region_selection.get().is_none());
         window
             .0
             .render_generation
@@ -11181,98 +10703,6 @@ mod tests {
         assert!(
             !window.clipboard_paste_is_current(window.0.render_generation.get(), &operations),
             "a clipboard callback from an earlier document history must be rejected"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a graphical display"]
-    fn oversized_paste_keeps_its_full_mask_for_lasso_bounds_and_returning_from_an_edge() {
-        adw::init().expect("GTK display initialization");
-        let application = adw::Application::builder()
-            .application_id("io.github.mendrik_private.Diorama.OversizedPasteTest")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        application.register(gio::Cancellable::NONE).unwrap();
-        let window = ViewerWindow::new(&application, None);
-        let background = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
-        let cutout = image::RgbaImage::from_fn(5, 4, |x, y| {
-            image::Rgba([20 + x as u8, 40 + y as u8, 60, 255])
-        });
-        window
-            .0
-            .document
-            .replace(Some(Document::new(crate::document::ImageSource {
-                pixels: Arc::new(background.clone()),
-                path: None,
-                metadata: crate::document::Metadata::default(),
-            })));
-        window.0.rendered.replace(Some(background));
-        window
-            .0
-            .rendered_generation
-            .set(window.0.render_generation.get());
-        window.0.canvas.set_texture(Some(
-            &texture_from_rgba(window.0.rendered.borrow().as_ref().unwrap()).unwrap(),
-        ));
-        window.0.canvas.allocate(300, 200, -1, None);
-        window.paste_rgba_image(cutout.clone());
-
-        let prepared = window.0.prepared_selection.borrow().clone().unwrap();
-        assert_eq!(prepared.origin, ForegroundOrigin { x: -1, y: -1 });
-        assert_eq!(prepared.mask.dimensions(), cutout.dimensions());
-        assert_eq!(prepared.crop.width, 3);
-        assert_eq!(prepared.crop.height, 2);
-        let lasso = window
-            .0
-            .canvas
-            .lasso_display_bounds(&lasso_overlay(&prepared))
-            .unwrap();
-        let image_bounds = window
-            .0
-            .canvas
-            .crop_display_bounds(CropOverlay {
-                x: 0,
-                y: 0,
-                width: 3,
-                height: 2,
-                image_width: 3,
-                image_height: 2,
-            })
-            .unwrap();
-        assert_eq!(lasso.width(), image_bounds.width() * 5.0 / 3.0);
-        assert_eq!(lasso.height(), image_bounds.height() * 4.0 / 2.0);
-
-        let pixels = {
-            let document = window.0.document.borrow();
-            let Operation::SelectionEdit { pixels, .. } =
-                document.as_ref().unwrap().operations().last().unwrap()
-            else {
-                panic!("paste must produce a selection edit");
-            };
-            pixels.clone()
-        };
-        let returned = prepared
-            .image_at(&pixels, ForegroundOrigin { x: 0, y: 0 })
-            .unwrap();
-        assert_eq!(
-            returned.get_pixel(0, 0),
-            cutout.get_pixel(0, 0),
-            "an initially off-canvas source pixel returns intact"
-        );
-    }
-
-    #[test]
-    fn pasted_crop_keeps_in_bounds_provenance_for_an_oversized_cutout() {
-        assert_eq!(
-            pasted_crop((5, 4), (7, 6), ForegroundOrigin { x: -1, y: -1 }),
-            Some(CropOverlay {
-                x: 0,
-                y: 0,
-                width: 5,
-                height: 4,
-                image_width: 5,
-                image_height: 4,
-            })
         );
     }
 

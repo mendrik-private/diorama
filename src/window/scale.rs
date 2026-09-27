@@ -405,11 +405,11 @@ mod tests {
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
             &target_contours
         );
-        assert!(
-            target_contours
-                .pixels()
-                .all(|pixel| pixel.0 == [0, 0, 0, 255] || pixel.0 == [255, 255, 255, 255])
-        );
+        // Contour ink is shaded by strength (0.95..=1 opacity => byte <= 13).
+        assert!(target_contours.pixels().all(|pixel| {
+            let [r, g, b, a] = pixel.0;
+            r == g && g == b && a == 255 && (r <= 13 || r == 255)
+        }));
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
         window.set_scale_original_visible(true);

@@ -126,6 +126,7 @@ pub fn hit_test(
 #[must_use]
 pub fn handles(annotation: &Annotation) -> Vec<(HandleKind, Point)> {
     match &annotation.shape {
+        Shape::Image { corners, .. } => frame_handles(*corners),
         Shape::Pencil {
             geometry: PencilGeometry::Freehand(points),
             ..
@@ -148,32 +149,10 @@ pub fn handles(annotation: &Annotation) -> Vec<(HandleKind, Point)> {
             })
             .collect(),
         Shape::Pencil {
-            geometry: PencilGeometry::RotatedRectangle(points),
+            geometry:
+                PencilGeometry::RotatedRectangle(points) | PencilGeometry::RotatedEllipse(points),
             ..
-        } => {
-            let kinds = [
-                HandleKind::NorthWest,
-                HandleKind::North,
-                HandleKind::NorthEast,
-                HandleKind::East,
-                HandleKind::SouthEast,
-                HandleKind::South,
-                HandleKind::SouthWest,
-                HandleKind::West,
-            ];
-            (0..8)
-                .map(|i| {
-                    (
-                        kinds[i],
-                        if i % 2 == 0 {
-                            points[i / 2]
-                        } else {
-                            points[i / 2].midpoint(points[(i / 2 + 1) % 4])
-                        },
-                    )
-                })
-                .collect()
-        }
+        } => frame_handles(*points),
         Shape::Pencil { geometry, .. } => rectangular_handles(geometry_bounds(geometry)),
         Shape::Highlight { rect, angle, .. } => rotated_rect_handles(*rect, *angle),
         Shape::Arrow {
@@ -304,8 +283,12 @@ fn rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> b
         annotation.shape,
         Shape::Arrow { .. }
             | Shape::Text { .. }
+            | Shape::Image { .. }
             | Shape::Pencil {
-                geometry: PencilGeometry::Rectangle(_) | PencilGeometry::RotatedRectangle(_),
+                geometry: PencilGeometry::Rectangle(_)
+                    | PencilGeometry::RotatedRectangle(_)
+                    | PencilGeometry::Ellipse(_)
+                    | PencilGeometry::RotatedEllipse(_),
                 ..
             }
             | Shape::Highlight { .. }
@@ -329,6 +312,9 @@ fn rotation_ring_hit(annotation: &Annotation, point: Point, tolerance: f32) -> b
 
 fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
     match &annotation.shape {
+        Shape::Image {
+            pixels, corners, ..
+        } => image_body_hit(pixels, *corners, point),
         // Single-click dots paint pixels; their hit tolerance must not capture the next click.
         Shape::Pencil {
             geometry: PencilGeometry::Freehand(points),
@@ -389,6 +375,66 @@ fn body_hit(annotation: &Annotation, point: Point, tolerance: f32) -> bool {
             distance_to_polyline(point, &curve) <= tolerance + *font_size * scale / 2.0
         }
     }
+}
+
+fn frame_handles(points: [Point; 4]) -> Vec<(HandleKind, Point)> {
+    let kinds = [
+        HandleKind::NorthWest,
+        HandleKind::North,
+        HandleKind::NorthEast,
+        HandleKind::East,
+        HandleKind::SouthEast,
+        HandleKind::South,
+        HandleKind::SouthWest,
+        HandleKind::West,
+    ];
+    (0..8)
+        .map(|i| {
+            (
+                kinds[i],
+                if i % 2 == 0 {
+                    points[i / 2]
+                } else {
+                    points[i / 2].midpoint(points[(i / 2 + 1) % 4])
+                },
+            )
+        })
+        .collect()
+}
+
+fn image_body_hit(pixels: &image::RgbaImage, corners: [Point; 4], point: Point) -> bool {
+    if pixels.width() == 0 || pixels.height() == 0 {
+        return false;
+    }
+    let Some((u, v)) = frame_coordinates(corners, point) else {
+        return false;
+    };
+    if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+        return false;
+    }
+    let x = (u * pixels.width() as f32).floor() as u32;
+    let y = (v * pixels.height() as f32).floor() as u32;
+    pixels.get_pixel(x, y)[3] != 0
+}
+
+fn frame_coordinates(corners: [Point; 4], point: Point) -> Option<(f32, f32)> {
+    let u = Point {
+        x: corners[1].x - corners[0].x,
+        y: corners[1].y - corners[0].y,
+    };
+    let v = Point {
+        x: corners[3].x - corners[0].x,
+        y: corners[3].y - corners[0].y,
+    };
+    let determinant = u.x * v.y - u.y * v.x;
+    (determinant.abs() > f32::EPSILON).then(|| {
+        let dx = point.x - corners[0].x;
+        let dy = point.y - corners[0].y;
+        (
+            (dx * v.y - dy * v.x) / determinant,
+            (u.x * dy - u.y * dx) / determinant,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -585,5 +631,79 @@ mod tests {
             }
         }
         assert!(handles(&annotation).is_empty());
+    }
+
+    #[test]
+    fn image_hits_visible_pixels_but_allows_reselecting_through_transparency() {
+        let image = Annotation {
+            id: AnnotationId(1),
+            shape: Shape::Image {
+                pixels: std::sync::Arc::new(image::RgbaImage::from_fn(2, 2, |x, y| {
+                    image::Rgba(if (x, y) == (1, 1) {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    })
+                })),
+                corners: [
+                    Point { x: 10.0, y: 10.0 },
+                    Point { x: 30.0, y: 10.0 },
+                    Point { x: 30.0, y: 30.0 },
+                    Point { x: 10.0, y: 30.0 },
+                ],
+                resampling: crate::document::Resampling::Bicubic,
+            },
+        };
+        let behind = Annotation {
+            id: AnnotationId(2),
+            shape: Shape::Pencil {
+                geometry: PencilGeometry::Line(vec![
+                    Point { x: 12.0, y: 12.0 },
+                    Point { x: 18.0, y: 12.0 },
+                ]),
+                style: StrokeStyle {
+                    color: [0; 4],
+                    width: 2.0,
+                },
+                anti_aliasing: true,
+            },
+        };
+        assert_eq!(
+            hit_test(
+                &[behind.clone(), image.clone()],
+                None,
+                Point { x: 15.0, y: 15.0 },
+                2.0
+            ),
+            Some(Hit {
+                id: behind.id,
+                kind: HitKind::Body,
+            })
+        );
+        assert_eq!(
+            hit_test(
+                &[behind, image.clone()],
+                None,
+                Point { x: 25.0, y: 25.0 },
+                2.0
+            ),
+            Some(Hit {
+                id: image.id,
+                kind: HitKind::Body,
+            })
+        );
+        assert_eq!(handles(&image).len(), 8);
+        assert!(matches!(
+            hit_test(
+                std::slice::from_ref(&image),
+                Some(image.id),
+                Point { x: 10.0, y: 10.0 },
+                2.0,
+            ),
+            Some(Hit {
+                kind: HitKind::Handle(HandleKind::NorthWest),
+                ..
+            })
+        ));
     }
 }

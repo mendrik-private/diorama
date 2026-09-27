@@ -61,15 +61,15 @@ fn harden_opaque_cutout_at_zero_aa(
     cancel.check()
 }
 
-/// Convert the scaler's binary grayscale contour representation into the
-/// opaque black-on-white image used by the inspection preview.
+/// Convert the scaler's strength-weighted grayscale contour representation
+/// into the opaque grayscale-on-white image used by the inspection preview.
 fn contour_mask_to_rgba(mask: &image::GrayImage, cancel: &CancellationToken) -> Result<RgbaImage> {
     let mut image = RgbaImage::new(mask.width(), mask.height());
     for (i, (source, output)) in mask.pixels().zip(image.pixels_mut()).enumerate() {
         if i.is_multiple_of(4096) {
             cancel.check()?;
         }
-        let value = if source[0] == 0 { 0 } else { OPAQUE_ALPHA };
+        let value = source[0];
         output.0 = [value, value, value, OPAQUE_ALPHA];
     }
     cancel.check()?;
@@ -306,9 +306,10 @@ impl Session {
         Ok(built)
     }
 
-    /// Return a binary contour inspection image for the requested preview
-    /// dimensions. Original-size inspection renders the fitted source traces
-    /// only; downscaled inspection uses the cached foreground support path.
+    /// Return a white-background contour inspection image with grayscale
+    /// values weighted by each contour's established opacity. Original-size
+    /// inspection renders the fitted source traces; downscaled inspection uses
+    /// the cached foreground support path.
     pub fn contours(&self, w: u32, h: u32, cancel: &CancellationToken) -> Result<RgbaImage> {
         cancel.check()?;
         self.validate_dimensions(w, h)?;
@@ -469,20 +470,36 @@ mod tests {
         }))
     }
 
-    fn assert_binary_contours(image: &RgbaImage, dimensions: (u32, u32)) {
+    /// Contour pixels use `round(255 * (1 - strength))`: higher strengths are
+    /// darker. Strengths are bounded to 0.95..=1, so contour pixels are at
+    /// most byte 13.
+    fn assert_strength_contours(image: &RgbaImage, dimensions: (u32, u32)) {
+        const WEAKEST_INK: u8 = 13;
         assert_eq!(image.dimensions(), dimensions);
+        assert!(image.pixels().all(|pixel| {
+            let [r, g, b, a] = pixel.0;
+            r == g && g == b && a == 255 && (r <= WEAKEST_INK || r == 255)
+        }));
         assert!(
-            image
-                .pixels()
-                .all(|pixel| { pixel.0 == [0, 0, 0, 255] || pixel.0 == [255, 255, 255, 255] })
-        );
-        assert!(
-            image.pixels().any(|pixel| pixel.0 == [0, 0, 0, 255]),
-            "contour preview must render detected contours as black lines"
+            image.pixels().any(|pixel| pixel[0] <= WEAKEST_INK),
+            "contour preview must render detected contours as dark lines"
         );
         assert!(
             image.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]),
             "contour preview must retain a white background"
+        );
+    }
+
+    #[test]
+    fn contour_mask_conversion_preserves_intermediate_grayscale_bytes() {
+        let mask = image::GrayImage::from_raw(4, 1, vec![0, 13, 128, 255]).unwrap();
+        let converted = contour_mask_to_rgba(&mask, &CancellationToken::default()).unwrap();
+
+        assert_eq!(
+            converted.as_raw(),
+            &[
+                0, 0, 0, 255, 13, 13, 13, 255, 128, 128, 128, 255, 255, 255, 255, 255
+            ]
         );
     }
 
@@ -536,7 +553,7 @@ mod tests {
         let cancel = CancellationToken::default();
 
         let original = session.contours(64, 64, &cancel).unwrap();
-        assert_binary_contours(&original, (64, 64));
+        assert_strength_contours(&original, (64, 64));
         let polished_source_mask = session
             .scaler
             .polished_contour_mask(64, 64, &|| cancel.check().is_err())
@@ -556,7 +573,7 @@ mod tests {
         );
 
         let target = session.contours(32, 32, &cancel).unwrap();
-        assert_binary_contours(&target, (32, 32));
+        assert_strength_contours(&target, (32, 32));
         let foreground = session.foreground(&cancel).unwrap();
         let target_mask = session
             .scaler
@@ -626,7 +643,7 @@ mod tests {
             "a cancelled contour foreground must not be cached"
         );
         let retry = CancellationToken::default();
-        assert_binary_contours(&session.contours(32, 32, &retry).unwrap(), (32, 32));
+        assert_strength_contours(&session.contours(32, 32, &retry).unwrap(), (32, 32));
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
