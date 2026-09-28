@@ -195,6 +195,37 @@ impl Silhouette {
             .collect()
     }
 
+    /// Replace a reduced fill's alpha with this support's target coverage at
+    /// `aa` times the source's intrinsic alpha. Pixels that end up without
+    /// alpha become fully transparent.
+    pub fn target_alpha(
+        &self,
+        base: LinearImage,
+        fill_source: &LinearImage,
+        aa: GameAssetAa,
+        cancel: &dyn Cancellation,
+    ) -> Result<LinearImage> {
+        let (w, h) = (base.w, base.h);
+        let source_coverage = self.coverage(w, h, cancel)?;
+        let coverage = self.target_coverage(&source_coverage, aa, cancel)?;
+        let opacity = self.intrinsic_opacity(fill_source, &source_coverage, w, h, cancel)?;
+        let mut pixels = Vec::with_capacity(base.pixels.len());
+        for (i, ((pixel, support), intrinsic)) in
+            base.pixels.iter().zip(coverage).zip(opacity).enumerate()
+        {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            let alpha = (intrinsic * support).clamp(0., 1.);
+            pixels.push(if alpha <= 1e-8 {
+                [0.; 4]
+            } else {
+                [pixel[0], pixel[1], pixel[2], alpha]
+            });
+        }
+        Ok(LinearImage { w, h, pixels })
+    }
+
     /// Source alpha projected independently of repair.  Repairing an outer
     /// ink path against a transparent exterior must not turn an originally
     /// opaque object translucent.

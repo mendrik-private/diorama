@@ -3,8 +3,57 @@ use crate::{Cancellation, Result};
 use image::RgbaImage;
 use std::collections::HashMap;
 
-pub type Sample = [f64; 8];
+/// Detector records retain the original ridge score for fitting plus a
+/// separate colour-edge prominence. Keeping those signals distinct matters:
+/// a ridge can be accurately localised in a dark material even when only one
+/// shoulder has a large colour transition.
+pub type Sample = [f64; 9];
 pub type Model = [f64; 10];
+
+fn colour_sobel(image: &RgbaImage, x: isize, y: isize) -> f64 {
+    let sample = |x: isize, y: isize| {
+        if x < 0 || y < 0 || x >= image.width() as isize || y >= image.height() as isize {
+            return [1.; 3];
+        }
+        let pixel = image.get_pixel(x as u32, y as u32).0;
+        let alpha = pixel[3] as f64 / 255.;
+        std::array::from_fn(|c| pixel[c] as f64 / 255. * alpha + 1. - alpha)
+    };
+    let mut sx = [0.; 3];
+    let mut sy = [0.; 3];
+    for (dy, row_weight) in [(-1, 1.), (0, 2.), (1, 1.)] {
+        for (dx, column_weight) in [-1, 0, 1].into_iter().zip([-1., 0., 1.]) {
+            let colour = sample(x + dx, y + dy);
+            for c in 0..3 {
+                sx[c] += row_weight * column_weight * colour[c];
+            }
+        }
+    }
+    for (dy, row_weight) in [-1, 0, 1].into_iter().zip([-1., 0., 1.]) {
+        for (dx, column_weight) in [-1, 0, 1].into_iter().zip([1., 2., 1.]) {
+            let colour = sample(x + dx, y + dy);
+            for c in 0..3 {
+                sy[c] += row_weight * column_weight * colour[c];
+            }
+        }
+    }
+    (sx.into_iter().map(|v| v * v).sum::<f64>() + sy.into_iter().map(|v| v * v).sum::<f64>()).sqrt()
+        / 5.657
+}
+
+/// A bounded Sobel-style colour edge measurement around a ridge. A symmetric
+/// dark stroke has almost no gradient at its centre, so inspect both nearby
+/// shoulders instead of mistaking it for texture.
+fn colour_prominence(image: &RgbaImage, x: f64, y: f64, nx: f64, ny: f64) -> f64 {
+    (-2..=2)
+        .map(|step| {
+            let x = (x + step as f64 * nx).round() as isize;
+            let y = (y + step as f64 * ny).round() as isize;
+            colour_sobel(image, x, y)
+        })
+        .fold(0., f64::max)
+        .clamp(0., 1.)
+}
 
 pub fn detect(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Vec<Sample>> {
     let (w, h) = (image.width() as usize, image.height() as usize);
@@ -73,7 +122,10 @@ pub fn detect(image: &RgbaImage, cancel: &dyn Cancellation) -> Result<Vec<Sample
                                 limit_bytes: super::DEFAULT_MEMORY_LIMIT,
                             });
                         }
-                        records.push([px, py, nx, ny, score, contrast, center, sigma]);
+                        let prominence = (0.62 * colour_prominence(image, px, py, nx, ny)
+                            + 0.38 * (strongside / 0.8).clamp(0., 1.))
+                            * (0.55 + 0.45 * (1. - center).sqrt());
+                        records.push([px, py, nx, ny, score, contrast, center, sigma, prominence]);
                     }
                 }
             }

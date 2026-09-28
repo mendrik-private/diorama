@@ -10,6 +10,6 @@ pub use annotation::{
 use history::History;
 pub use model::{CancellationToken, Document, ImageSource, Metadata, RenderedImage};
 pub use operation::{
-    BrushPoint, GameAssetAa, GameAssetOptions, Operation, ProtectedColor, Resampling, Rotation,
-    Stroke, StrokePath,
+    BrushPoint, GameAssetOptions, Operation, ProtectedColor, Resampling, Rotation, Stroke,
+    StrokePath,
 };

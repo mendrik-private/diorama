@@ -74,12 +74,31 @@ mod tests {
         Ok(image.clone())
     }
 
+    fn fixture_line_art(
+        image: &image::RgbaImage,
+        cancel: &CancellationToken,
+    ) -> crate::error::Result<image::GrayImage> {
+        let mut line_art = image::GrayImage::new(image.width(), image.height());
+        for (index, (source, output)) in image.pixels().zip(line_art.pixels_mut()).enumerate() {
+            if index.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            output[0] = if source[0].max(source[1]).max(source[2]) < 48 {
+                0
+            } else {
+                255
+            };
+        }
+        cancel.check()?;
+        Ok(line_art)
+    }
+
     #[test]
     #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
-    fn game_asset_aa_control_updates_preview_and_committed_operation() {
+    fn game_asset_strength_control_updates_preview_and_committed_operation() {
         adw::init().expect("GTK initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik_private.Diorama.ScaleAaTest")
+            .application_id("io.github.mendrik_private.Diorama.ScaleStrengthTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -108,42 +127,36 @@ mod tests {
         window.0.content_stack.set_visible_child_name("viewer");
         window.update_action_states();
         let remove_background = Arc::new(identity_background_remover);
-        let session = Arc::new(
-            crate::tools::scale::game_asset::Session::with_test_background_remover(
-                source.clone(),
-                remove_background,
-            ),
-        );
+        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
+            source.clone(),
+            remove_background,
+            Arc::new(fixture_line_art),
+        ));
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(0);
-        assert!(!window.0.scale_aa_controls.get_visible());
+        assert!(!window.0.scale_strength_controls.get_visible());
         window.0.scale_method.set_selected(2);
-        assert!(window.0.scale_aa_controls.get_visible());
-        let top_row = window.0.scale_aa_controls.parent().unwrap();
+        assert!(window.0.scale_strength_controls.get_visible());
+        let top_row = window.0.scale_strength_controls.parent().unwrap();
         assert_eq!(
             top_row.parent().unwrap().first_child(),
             Some(top_row.clone())
         );
         assert_eq!(
             top_row.last_child(),
-            Some(window.0.scale_aa_controls.clone().upcast())
+            Some(window.0.scale_strength_controls.clone().upcast())
         );
-        let mut child = window.0.scale_aa_controls.first_child();
+        let mut child = window.0.scale_strength_controls.first_child();
         while let Some(widget) = child {
-            assert!(!widget.is::<gtk::Scale>(), "AA has no slider");
+            assert!(!widget.is::<gtk::Scale>(), "Strength has no slider");
             child = widget.next_sibling();
         }
-        assert_eq!(window.0.scale_aa.value(), 50.);
-        assert_eq!(window.0.scale_aa.adjustment().lower(), 0.);
-        assert_eq!(window.0.scale_aa.adjustment().upper(), 100.);
-        assert_eq!(window.0.scale_contour_opacity.value(), 100.);
-        assert_eq!(window.0.scale_contour_opacity.adjustment().lower(), 0.);
-        assert_eq!(window.0.scale_contour_opacity.adjustment().upper(), 100.);
+        assert_eq!(window.0.scale_strength.value(), 40.);
+        assert_eq!(window.0.scale_strength.adjustment().lower(), 0.);
+        assert_eq!(window.0.scale_strength.adjustment().upper(), 100.);
         assert_eq!(
-            window.0.scale_contour_opacity.tooltip_text().as_deref(),
-            Some(
-                "Contour opacity: 0% adds no contours; 100% draws full contours over the existing fill"
-            )
+            window.0.scale_strength.tooltip_text().as_deref(),
+            Some("Line-art sharpening: 0% applies a light unsharp mask; 100% the strongest")
         );
         window.0.scale_game_asset.replace(Some(session.clone()));
         window.0.scale_width.set_value(32.);
@@ -160,29 +173,10 @@ mod tests {
         wait_for_preview();
         let preserved_zoom = 1.375;
         window.set_scale_preview_zoom(preserved_zoom);
-        for percent in [0, 100, 50] {
-            window.0.scale_aa.set_value(f64::from(percent));
-            assert_eq!(window.0.scale_aa.value(), f64::from(percent));
-            let options = GameAssetOptions::new(GameAssetAa::new(percent), 100);
-            assert_eq!(
-                window.0.scale_resampling.get(),
-                Resampling::GameAsset(options)
-            );
-            wait_for_preview();
-            assert_eq!(window.0.settings.game_asset_options(), options);
-            let expected = session
-                .resize(32, 27, options, &CancellationToken::default())
-                .unwrap();
-            assert_eq!(
-                window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
-                &expected
-            );
-            assert_eq!(window.0.canvas.zoom(), preserved_zoom);
-        }
-        for percent in [0, 50, 100] {
-            window.0.scale_contour_opacity.set_value(f64::from(percent));
-            assert_eq!(window.0.scale_contour_opacity.value(), f64::from(percent));
-            let options = GameAssetOptions::new(GameAssetAa::new(50), percent);
+        for percent in [0, 100, 40] {
+            window.0.scale_strength.set_value(f64::from(percent));
+            assert_eq!(window.0.scale_strength.value(), f64::from(percent));
+            let options = GameAssetOptions::new(percent);
             assert_eq!(
                 window.0.scale_resampling.get(),
                 Resampling::GameAsset(options)
@@ -200,16 +194,14 @@ mod tests {
         }
         // Switching methods hides the paired controls without forgetting them
         // or contaminating another method. Rapid changes publish only the latest value.
-        window.0.scale_aa.set_value(75.);
-        window.0.scale_contour_opacity.set_value(40.);
+        window.0.scale_strength.set_value(75.);
         for method in [0, 1, 3] {
             window.0.scale_method.set_selected(method);
-            assert!(!window.0.scale_aa_controls.get_visible());
+            assert!(!window.0.scale_strength_controls.get_visible());
         }
         window.0.scale_method.set_selected(2);
-        assert_eq!(window.0.scale_aa.value(), 75.);
-        assert_eq!(window.0.scale_contour_opacity.value(), 40.);
-        window.0.scale_aa.set_value(0.);
+        assert_eq!(window.0.scale_strength.value(), 75.);
+        window.0.scale_strength.set_value(0.);
         let obsolete = window
             .0
             .scale_preview_cancellation
@@ -217,14 +209,14 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
-        window.0.scale_aa.set_value(100.);
+        window.0.scale_strength.set_value(100.);
         assert!(obsolete.check().is_err());
         wait_for_preview();
         let expected = session
             .resize(
                 32,
                 27,
-                GameAssetOptions::new(GameAssetAa::new(100), 40),
+                GameAssetOptions::new(100),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -234,12 +226,12 @@ mod tests {
         );
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
 
-        window.0.scale_contour_opacity.grab_focus();
+        window.0.scale_strength.grab_focus();
         while context.pending() {
             context.iteration(false);
         }
         assert!(application.accels_for_action("win.zoom-100").is_empty());
-        let controllers = window.0.scale_contour_opacity.observe_controllers();
+        let controllers = window.0.scale_strength.observe_controllers();
         assert!(
             (0..controllers.n_items())
                 .filter_map(|i| controllers.item(i))
@@ -269,14 +261,14 @@ mod tests {
             .0;
         assert!(
             minimum <= 1000,
-            "paired Game Asset spins stay usable at 1000px"
+            "the Game Asset strength spin stays usable at 1000px"
         );
         for width in [minimum, minimum.max(700), 1000] {
             window.0.canvas_overlay.allocate(width, 600, -1, None);
-            let row = &window.0.scale_aa_controls;
+            let row = &window.0.scale_strength_controls;
             assert!(
                 row.width() > 0 && row.width() <= width - 52,
-                "requested overlay {width}, actual {}, AA row {}, controls {}, minimum {:?}",
+                "requested overlay {width}, actual {}, strength row {}, controls {}, minimum {:?}",
                 window.0.canvas_overlay.width(),
                 row.width(),
                 window.0.scale_controls.width(),
@@ -285,19 +277,17 @@ mod tests {
                     .scale_controls
                     .measure(gtk::Orientation::Horizontal, -1)
             );
-            let bounds = window.0.scale_aa.compute_bounds(row).unwrap();
-            assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
-            let bounds = window.0.scale_contour_opacity.compute_bounds(row).unwrap();
+            let bounds = window.0.scale_strength.compute_bounds(row).unwrap();
             assert!(bounds.x() >= 0. && bounds.x() + bounds.width() <= row.width() as f32);
             let bounds = row.compute_bounds(&top_row).unwrap();
-            assert_eq!(bounds.y(), 0., "AA stays on the first row");
+            assert_eq!(bounds.y(), 0., "Strength stays on the first row");
             assert_eq!(
                 bounds.x() + bounds.width(),
                 top_row.width() as f32,
-                "AA stays at the right"
+                "Strength stays at the right"
             );
         }
-        if let Ok(path) = std::env::var("DIORAMA_AA_UI_CAPTURE") {
+        if let Ok(path) = std::env::var("DIORAMA_STRENGTH_UI_CAPTURE") {
             let paintable = gtk::WidgetPaintable::new(Some(&window.0.window));
             window.0.window.queue_resize();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -330,9 +320,7 @@ mod tests {
             &[Operation::Scale {
                 width: 32,
                 height: 27,
-                resampling: Resampling::GameAsset(
-                    GameAssetOptions::new(GameAssetAa::new(100), 40,)
-                )
+                resampling: Resampling::GameAsset(GameAssetOptions::new(100))
             }]
         );
         window.0.window.close();
@@ -340,10 +328,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
-    fn game_asset_contour_toggle_uses_the_preview_worker_without_committing_the_mask() {
+    fn game_asset_line_art_toggle_uses_the_preview_worker_without_committing_it() {
         adw::init().expect("GTK initialization");
         let application = adw::Application::builder()
-            .application_id("io.github.mendrik_private.Diorama.ContourPreviewTest")
+            .application_id("io.github.mendrik_private.Diorama.LineArtPreviewTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(gio::Cancellable::NONE).unwrap();
@@ -370,12 +358,11 @@ mod tests {
         window.0.rendered.replace(Some((*source).clone()));
         window.0.content_stack.set_visible_child_name("viewer");
         window.update_action_states();
-        let session = Arc::new(
-            crate::tools::scale::game_asset::Session::with_test_background_remover(
-                source.clone(),
-                Arc::new(identity_background_remover),
-            ),
-        );
+        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
+            source.clone(),
+            Arc::new(identity_background_remover),
+            Arc::new(fixture_line_art),
+        ));
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(2);
         window.0.scale_game_asset.replace(Some(session.clone()));
@@ -392,25 +379,56 @@ mod tests {
             assert!(!window.0.scale_spinner.get_visible(), "preview completed");
         };
         wait_for_preview();
-        assert!(window.0.scale_show_contours.get_visible());
+        assert!(window.0.scale_show_line_art.get_visible());
         let preserved_zoom = 1.375;
         window.set_scale_preview_zoom(preserved_zoom);
 
-        window.0.scale_show_contours.set_active(true);
+        window.0.scale_show_line_art.set_active(true);
         wait_for_preview();
-        let target_contours = session
-            .contours(32, 27, &CancellationToken::default())
+        let target_line_art = session
+            .line_art(
+                32,
+                27,
+                GameAssetOptions::default(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert_eq!(
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
-            &target_contours
+            &target_line_art
         );
-        // Contour ink is shaded by strength (0.95..=1 opacity => byte <= 13).
-        assert!(target_contours.pixels().all(|pixel| {
+        assert!(target_line_art.pixels().all(|pixel| {
             let [r, g, b, a] = pixel.0;
-            r == g && g == b && a == 255 && (r <= 13 || r == 255)
+            r == g && g == b && a == 255
         }));
+        assert!(
+            target_line_art.pixels().any(|pixel| pixel[0] < 255),
+            "line-art preview includes ink"
+        );
+        assert!(
+            target_line_art
+                .pixels()
+                .any(|pixel| pixel.0 == [255, 255, 255, 255]),
+            "line-art preview retains its white background"
+        );
         assert_eq!(window.0.canvas.zoom(), preserved_zoom);
+
+        // The strength control re-renders the sharpened line-art preview.
+        window.0.scale_strength.set_value(100.);
+        wait_for_preview();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            &session
+                .line_art(
+                    32,
+                    27,
+                    GameAssetOptions::new(100),
+                    &CancellationToken::default()
+                )
+                .unwrap()
+        );
+        window.0.scale_strength.set_value(40.);
+        wait_for_preview();
 
         window.set_scale_original_visible(true);
         assert_eq!(
@@ -429,29 +447,34 @@ mod tests {
             (32, 27)
         );
 
-        // A source-sized contour is diagnostic work too, instead of the
+        // Source-sized line art is diagnostic work too, instead of the
         // normal immediate source preview shortcut.
         window.0.scale_width.set_value(96.);
         wait_for_preview();
-        let source_contours = session
-            .contours(96, 80, &CancellationToken::default())
+        let source_line_art = session
+            .line_art(
+                96,
+                80,
+                GameAssetOptions::default(),
+                &CancellationToken::default(),
+            )
             .unwrap();
         assert_eq!(
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
-            &source_contours
+            &source_line_art
         );
-        window.0.scale_show_contours.set_active(false);
+        window.0.scale_show_line_art.set_active(false);
         assert_eq!(
             window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
             source.as_ref()
         );
 
-        window.0.scale_show_contours.set_active(true);
+        window.0.scale_show_line_art.set_active(true);
         window.0.scale_method.set_selected(0);
-        assert!(!window.0.scale_show_contours.get_visible());
-        assert!(!window.0.scale_show_contours.is_active());
+        assert!(!window.0.scale_show_line_art.get_visible());
+        assert!(!window.0.scale_show_line_art.is_active());
         window.0.scale_method.set_selected(2);
-        assert!(window.0.scale_show_contours.get_visible());
+        assert!(window.0.scale_show_line_art.get_visible());
         window.0.scale_width.set_value(32.);
         wait_for_preview();
 
@@ -460,26 +483,26 @@ mod tests {
             .scale_controls
             .measure(gtk::Orientation::Horizontal, -1)
             .0;
-        assert!(minimum <= 1000, "contour toggle remains usable at 1000px");
+        assert!(minimum <= 1000, "line-art toggle remains usable at 1000px");
         for width in [minimum, minimum.max(700), 1000] {
             window.0.canvas_overlay.allocate(width, 600, -1, None);
-            let slider_row = window.0.scale_show_contours.parent().unwrap();
+            let slider_row = window.0.scale_show_line_art.parent().unwrap();
             let bounds = window
                 .0
-                .scale_show_contours
+                .scale_show_line_art
                 .compute_bounds(&slider_row)
                 .unwrap();
             assert!(
                 bounds.x() >= 0. && bounds.x() + bounds.width() <= slider_row.width() as f32,
-                "contour toggle stays within the slider row at {width}px"
+                "line-art toggle stays within the slider row at {width}px"
             );
         }
 
-        window.0.scale_show_contours.set_active(true);
+        window.0.scale_show_line_art.set_active(true);
         wait_for_preview();
         let resampling = window.0.scale_resampling.get();
         window.confirm_scale_preview();
-        assert!(!window.0.scale_show_contours.is_active());
+        assert!(!window.0.scale_show_line_art.is_active());
         assert_eq!(
             window.0.document.borrow().as_ref().unwrap().operations(),
             &[Operation::Scale {

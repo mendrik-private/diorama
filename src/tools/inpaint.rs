@@ -1,22 +1,22 @@
 //! Local, cancellable LaMa inference for a selection's reusable clean background.
 use std::{
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Mutex, TryLockError},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
+    time::Duration,
 };
 
 use image::{GrayImage, Luma, RgbaImage};
 
 use crate::document::CancellationToken;
 use crate::error::{AppError, Result};
-use crate::tools::{crop::CropBounds, python_runtime, selection};
+use crate::tools::{
+    crop::CropBounds,
+    python_runtime, selection,
+    worker_process::{self, Launch, RuntimeConfiguration},
+};
 
 const WORKER: &str = include_str!("lama_worker.py");
-static INFERENCE: Mutex<()> = Mutex::new(());
 
 struct Runtime {
     python: PathBuf,
@@ -31,9 +31,14 @@ struct Runtime {
 
 impl Runtime {
     fn from_environment() -> Result<Self> {
-        let launch = launch_mode_from(Path::new("/.flatpak-info"));
+        let launch = Launch::detect();
         let cache = cache_directory()?;
-        let configuration = runtime_configuration(&launch);
+        let configuration = RuntimeConfiguration::read(
+            std::env::var_os("DIORAMA_LAMA_RUNTIME_CONFIG")
+                .map(PathBuf::from)
+                .or_else(|| launch.runtime_config_path("lama-runtime.conf"))
+                .as_deref(),
+        );
         let explicit_python = std::env::var_os("DIORAMA_LAMA_PYTHON").map(PathBuf::from);
         let (python, bundled) = python_selection(
             explicit_python,
@@ -69,27 +74,8 @@ fn python_selection(
     (configured.unwrap_or_else(|| "python3".into()), false)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Launch {
-    Direct,
-    FlatpakHost { launcher: PathBuf },
-}
-
-fn launch_mode_from(flatpak_info: &Path) -> Launch {
-    if flatpak_info.is_file() {
-        Launch::FlatpakHost {
-            launcher: PathBuf::from("flatpak-spawn"),
-        }
-    } else {
-        Launch::Direct
-    }
-}
-
 fn cache_directory() -> Result<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    worker_process::cache_home()
         .ok_or_else(|| AppError::Inpainting("HOME is unavailable; configure local LaMa".into()))
 }
 
@@ -97,70 +83,16 @@ fn cache_directory() -> Result<PathBuf> {
 /// up by the host command. The latter avoids a second 205 MB download in a
 /// Flatpak whose cache directory is intentionally app-scoped.
 fn default_model_path(cache: &Path) -> PathBuf {
-    let host_cache = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".cache"));
-    default_model_path_with_host_cache(cache, host_cache.as_deref())
+    default_model_path_with_host_cache(cache, worker_process::host_cache_home().as_deref())
 }
 
 fn default_model_path_with_host_cache(cache: &Path, host_cache: Option<&Path>) -> PathBuf {
-    let app_model = cache.join("diorama/big-lama.pt");
-    if app_model.is_file() {
-        return app_model;
-    }
-    host_cache
-        .map(|cache| cache.join("diorama/big-lama.pt"))
-        .filter(|model| model.is_file())
-        .unwrap_or(app_model)
-}
-
-#[derive(Default)]
-struct RuntimeConfiguration {
-    python: Option<PathBuf>,
-    library_path: Option<String>,
-}
-
-fn runtime_configuration(launch: &Launch) -> RuntimeConfiguration {
-    let config = std::env::var_os("DIORAMA_LAMA_RUNTIME_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| default_runtime_config_path(launch));
-    config
-        .and_then(|config| fs::read_to_string(config).ok())
-        .map(|contents| runtime_configuration_from_contents(&contents))
-        .unwrap_or_default()
-}
-
-fn runtime_configuration_from_contents(contents: &str) -> RuntimeConfiguration {
-    let mut configuration = RuntimeConfiguration::default();
-    for line in contents.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "python" => configuration.python = Some(PathBuf::from(value)),
-            "library_path" => configuration.library_path = Some(value.to_owned()),
-            _ => {}
-        }
-    }
-    configuration
-}
-
-fn default_runtime_config_path(launch: &Launch) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(match launch {
-        // setup-lama.py is normally run on the host, so use the host's config
-        // location rather than Flatpak's app-scoped XDG_CONFIG_HOME.
-        Launch::FlatpakHost { .. } => home.join(".config/diorama/lama-runtime.conf"),
-        Launch::Direct => std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"))
-            .join("diorama/lama-runtime.conf"),
-    })
+    worker_process::app_or_host_install(
+        cache,
+        host_cache,
+        Path::new("diorama/big-lama.pt"),
+        Path::is_file,
+    )
 }
 
 pub fn clean_background(
@@ -275,22 +207,7 @@ fn run_lama(
     runtime: &Runtime,
 ) -> Result<RgbaImage> {
     // Bound concurrent model memory even when several windows prepare cutouts.
-    let waiting = Instant::now();
-    let _permit = loop {
-        cancellation.check()?;
-        match INFERENCE.try_lock() {
-            Ok(permit) => break permit,
-            Err(TryLockError::Poisoned(error)) => break error.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                if waiting.elapsed() >= runtime.timeout {
-                    return Err(AppError::Inpainting(
-                        "Timed out waiting for local LaMa".into(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    };
+    let _permit = worker_process::inference_permit(cancellation)?;
     if !runtime.model.is_file() {
         return Err(AppError::Inpainting(
             "LaMa model is missing. Run python3 build-aux/setup-lama.py or set DIORAMA_LAMA_MODEL"
@@ -315,45 +232,24 @@ fn run_lama(
     let log = directory.path().join("lama.log");
     image.save(&input)?;
     mask.save(&matte)?;
-    let log_file = File::create(&log)?;
     cancellation.check()?;
-    let mut child = lama_command(runtime, bundled.as_ref(), &input, &matte, &output)
-        .stdin(Stdio::null())
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .spawn()
-        .map_err(|error| {
-            AppError::Inpainting(format!("Could not start local LaMa worker: {error}"))
-        })?;
-    let started = Instant::now();
-    let status = loop {
-        if let Err(error) = cancellation.check() {
-            kill_and_reap(&mut child);
-            return Err(error);
-        }
-        if started.elapsed() >= runtime.timeout {
-            kill_and_reap(&mut child);
-            return Err(AppError::Inpainting("Local LaMa timed out".into()));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                kill_and_reap(&mut child);
-                return Err(error.into());
-            }
-        }
-    };
+    let mut child = worker_process::spawn_logged(
+        &mut lama_command(runtime, bundled.as_ref(), &input, &matte, &output),
+        &log,
+    )
+    .map_err(|error| AppError::Inpainting(format!("Could not start local LaMa worker: {error}")))?;
+    let status = worker_process::wait(
+        &mut child,
+        cancellation,
+        runtime.timeout,
+        Duration::from_millis(20),
+    )
+    .map_err(|error| error.into_app_error(AppError::Inpainting("Local LaMa timed out".into())))?;
     cancellation.check()?;
     if !status.success() {
-        let mut log = File::open(log)?;
-        let length = log.metadata()?.len();
-        log.seek(SeekFrom::Start(length.saturating_sub(4096)))?;
-        let mut tail = Vec::new();
-        log.take(4096).read_to_end(&mut tail)?;
         return Err(AppError::Inpainting(format!(
             "Local LaMa failed: {}",
-            String::from_utf8_lossy(&tail).trim()
+            worker_process::log_tail(&log)
         )));
     }
     let repaired = image::open(output)?.into_rgba8();
@@ -386,25 +282,10 @@ fn lama_command(
                 .arg(&bundled.worker);
             command
         }
-        None => match &runtime.launch {
-            Launch::Direct => Command::new(&runtime.python),
-            Launch::FlatpakHost { launcher } => {
-                let mut command = Command::new(launcher);
-                command.args([
-                    "--host",
-                    "--watch-bus",
-                    "--unset-env=LD_LIBRARY_PATH",
-                    "--unset-env=LD_PRELOAD",
-                ]);
-                if let Some(library_path) = &runtime.host_library_path {
-                    // Restore only the host loader path verified by setup-lama.py,
-                    // after stripping the sandbox's loader environment.
-                    command.arg(format!("--env=LD_LIBRARY_PATH={library_path}"));
-                }
-                command.arg(&runtime.python);
-                command
-            }
-        },
+        // Restore only the host loader path verified by setup-lama.py.
+        None => runtime
+            .launch
+            .command(&runtime.python, runtime.host_library_path.as_deref()),
     };
     if bundled.is_none() {
         command.arg("-c").arg(WORKER);
@@ -423,15 +304,11 @@ fn lama_command(
     command
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
+    use std::{thread, time::Instant};
 
     fn bounds() -> CropBounds {
         CropBounds {
@@ -448,10 +325,8 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_runtime(root: &std::path::Path, body: &str) -> Runtime {
-        use std::os::unix::fs::PermissionsExt;
         let python = root.join("python");
-        std::fs::write(&python, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        worker_process::write_test_executable(&python, &format!("#!/bin/sh\n{body}\n"));
         let model = root.join("model.pt");
         std::fs::write(&model, b"fake-model").unwrap();
         Runtime {
@@ -464,20 +339,6 @@ mod tests {
             host_library_path: None,
             bundled: false,
         }
-    }
-
-    #[test]
-    fn launch_mode_detects_flatpak_explicitly() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("flatpak-info");
-        assert_eq!(launch_mode_from(&marker), Launch::Direct);
-        std::fs::write(&marker, "[Instance]\n").unwrap();
-        assert_eq!(
-            launch_mode_from(&marker),
-            Launch::FlatpakHost {
-                launcher: PathBuf::from("flatpak-spawn"),
-            }
-        );
     }
 
     #[test]
@@ -502,21 +363,6 @@ mod tests {
         assert_eq!(
             default_model_path_with_host_cache(&app_cache, Some(&host_cache)),
             app_model
-        );
-    }
-
-    #[test]
-    fn configured_runtime_uses_recorded_values_without_normalizing_them() {
-        let configuration = runtime_configuration_from_contents(
-            "# comment\npython= /venv/bin/python \nlibrary_path=/host/lib with spaces:/host/rocm/lib\n",
-        );
-        assert_eq!(
-            configuration.python,
-            Some(PathBuf::from("/venv/bin/python"))
-        );
-        assert_eq!(
-            configuration.library_path.as_deref(),
-            Some("/host/lib with spaces:/host/rocm/lib")
         );
     }
 
@@ -748,19 +594,63 @@ mod tests {
             Some(&runtime),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_inference_permit_does_not_time_out_the_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = fake_runtime(root.path(), "exec sleep 60");
+        runtime.timeout = Duration::from_millis(50);
+        let image = RgbaImage::from_pixel(10, 8, Rgba([90, 80, 70, 255]));
+        let held = worker_process::inference_permit(&CancellationToken::default()).unwrap();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let started = Instant::now();
+                let result = clean_background_with_runtime(
+                    &image,
+                    bounds(),
+                    &mask(),
+                    &CancellationToken::default(),
+                    Some(&runtime),
+                );
+                (result, started.elapsed())
+            });
+            // Hold the permit for several worker timeouts.
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                !worker.is_finished(),
+                "waiting for the permit never times out"
+            );
+            drop(held);
+            let (result, elapsed) = worker.join().unwrap();
+            let error = result.unwrap_err();
+            // Only the worker run itself is bounded by the timeout.
+            assert!(error.to_string().contains("timed out"), "{error}");
+            assert!(!error.to_string().contains("waiting"), "{error}");
+            assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        });
+        let cancelled = CancellationToken::default();
+        let held = worker_process::inference_permit(&CancellationToken::default()).unwrap();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                clean_background_with_runtime(&image, bounds(), &mask(), &cancelled, Some(&runtime))
+            });
+            thread::sleep(Duration::from_millis(100));
+            cancelled.cancel();
+            assert!(matches!(worker.join().unwrap(), Err(AppError::Cancelled)));
+        });
+        drop(held);
     }
 
     #[cfg(unix)]
     #[test]
     fn cancellation_kills_and_reaps_the_flatpak_launcher() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().unwrap();
         let mut runtime = fake_runtime(root.path(), "exit 99");
         let launcher = root.path().join("flatpak-spawn");
-        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        worker_process::write_test_executable(&launcher, "#!/bin/sh\nexec sleep 60\n");
         runtime.launch = Launch::FlatpakHost { launcher };
         let image = RgbaImage::from_pixel(10, 8, Rgba([90, 80, 70, 255]));
         let token = CancellationToken::default();

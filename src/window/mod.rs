@@ -11,8 +11,8 @@ use crate::compare::{SplitOrientation, choose_split};
 use crate::document::Stroke;
 use crate::document::{
     Annotation, AnnotationEdit, AnnotationId, Axis, BrushPoint, CancellationToken, Document,
-    GameAssetAa, GameAssetOptions, LineLink, LineVertex, MEASUREMENT_STROKE_WIDTH, Operation,
-    PencilGeometry, Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
+    GameAssetOptions, LineLink, LineVertex, MEASUREMENT_STROKE_WIDTH, Operation, PencilGeometry,
+    Point, Rect, Resampling, Rotation, Shape, StrokePath, StrokeStyle,
 };
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
@@ -761,10 +761,9 @@ struct WindowState {
     scale_lock: gtk::ToggleButton,
     scale_unit: gtk::DropDown,
     scale_method: gtk::DropDown,
-    scale_aa_controls: gtk::Box,
-    scale_aa: gtk::SpinButton,
-    scale_contour_opacity: gtk::SpinButton,
-    scale_show_contours: gtk::ToggleButton,
+    scale_strength_controls: gtk::Box,
+    scale_strength: gtk::SpinButton,
+    scale_show_line_art: gtk::ToggleButton,
     scale_original_button: gtk::Button,
     scale_source: RefCell<Option<Arc<image::RgbaImage>>>,
     scale_gpu: RefCell<Option<Arc<crate::tools::scale::GpuScaler>>>,
@@ -1025,55 +1024,43 @@ impl ViewerWindow {
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
         scale_slider_row.append(&scale_slider);
-        let scale_show_contours = gtk::ToggleButton::builder()
-            .label(gettext("Show contours"))
-            .tooltip_text(gettext("Preview the detected contour mask"))
+        let scale_show_line_art = gtk::ToggleButton::builder()
+            .label(gettext("Show line art"))
+            .tooltip_text(gettext("Preview the sharpened line art"))
             .visible(matches!(scale_resampling, Resampling::GameAsset(_)))
             .build();
-        scale_show_contours.update_property(&[
-            gtk::accessible::Property::Label(&gettext("Show contours")),
+        scale_show_line_art.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Show line art")),
             gtk::accessible::Property::Description(&gettext(
-                "Preview Game Asset contours shaded by their opacity strength",
+                "Preview the Game Asset line art as it is multiplied over the result",
             )),
         ]);
-        scale_slider_row.append(&scale_show_contours);
-        let scale_aa_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        scale_aa_controls.set_valign(gtk::Align::Start);
-        scale_aa_controls.set_visible(matches!(scale_resampling, Resampling::GameAsset(_)));
-        let scale_aa_label = gtk::Label::with_mnemonic(&gettext("_AA"));
-        let scale_aa = spin(0.0, 100.0, f64::from(settings.game_asset_aa().percent()));
-        scale_aa.set_width_chars(3);
-        scale_aa_label.set_mnemonic_widget(Some(&scale_aa));
-        let aa_description =
-            gettext("Antialiasing: 0% keeps pixel edges crisp; 100% applies full smoothing");
-        scale_aa.set_tooltip_text(Some(&aa_description));
-        scale_aa.update_property(&[
-            gtk::accessible::Property::Label(&gettext("Antialiasing (%)")),
-            gtk::accessible::Property::Description(&aa_description),
-        ]);
-        scale_aa_controls.append(&scale_aa_label);
-        scale_aa_controls.append(&scale_aa);
-        scale_aa_controls.append(&gtk::Label::new(Some("%")));
-        let scale_contour_opacity_label = gtk::Label::with_mnemonic(&gettext("_Opacity"));
-        let scale_contour_opacity =
-            spin(0.0, 100.0, f64::from(settings.game_asset_contour_opacity()));
-        scale_contour_opacity.set_width_chars(3);
-        scale_contour_opacity_label.set_mnemonic_widget(Some(&scale_contour_opacity));
-        let opacity_description = gettext(
-            "Contour opacity: 0% adds no contours; 100% draws full contours over the existing fill",
+        scale_slider_row.append(&scale_show_line_art);
+        let scale_strength_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        scale_strength_controls.set_valign(gtk::Align::Start);
+        scale_strength_controls.set_visible(matches!(scale_resampling, Resampling::GameAsset(_)));
+        let scale_strength_label = gtk::Label::with_mnemonic(&gettext("_Strength"));
+        let scale_strength = spin(
+            0.0,
+            100.0,
+            f64::from(settings.game_asset_options().strength().percent()),
         );
-        scale_contour_opacity.set_tooltip_text(Some(&opacity_description));
-        scale_contour_opacity.update_property(&[
-            gtk::accessible::Property::Label(&gettext("Contour opacity (%)")),
-            gtk::accessible::Property::Description(&opacity_description),
+        scale_strength.set_width_chars(3);
+        scale_strength_label.set_mnemonic_widget(Some(&scale_strength));
+        let strength_description =
+            gettext("Line-art sharpening: 0% applies a light unsharp mask; 100% the strongest");
+        scale_strength.set_tooltip_text(Some(&strength_description));
+        scale_strength.update_property(&[
+            gtk::accessible::Property::Label(&gettext("Line-art sharpening strength (%)")),
+            gtk::accessible::Property::Description(&strength_description),
         ]);
-        scale_aa_controls.append(&scale_contour_opacity_label);
-        scale_aa_controls.append(&scale_contour_opacity);
-        scale_aa_controls.append(&gtk::Label::new(Some("%")));
+        scale_strength_controls.append(&scale_strength_label);
+        scale_strength_controls.append(&scale_strength);
+        scale_strength_controls.append(&gtk::Label::new(Some("%")));
         let scale_top_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         scale_control_row.set_valign(gtk::Align::Start);
         scale_top_row.append(&scale_control_row);
-        scale_top_row.append(&scale_aa_controls);
+        scale_top_row.append(&scale_strength_controls);
         scale_content.append(&scale_top_row);
         scale_content.append(&scale_slider_row);
         scale_surface.append(&scale_content);
@@ -1316,10 +1303,9 @@ impl ViewerWindow {
             scale_lock,
             scale_unit,
             scale_method,
-            scale_aa_controls,
-            scale_aa,
-            scale_contour_opacity,
-            scale_show_contours,
+            scale_strength_controls,
+            scale_strength,
+            scale_show_line_art,
             scale_original_button,
             scale_source: RefCell::new(None),
             scale_gpu: RefCell::new(None),
@@ -3072,8 +3058,7 @@ impl ViewerWindow {
         for field in [
             self.0.scale_width.clone().upcast::<gtk::Widget>(),
             self.0.scale_height.clone().upcast(),
-            self.0.scale_aa.clone().upcast(),
-            self.0.scale_contour_opacity.clone().upcast(),
+            self.0.scale_strength.clone().upcast(),
         ] {
             let keys = gtk::EventControllerKey::new();
             keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3116,8 +3101,7 @@ impl ViewerWindow {
             move |dropdown| {
                 let resampling = match resampling_at(dropdown.selected()) {
                     Resampling::GameAsset(_) => Resampling::GameAsset(GameAssetOptions::new(
-                        GameAssetAa::new(this.0.scale_aa.value().round() as u8),
-                        this.0.scale_contour_opacity.value().round() as u8,
+                        this.0.scale_strength.value().round() as u8,
                     )),
                     method => method,
                 };
@@ -3130,16 +3114,13 @@ impl ViewerWindow {
             let this = self.clone();
             move |slider| this.scale_slider_changed(slider.value())
         });
-        self.0.scale_aa.connect_value_changed({
+        self.0.scale_strength.connect_value_changed({
             let this = self.clone();
             move |spin| {
                 if this.0.scale_updating_controls.get() {
                     return;
                 }
-                let options = GameAssetOptions::new(
-                    GameAssetAa::new(spin.value().round() as u8),
-                    this.0.scale_contour_opacity.value().round() as u8,
-                );
+                let options = GameAssetOptions::new(spin.value().round() as u8);
                 this.0.settings.set_game_asset_options(options);
                 if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
                     this.0.scale_resampling.set(Resampling::GameAsset(options));
@@ -3147,24 +3128,7 @@ impl ViewerWindow {
                 }
             }
         });
-        self.0.scale_contour_opacity.connect_value_changed({
-            let this = self.clone();
-            move |spin| {
-                if this.0.scale_updating_controls.get() {
-                    return;
-                }
-                let options = GameAssetOptions::new(
-                    GameAssetAa::new(this.0.scale_aa.value().round() as u8),
-                    spin.value().round() as u8,
-                );
-                this.0.settings.set_game_asset_options(options);
-                if matches!(this.0.scale_resampling.get(), Resampling::GameAsset(_)) {
-                    this.0.scale_resampling.set(Resampling::GameAsset(options));
-                    this.refresh_scale_controls();
-                }
-            }
-        });
-        self.0.scale_show_contours.connect_toggled({
+        self.0.scale_show_line_art.connect_toggled({
             let this = self.clone();
             move |_| {
                 if this.0.scale_updating_controls.get()
@@ -3264,7 +3228,7 @@ impl ViewerWindow {
         }
         self.0.pending_scale_activation.set(false);
         let was_updating = self.0.scale_updating_controls.replace(true);
-        self.0.scale_show_contours.set_active(false);
+        self.0.scale_show_line_art.set_active(false);
         self.0.scale_updating_controls.set(was_updating);
         self.0
             .scale_preview_generation
@@ -3441,10 +3405,10 @@ impl ViewerWindow {
 
     fn refresh_scale_method(&self) {
         let game_asset = matches!(self.0.scale_resampling.get(), Resampling::GameAsset(_));
-        self.0.scale_aa_controls.set_visible(game_asset);
-        self.0.scale_show_contours.set_visible(game_asset);
+        self.0.scale_strength_controls.set_visible(game_asset);
+        self.0.scale_show_line_art.set_visible(game_asset);
         if !game_asset {
-            self.0.scale_show_contours.set_active(false);
+            self.0.scale_show_line_art.set_active(false);
         }
         self.0
             .scale_method
@@ -3477,9 +3441,9 @@ impl ViewerWindow {
             cancellation.cancel();
         }
         let resampling = self.0.scale_resampling.get();
-        let show_contours = self.0.scale_show_contours.is_active()
+        let show_line_art = self.0.scale_show_line_art.is_active()
             && matches!(resampling, Resampling::GameAsset(_));
-        if (target_width, target_height) == source.dimensions() && !show_contours {
+        if (target_width, target_height) == source.dimensions() && !show_line_art {
             self.0.scale_spinner.set_visible(false);
             self.display_scale_preview(source, preserved_zoom);
             return;
@@ -3520,8 +3484,13 @@ impl ViewerWindow {
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
                     if let Some((session, options)) = game_asset {
-                        if show_contours {
-                            return session.contours(target_width, target_height, &cancellation);
+                        if show_line_art {
+                            return session.line_art(
+                                target_width,
+                                target_height,
+                                options,
+                                &cancellation,
+                            );
                         }
                         return session.resize(target_width, target_height, options, &cancellation);
                     }

@@ -1,25 +1,23 @@
-//! Application boundary for the shared Game Asset scaler.
+//! Application boundary for Game Asset scaling: FLUX line art of the
+//! untouched source, reduced and sharpened by the shared scaler, multiplied
+//! over the BiRefNet foreground's Lanczos fill.
 use crate::{
-    document::{CancellationToken, GameAssetAa, GameAssetOptions},
+    document::{CancellationToken, GameAssetOptions},
     error::{AppError, Result},
 };
-use image::RgbaImage;
-use std::sync::{Arc, Mutex};
+use image::{GrayImage, RgbaImage};
+use std::{
+    sync::{Arc, Mutex, TryLockError},
+    thread,
+    time::Duration,
+};
 
 pub(crate) type BackgroundRemover =
     dyn Fn(&RgbaImage, &CancellationToken) -> Result<RgbaImage> + Send + Sync;
+pub(crate) type LineArtGenerator =
+    dyn Fn(&RgbaImage, &CancellationToken) -> Result<GrayImage> + Send + Sync;
 
 const OPAQUE_ALPHA: u8 = 255;
-const HARD_CUTOUT_ALPHA: u8 = 128;
-/// The two stable ends of Diorama's AA control for one target size. Keeping
-/// this as one unit prevents a cancelled render from exposing a half-built
-/// cache entry.
-struct AaEndpoints {
-    target: (u32, u32),
-    contour_opacity: u8,
-    zero: RgbaImage,
-    full: RgbaImage,
-}
 
 fn validate_dimensions((source_width, source_height): (u32, u32), w: u32, h: u32) -> Result<()> {
     if w == 0
@@ -34,38 +32,11 @@ fn validate_dimensions((source_width, source_height): (u32, u32), w: u32, h: u32
     Ok(())
 }
 
-/// AA zero means a hard pixel edge.  BiRefNet returns a soft alpha estimate
-/// even for opaque artwork, so use the same half-coverage boundary as the
-/// shared scaler's silhouette projection after it has painted the contours.
-/// Explicit source alpha remains untouched: it can represent intentional
-/// translucency rather than model uncertainty.
-fn harden_opaque_cutout_at_zero_aa(
-    image: &mut RgbaImage,
-    source_is_opaque: bool,
-    aa: GameAssetAa,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    if !source_is_opaque || aa.percent() != 0 {
-        return Ok(());
-    }
-    for (i, pixel) in image.pixels_mut().enumerate() {
-        if i.is_multiple_of(4096) {
-            cancel.check()?;
-        }
-        if pixel[3] < HARD_CUTOUT_ALPHA {
-            pixel.0 = [0; 4];
-        } else {
-            pixel[3] = OPAQUE_ALPHA;
-        }
-    }
-    cancel.check()
-}
-
-/// Convert the scaler's strength-weighted grayscale contour representation
-/// into the opaque grayscale-on-white image used by the inspection preview.
-fn contour_mask_to_rgba(mask: &image::GrayImage, cancel: &CancellationToken) -> Result<RgbaImage> {
-    let mut image = RgbaImage::new(mask.width(), mask.height());
-    for (i, (source, output)) in mask.pixels().zip(image.pixels_mut()).enumerate() {
+/// Convert grayscale line art into the opaque image used by the inspection
+/// preview.
+fn line_art_to_rgba(line_art: &GrayImage, cancel: &CancellationToken) -> Result<RgbaImage> {
+    let mut image = RgbaImage::new(line_art.width(), line_art.height());
+    for (i, (source, output)) in line_art.pixels().zip(image.pixels_mut()).enumerate() {
         if i.is_multiple_of(4096) {
             cancel.check()?;
         }
@@ -76,137 +47,66 @@ fn contour_mask_to_rgba(mask: &image::GrayImage, cancel: &CancellationToken) -> 
     Ok(image)
 }
 
-fn srgb_to_linear(encoded: u8) -> f64 {
-    let encoded = f64::from(encoded) / 255.;
-    if encoded <= 0.04045 {
-        encoded / 12.92
-    } else {
-        ((encoded + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(linear: f64) -> u8 {
-    let encoded = if linear <= 0.003_130_8 {
-        linear * 12.92
-    } else {
-        1.055 * linear.powf(1. / 2.4) - 0.055
-    };
-    (encoded.clamp(0., 1.) * 255.).round() as u8
-}
-
-/// Blend the two rendered AA endpoints in premultiplied linear light. The
-/// caller returns the endpoints directly, so their encoded RGB and alpha stay
-/// byte-exact at 0% and 100%.
-pub(crate) fn blend_aa_endpoints(
-    zero: &RgbaImage,
-    full: &RgbaImage,
-    percent: u8,
-    cancel: &CancellationToken,
-) -> Result<RgbaImage> {
-    debug_assert!(percent > 0 && percent < 100);
-    debug_assert_eq!(zero.dimensions(), full.dimensions());
-    let t = f64::from(percent) / 100.;
-    let mut blended = RgbaImage::new(zero.width(), zero.height());
-    for (i, ((zero_pixel, full_pixel), output)) in zero
-        .pixels()
-        .zip(full.pixels())
-        .zip(blended.pixels_mut())
-        .enumerate()
-    {
-        if i.is_multiple_of(4096) {
-            cancel.check()?;
-        }
-        let zero_alpha = f64::from(zero_pixel[3]) / 255.;
-        let full_alpha = f64::from(full_pixel[3]) / 255.;
-        let alpha = zero_alpha + (full_alpha - zero_alpha) * t;
-        let alpha_byte = (alpha * 255.).round() as u8;
-        if alpha_byte == 0 {
-            output.0 = [0; 4];
-            continue;
-        }
-        for channel in 0..3 {
-            let zero_premultiplied = srgb_to_linear(zero_pixel[channel]) * zero_alpha;
-            let full_premultiplied = srgb_to_linear(full_pixel[channel]) * full_alpha;
-            output[channel] = linear_to_srgb(
-                (zero_premultiplied + (full_premultiplied - zero_premultiplied) * t) / alpha,
-            );
-        }
-        output[3] = alpha_byte;
-    }
-    cancel.check()?;
-    Ok(blended)
-}
-
-/// A preview session keeps the untouched source for contour analysis and the
-/// background-removed foreground for Lanczos fill.  The foreground cache is
-/// populated only after a complete, non-cancelled model result.
+/// A preview session keeps the untouched source for line-art generation,
+/// while the background-removed foreground supplies the fill. The line-art
+/// scaler is published only after generation finishes without cancellation;
+/// it caches the reduced fill and line art of the latest target size.
 pub struct Session {
     source: Arc<RgbaImage>,
-    source_is_opaque: Mutex<Option<bool>>,
-    scaler: asset_scaler::Session,
+    scaler: Mutex<Option<Arc<asset_scaler::LineArtSession>>>,
+    preparation_gate: Mutex<()>,
     foreground: Mutex<Option<Arc<RgbaImage>>>,
-    /// One completed pair for the active preview size: two rendered endpoint
-    /// images. A completed new size replaces it atomically.
-    aa_endpoints: Mutex<Option<Arc<AaEndpoints>>>,
     remove_background: Arc<BackgroundRemover>,
+    generate_line_art: Arc<LineArtGenerator>,
 }
 
 impl Session {
     pub fn new(source: Arc<RgbaImage>) -> Self {
-        Self::with_background_remover(source, Arc::new(crate::tools::selection::birefnet_cutout))
+        Self::with_workers(
+            source,
+            Arc::new(crate::tools::selection::birefnet_cutout),
+            Arc::new(crate::tools::line_art::sketch),
+        )
     }
 
-    fn with_background_remover(
+    fn with_workers(
         source: Arc<RgbaImage>,
         remove_background: Arc<BackgroundRemover>,
+        generate_line_art: Arc<LineArtGenerator>,
     ) -> Self {
         Self {
-            scaler: asset_scaler::Session::new(source.clone()),
             source,
-            source_is_opaque: Mutex::new(None),
+            scaler: Mutex::new(None),
+            preparation_gate: Mutex::new(()),
             foreground: Mutex::new(None),
-            aa_endpoints: Mutex::new(None),
             remove_background,
+            generate_line_art,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_background_remover(
+    pub(crate) fn with_test_workers(
+        source: Arc<RgbaImage>,
+        remove_background: Arc<BackgroundRemover>,
+        generate_line_art: Arc<LineArtGenerator>,
+    ) -> Self {
+        Self::with_workers(source, remove_background, generate_line_art)
+    }
+
+    #[cfg(test)]
+    fn with_background_remover(
         source: Arc<RgbaImage>,
         remove_background: Arc<BackgroundRemover>,
     ) -> Self {
-        Self::with_background_remover(source, remove_background)
+        Self::with_workers(
+            source,
+            remove_background,
+            Arc::new(model_like_test_line_art),
+        )
     }
 
     fn validate_dimensions(&self, w: u32, h: u32) -> Result<()> {
         validate_dimensions(self.source.dimensions(), w, h)
-    }
-
-    fn source_is_opaque(&self, cancel: &CancellationToken) -> Result<bool> {
-        if let Some(source_is_opaque) = *self
-            .source_is_opaque
-            .lock()
-            .expect("source-alpha cache poisoned")
-        {
-            return Ok(source_is_opaque);
-        }
-
-        let mut source_is_opaque = true;
-        for (i, pixel) in self.source.pixels().enumerate() {
-            if i.is_multiple_of(4096) {
-                cancel.check()?;
-            }
-            if pixel[3] != OPAQUE_ALPHA {
-                source_is_opaque = false;
-                break;
-            }
-        }
-        cancel.check()?;
-        let mut cache = self
-            .source_is_opaque
-            .lock()
-            .expect("source-alpha cache poisoned");
-        Ok(*cache.get_or_insert(source_is_opaque))
     }
 
     fn foreground(&self, cancel: &CancellationToken) -> Result<Arc<RgbaImage>> {
@@ -228,104 +128,75 @@ impl Session {
         Ok(cache.get_or_insert(foreground).clone())
     }
 
-    fn aa_endpoints(
-        &self,
-        target: (u32, u32),
-        options: GameAssetOptions,
-        cancel: &CancellationToken,
-    ) -> Result<Arc<AaEndpoints>> {
-        if let Some(endpoints) = self
-            .aa_endpoints
+    /// Serialize line-art generation for this immutable source without
+    /// holding the cache lock during model work. Waiting callers poll their
+    /// cancellation token, then recheck the completed cache once they acquire
+    /// the gate.
+    fn scaler(&self, cancel: &CancellationToken) -> Result<Arc<asset_scaler::LineArtSession>> {
+        if let Some(scaler) = self
+            .scaler
             .lock()
-            .expect("AA endpoint cache poisoned")
-            .as_ref()
-            .filter(|endpoints| {
-                endpoints.target == target && endpoints.contour_opacity == options.contour_opacity()
-            })
-            .cloned()
+            .expect("line-art scaler cache poisoned")
+            .clone()
         {
             cancel.check()?;
-            return Ok(endpoints);
+            return Ok(scaler);
         }
-
-        // Trace the untouched original before BiRefNet changes alpha and edge
-        // colours. Neither the scaler nor foreground cache lock is held while
-        // building either endpoint.
-        self.scaler
-            .prepare(&|| cancel.check().is_err())
-            .map_err(map_error)?;
-        let foreground = self.foreground(cancel)?;
-        let source_is_opaque = self.source_is_opaque(cancel)?;
-        let mut zero = self
-            .scaler
-            .resize_with_foreground_opacity(
-                &foreground,
-                target.0,
-                target.1,
-                GameAssetAa::new(0),
-                options.contour_opacity_fraction(),
-                &|| cancel.check().is_err(),
-            )
-            .map_err(map_error)?;
-        harden_opaque_cutout_at_zero_aa(&mut zero, source_is_opaque, GameAssetAa::new(0), cancel)?;
-        let full = self
-            .scaler
-            .resize_with_foreground_opacity(
-                &foreground,
-                target.0,
-                target.1,
-                GameAssetAa::new(100),
-                options.contour_opacity_fraction(),
-                &|| cancel.check().is_err(),
-            )
-            .map_err(map_error)?;
-        cancel.check()?;
-        let built = Arc::new(AaEndpoints {
-            target,
-            contour_opacity: options.contour_opacity(),
-            zero,
-            full,
-        });
-
-        let mut cache = self
-            .aa_endpoints
-            .lock()
-            .expect("AA endpoint cache poisoned");
-        cancel.check()?;
-        if let Some(endpoints) = cache
-            .as_ref()
-            .filter(|endpoints| {
-                endpoints.target == target && endpoints.contour_opacity == options.contour_opacity()
-            })
-            .cloned()
-        {
+        loop {
             cancel.check()?;
-            return Ok(endpoints);
+            let gate = match self.preparation_gate.try_lock() {
+                Ok(gate) => gate,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+            };
+            if let Some(scaler) = self
+                .scaler
+                .lock()
+                .expect("line-art scaler cache poisoned")
+                .clone()
+            {
+                drop(gate);
+                cancel.check()?;
+                return Ok(scaler);
+            }
+            // Check source dimensions and the working-memory guard ahead of
+            // the external model process.
+            asset_scaler::LineArtSession::preflight(&self.source).map_err(map_error)?;
+            cancel.check()?;
+            let line_art = Arc::new((self.generate_line_art)(&self.source, cancel)?);
+            cancel.check()?;
+            let scaler = Arc::new(
+                asset_scaler::LineArtSession::new(&self.source, line_art).map_err(map_error)?,
+            );
+            let mut cache = self.scaler.lock().expect("line-art scaler cache poisoned");
+            cancel.check()?;
+            let cached = cache.get_or_insert(scaler).clone();
+            drop(cache);
+            drop(gate);
+            return Ok(cached);
         }
-        *cache = Some(built.clone());
-        Ok(built)
     }
 
-    /// Return a white-background contour inspection image with grayscale
-    /// values weighted by each contour's established opacity. Original-size
-    /// inspection renders the fitted source traces; downscaled inspection uses
-    /// the cached foreground support path.
-    pub fn contours(&self, w: u32, h: u32, cancel: &CancellationToken) -> Result<RgbaImage> {
+    /// Return the line art as the result multiplies it: the generated line
+    /// art at the original size, reduced and sharpened at `options`'s
+    /// strength otherwise. This never needs the extracted foreground.
+    pub fn line_art(
+        &self,
+        w: u32,
+        h: u32,
+        options: GameAssetOptions,
+        cancel: &CancellationToken,
+    ) -> Result<RgbaImage> {
         cancel.check()?;
         self.validate_dimensions(w, h)?;
-        let mask = if (w, h) == self.source.dimensions() {
-            self.scaler
-                .polished_contour_mask(w, h, &|| cancel.check().is_err())
-                .map_err(map_error)?
-        } else {
-            let foreground = self.foreground(cancel)?;
-            self.scaler
-                .foreground_contour_mask(&foreground, w, h, GameAssetAa::new(0), &|| {
-                    cancel.check().is_err()
-                })
-                .map_err(map_error)?
-        };
-        contour_mask_to_rgba(&mask, cancel)
+        let line_art = self
+            .scaler(cancel)?
+            .line_art(w, h, options.strength(), &|| cancel.check().is_err())
+            .map_err(map_error)?;
+        line_art_to_rgba(&line_art, cancel)
     }
 
     pub fn resize(
@@ -340,12 +211,15 @@ impl Session {
         if (w, h) == self.source.dimensions() {
             return Ok((*self.source).clone());
         }
-        let endpoints = self.aa_endpoints((w, h), options, cancel)?;
-        let resized = match options.aa().percent() {
-            0 => endpoints.zero.clone(),
-            100 => endpoints.full.clone(),
-            percent => blend_aa_endpoints(&endpoints.zero, &endpoints.full, percent, cancel)?,
-        };
+        // Generate the line art from the untouched original before BiRefNet
+        // runs; neither cache lock is held during model work.
+        let scaler = self.scaler(cancel)?;
+        let foreground = self.foreground(cancel)?;
+        let resized = scaler
+            .resize_with_foreground(&foreground, w, h, options.strength(), &|| {
+                cancel.check().is_err()
+            })
+            .map_err(map_error)?;
         cancel.check()?;
         Ok(resized)
     }
@@ -381,8 +255,16 @@ fn resize_with_background_remover(
     if image.dimensions() == (w, h) {
         return Ok(image.clone());
     }
-    Session::with_background_remover(Arc::new(image.clone()), remove_background)
-        .resize(w, h, options, cancel)
+    #[cfg(test)]
+    let generate_line_art: Arc<LineArtGenerator> = Arc::new(model_like_test_line_art);
+    #[cfg(not(test))]
+    let generate_line_art: Arc<LineArtGenerator> = Arc::new(crate::tools::line_art::sketch);
+    Session::with_workers(
+        Arc::new(image.clone()),
+        remove_background,
+        generate_line_art,
+    )
+    .resize(w, h, options, cancel)
 }
 
 fn map_error(error: asset_scaler::Error) -> AppError {
@@ -396,13 +278,45 @@ fn map_error(error: asset_scaler::Error) -> AppError {
     }
 }
 
+/// A deterministic stand-in for the line-art model in normal unit tests:
+/// near-neutral dark ink becomes black or weak gray, while saturated fill
+/// stays white.
+#[cfg(test)]
+fn model_like_test_line_art(image: &RgbaImage, cancel: &CancellationToken) -> Result<GrayImage> {
+    let mut line_art = GrayImage::new(image.width(), image.height());
+    for (index, (source, output)) in image.pixels().zip(line_art.pixels_mut()).enumerate() {
+        if index.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        let (minimum, maximum) = source.0[..3]
+            .iter()
+            .copied()
+            .fold((u8::MAX, 0_u8), |(minimum, maximum), value| {
+                (minimum.min(value), maximum.max(value))
+            });
+        output[0] = if maximum <= 80 {
+            0
+        } else if maximum - minimum <= 32 && maximum <= 130 {
+            112
+        } else {
+            255
+        };
+    }
+    cancel.check()?;
+    Ok(line_art)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        env, fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    fn options(aa: u8) -> GameAssetOptions {
-        GameAssetOptions::new(GameAssetAa::new(aa), 100)
+    fn options(strength: u8) -> GameAssetOptions {
+        GameAssetOptions::new(strength)
     }
 
     fn remove_flat_background(image: &RgbaImage, cancel: &CancellationToken) -> Result<RgbaImage> {
@@ -416,31 +330,6 @@ mod tests {
         Ok(foreground)
     }
 
-    fn remove_flat_background_with_soft_subject_edge(
-        image: &RgbaImage,
-        cancel: &CancellationToken,
-    ) -> Result<RgbaImage> {
-        cancel.check()?;
-        let mut foreground = image.clone();
-        for (x, y, pixel) in foreground.enumerate_pixels_mut() {
-            if !(16..48).contains(&x) || !(16..48).contains(&y) {
-                pixel.0 = [0; 4];
-            } else {
-                pixel.0 = [
-                    220,
-                    70,
-                    50,
-                    if x == 16 || x == 47 || y == 16 || y == 47 {
-                        192
-                    } else {
-                        255
-                    },
-                ];
-            }
-        }
-        Ok(foreground)
-    }
-
     fn counting_remover(calls: Arc<AtomicUsize>) -> Arc<BackgroundRemover> {
         Arc::new(move |image, cancel| {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -448,17 +337,20 @@ mod tests {
         })
     }
 
-    fn opaque_soft_edge_source() -> Arc<RgbaImage> {
-        Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if (16..48).contains(&x) && (16..48).contains(&y) {
-                image::Rgba([180, 60, 40, 255])
-            } else {
-                image::Rgba([240, 230, 220, 255])
+    fn counting_line_art_generator(
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    ) -> Arc<LineArtGenerator> {
+        Arc::new(move |image, cancel| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
             }
-        }))
+            model_like_test_line_art(image, cancel)
+        })
     }
 
-    fn contour_fixture() -> Arc<RgbaImage> {
+    fn outlined_fixture() -> Arc<RgbaImage> {
         Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
             if !(16..48).contains(&x) || !(16..48).contains(&y) {
                 image::Rgba([240, 230, 220, 255])
@@ -470,30 +362,17 @@ mod tests {
         }))
     }
 
-    /// Contour pixels use `round(255 * (1 - strength))`: higher strengths are
-    /// darker. Strengths are bounded to 0.95..=1, so contour pixels are at
-    /// most byte 13.
-    fn assert_strength_contours(image: &RgbaImage, dimensions: (u32, u32)) {
-        const WEAKEST_INK: u8 = 13;
-        assert_eq!(image.dimensions(), dimensions);
-        assert!(image.pixels().all(|pixel| {
-            let [r, g, b, a] = pixel.0;
-            r == g && g == b && a == 255 && (r <= WEAKEST_INK || r == 255)
-        }));
-        assert!(
-            image.pixels().any(|pixel| pixel[0] <= WEAKEST_INK),
-            "contour preview must render detected contours as dark lines"
-        );
-        assert!(
-            image.pixels().any(|pixel| pixel.0 == [255, 255, 255, 255]),
-            "contour preview must retain a white background"
-        );
+    /// The line art the shared scaler multiplies, built directly from the
+    /// same generated line art.
+    fn expected_scaler(source: &RgbaImage) -> asset_scaler::LineArtSession {
+        let line_art = model_like_test_line_art(source, &CancellationToken::default()).unwrap();
+        asset_scaler::LineArtSession::new(source, Arc::new(line_art)).unwrap()
     }
 
     #[test]
-    fn contour_mask_conversion_preserves_intermediate_grayscale_bytes() {
-        let mask = image::GrayImage::from_raw(4, 1, vec![0, 13, 128, 255]).unwrap();
-        let converted = contour_mask_to_rgba(&mask, &CancellationToken::default()).unwrap();
+    fn line_art_conversion_preserves_intermediate_grayscale_bytes() {
+        let line_art = GrayImage::from_raw(4, 1, vec![0, 13, 128, 255]).unwrap();
+        let converted = line_art_to_rgba(&line_art, &CancellationToken::default()).unwrap();
 
         assert_eq!(
             converted.as_raw(),
@@ -504,21 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn premultiplied_blend_clears_hidden_rgb_when_quantized_alpha_is_zero() {
-        let zero = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 0]));
-        let full = RgbaImage::from_pixel(1, 1, image::Rgba([20, 40, 60, 1]));
-        let blended = blend_aa_endpoints(&zero, &full, 1, &CancellationToken::default()).unwrap();
-        assert_eq!(blended.get_pixel(0, 0).0, [0; 4]);
-
-        let visible = RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-        let hidden_white = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 0]));
-        let blended =
-            blend_aa_endpoints(&visible, &hidden_white, 50, &CancellationToken::default()).unwrap();
-        assert_eq!(blended.get_pixel(0, 0).0, [255, 0, 0, 128]);
-    }
-
-    #[test]
-    fn identity_returns_the_original_without_background_or_endpoint_work() {
+    fn identity_returns_the_original_without_background_or_line_art_work() {
         let source = Arc::new(RgbaImage::from_fn(16, 12, |x, y| {
             image::Rgba([
                 x as u8,
@@ -527,618 +392,231 @@ mod tests {
                 if (x + y) % 3 == 0 { 90 } else { 255 },
             ])
         }));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let session =
-            Session::with_background_remover(source.clone(), counting_remover(calls.clone()));
+        let removals = Arc::new(AtomicUsize::new(0));
+        let generations = Arc::new(AtomicUsize::new(0));
+        let session = Session::with_test_workers(
+            source.clone(),
+            counting_remover(removals.clone()),
+            counting_line_art_generator(generations.clone(), Duration::ZERO),
+        );
         let output = session
-            .resize(16, 12, options(50), &CancellationToken::default())
+            .resize(16, 12, options(40), &CancellationToken::default())
             .unwrap();
         assert_eq!(output, *source);
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        assert!(
-            session
-                .aa_endpoints
-                .lock()
-                .expect("AA endpoint cache poisoned")
-                .is_none()
-        );
+        assert_eq!(removals.load(Ordering::Relaxed), 0);
+        assert_eq!(generations.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn contour_inspection_uses_polished_source_mask_at_original_size_and_cached_foreground_when_reduced()
-     {
-        let source = contour_fixture();
+    fn line_art_is_generated_once_across_targets_strengths_and_concurrent_requests() {
+        let source = outlined_fixture();
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = Session::with_background_remover(source, counting_remover(calls.clone()));
-        let cancel = CancellationToken::default();
-
-        let original = session.contours(64, 64, &cancel).unwrap();
-        assert_strength_contours(&original, (64, 64));
-        let polished_source_mask = session
-            .scaler
-            .polished_contour_mask(64, 64, &|| cancel.check().is_err())
+        let session = Arc::new(Session::with_test_workers(
+            source,
+            Arc::new(remove_flat_background),
+            counting_line_art_generator(calls.clone(), Duration::from_millis(30)),
+        ));
+        std::thread::scope(|scope| {
+            let first = session.clone();
+            let second = session.clone();
+            let first = scope
+                .spawn(move || first.resize(32, 32, options(0), &CancellationToken::default()));
+            let second = scope
+                .spawn(move || second.resize(32, 32, options(100), &CancellationToken::default()));
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+        session
+            .resize(24, 24, options(60), &CancellationToken::default())
             .unwrap();
-        assert_eq!(
-            original,
-            contour_mask_to_rgba(&polished_source_mask, &cancel).unwrap()
-        );
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        assert!(
-            session
-                .aa_endpoints
-                .lock()
-                .expect("AA endpoint cache poisoned")
-                .is_none(),
-            "contour inspection must not render resize endpoints"
-        );
-
-        let target = session.contours(32, 32, &cancel).unwrap();
-        assert_strength_contours(&target, (32, 32));
-        let foreground = session.foreground(&cancel).unwrap();
-        let target_mask = session
-            .scaler
-            .foreground_contour_mask(&foreground, 32, 32, GameAssetAa::new(0), &|| {
-                cancel.check().is_err()
-            })
+        session
+            .line_art(32, 32, options(40), &CancellationToken::default())
             .unwrap();
-        assert_eq!(target, contour_mask_to_rgba(&target_mask, &cancel).unwrap());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(session.contours(32, 32, &cancel).unwrap(), target);
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
-            "foreground must be cached"
-        );
-        assert!(
-            session
-                .aa_endpoints
-                .lock()
-                .expect("AA endpoint cache poisoned")
-                .is_none(),
-            "contour inspection must not populate the resize endpoint cache"
+            "one immutable source must run the line-art model once despite strength, target, and concurrent requests"
         );
     }
 
     #[test]
-    fn contour_inspection_validates_dimensions_and_preserves_foreground_cancellation_semantics() {
-        let source = contour_fixture();
+    fn invalid_or_cancelled_line_art_is_not_cached_and_a_retry_succeeds() {
+        let source = outlined_fixture();
         let calls = Arc::new(AtomicUsize::new(0));
-        let remover = counting_remover(calls.clone());
-        let session = Session::with_background_remover(source.clone(), remover);
-        let cancel = CancellationToken::default();
-        assert!(matches!(
-            session.contours(0, 32, &cancel),
-            Err(AppError::InvalidDimensions)
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        cancel.cancel();
-        assert!(matches!(
-            session.contours(32, 32, &cancel),
-            Err(AppError::Cancelled)
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let remover: Arc<BackgroundRemover> = {
+        let generator: Arc<LineArtGenerator> = {
             let calls = calls.clone();
-            Arc::new(move |image, cancel| {
-                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                    cancel.cancel();
-                }
-                Ok(image.clone())
-            })
-        };
-        let session = Session::with_background_remover(source, remover);
-        let cancelled = CancellationToken::default();
-        assert!(matches!(
-            session.contours(32, 32, &cancelled),
-            Err(AppError::Cancelled)
-        ));
-        assert!(
-            session
-                .foreground
-                .lock()
-                .expect("foreground cache poisoned")
-                .is_none(),
-            "a cancelled contour foreground must not be cached"
-        );
-        let retry = CancellationToken::default();
-        assert_strength_contours(&session.contours(32, 32, &retry).unwrap(), (32, 32));
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn aa_percent_interpolates_soft_cutout_without_a_zero_to_one_pop() {
-        let source = opaque_soft_edge_source();
-        let cancel = CancellationToken::default();
-        let remover = Arc::new(remove_flat_background_with_soft_subject_edge);
-        let session = Session::with_background_remover(source.clone(), remover);
-        let zero = session.resize(32, 32, options(0), &cancel).unwrap();
-        let full = session.resize(32, 32, options(100), &cancel).unwrap();
-
-        // This is the former direct AA=1 render: it restores the soft model
-        // edge at once and therefore supplies a regression reproducer.
-        let foreground = remove_flat_background_with_soft_subject_edge(&source, &cancel).unwrap();
-        let raw_scaler = asset_scaler::Session::new(source.clone());
-        raw_scaler.prepare(&|| false).unwrap();
-        let old_one = raw_scaler
-            .resize_with_foreground_opacity(
-                &foreground,
-                32,
-                32,
-                GameAssetAa::new(1),
-                options(1).contour_opacity_fraction(),
-                &|| false,
-            )
-            .unwrap();
-        assert!(
-            zero.pixels()
-                .zip(old_one.pixels())
-                .map(|(hard, soft)| hard[3].abs_diff(soft[3]))
-                .max()
-                .unwrap()
-                > 3,
-            "the direct AA=1 model edge must reproduce the old pop"
-        );
-
-        // The direct calls define the historical 0%/100% recipes. The
-        // Session must return those endpoint bytes unchanged before blending.
-        let mut raw_zero = raw_scaler
-            .resize_with_foreground_opacity(
-                &foreground,
-                32,
-                32,
-                GameAssetAa::new(0),
-                options(0).contour_opacity_fraction(),
-                &|| false,
-            )
-            .unwrap();
-        harden_opaque_cutout_at_zero_aa(&mut raw_zero, true, GameAssetAa::new(0), &cancel).unwrap();
-        let raw_full = raw_scaler
-            .resize_with_foreground_opacity(
-                &foreground,
-                32,
-                32,
-                GameAssetAa::new(100),
-                options(100).contour_opacity_fraction(),
-                &|| false,
-            )
-            .unwrap();
-        assert_eq!(zero, raw_zero);
-        assert_eq!(full, raw_full);
-
-        let mut previous = zero.clone();
-        for percent in 1..=100 {
-            let current = session.resize(32, 32, options(percent), &cancel).unwrap();
-            let mut largest_step = 0u8;
-            for ((start, end), (before, after)) in zero
-                .pixels()
-                .zip(full.pixels())
-                .zip(previous.pixels().zip(current.pixels()))
-            {
-                let expected = (f64::from(start[3])
-                    + (f64::from(end[3]) - f64::from(start[3])) * f64::from(percent) / 100.)
-                    .round() as u8;
-                assert_eq!(after[3], expected, "alpha at {percent}%");
-                if end[3] >= start[3] {
-                    assert!(after[3] >= before[3], "alpha rose backwards at {percent}%");
-                } else {
-                    assert!(after[3] <= before[3], "alpha fell backwards at {percent}%");
-                }
-                largest_step = largest_step.max(before[3].abs_diff(after[3]));
-            }
-            assert!(
-                largest_step <= 3,
-                "alpha step at {percent}% was {largest_step}"
-            );
-            previous = current;
-        }
-    }
-
-    #[test]
-    fn cached_preview_and_one_shot_use_the_same_pipeline_at_every_aa() {
-        let source = Arc::new(RgbaImage::from_fn(96, 80, |x, y| {
-            image::Rgba(
-                if (y as f64 - (0.57 * x as f64 + 10.)).abs() < 3.
-                    || (18..78).contains(&x) && (18..68).contains(&y)
-                {
-                    [8, 10, 4, 255]
-                } else {
-                    [240, 230, 220, 255]
+            Arc::new(
+                move |image, cancel| match calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => Ok(GrayImage::new(1, 1)),
+                    1 => {
+                        cancel.cancel();
+                        model_like_test_line_art(image, cancel)
+                    }
+                    _ => model_like_test_line_art(image, cancel),
                 },
             )
+        };
+        let session =
+            Session::with_test_workers(source, Arc::new(remove_flat_background), generator);
+        let first = CancellationToken::default();
+        assert!(matches!(
+            session.resize(32, 32, options(40), &first),
+            Err(AppError::InvalidDimensions)
+        ));
+        assert!(
+            session
+                .scaler
+                .lock()
+                .expect("line-art scaler cache poisoned")
+                .is_none()
+        );
+        let cancelled = CancellationToken::default();
+        assert!(matches!(
+            session.resize(32, 32, options(40), &cancelled),
+            Err(AppError::Cancelled)
+        ));
+        assert!(
+            session
+                .scaler
+                .lock()
+                .expect("line-art scaler cache poisoned")
+                .is_none()
+        );
+        session
+            .resize(32, 32, options(40), &CancellationToken::default())
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn injected_line_art_is_multiplied_over_the_foreground_fill() {
+        // The subject's RGB is flat, so only the supplied line art can darken
+        // the result, and only where it has ink.
+        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
+            if (4..60).contains(&x) && (4..60).contains(&y) {
+                image::Rgba([190, 95, 55, 255])
+            } else {
+                image::Rgba([0; 4])
+            }
         }));
+        let generator: Arc<LineArtGenerator> = Arc::new(|image, cancel| {
+            cancel.check()?;
+            let mut line_art =
+                GrayImage::from_pixel(image.width(), image.height(), image::Luma([255]));
+            for y in 30..34 {
+                for x in 8..56 {
+                    line_art.put_pixel(x, y, image::Luma([0]));
+                }
+            }
+            Ok(line_art)
+        });
+        let session =
+            Session::with_test_workers(source, Arc::new(|image, _| Ok(image.clone())), generator);
+        let result = session
+            .resize(32, 32, options(40), &CancellationToken::default())
+            .unwrap();
+        assert_eq!(result.get_pixel(16, 16).0, [0, 0, 0, 255]);
+        assert_eq!(result.get_pixel(16, 6).0, [190, 95, 55, 255]);
+        assert_eq!(result.get_pixel(0, 0).0, [0; 4]);
+    }
+
+    #[test]
+    fn resize_and_preview_use_the_shared_line_art_scaler_at_every_strength() {
+        let source = outlined_fixture();
         let calls = Arc::new(AtomicUsize::new(0));
         let remover = counting_remover(calls.clone());
         let session = Session::with_background_remover(source.clone(), remover.clone());
         let cancel = CancellationToken::default();
+        let expected = expected_scaler(&source);
+        let foreground = Arc::new(remove_flat_background(&source, &cancel).unwrap());
         let mut outputs = Vec::new();
-        for percent in [0, 100, 50, 0] {
-            let options = options(percent);
+        for strength in [0, 100, 40, 0] {
+            let options = options(strength);
             let preview = session.resize(32, 27, options, &cancel).unwrap();
-            assert_eq!(session.resize(32, 27, options, &cancel).unwrap(), preview);
+            assert_eq!(
+                preview,
+                expected
+                    .resize_with_foreground(&foreground, 32, 27, options.strength(), &|| false)
+                    .unwrap()
+            );
             assert_eq!(
                 resize_with_background_remover(&source, 32, 27, options, &cancel, remover.clone())
                     .unwrap(),
                 preview
             );
+            assert_eq!(
+                session.line_art(32, 27, options, &cancel).unwrap(),
+                line_art_to_rgba(
+                    &expected
+                        .line_art(32, 27, options.strength(), &|| false)
+                        .unwrap(),
+                    &cancel
+                )
+                .unwrap()
+            );
             outputs.push(preview);
         }
+        // One cached foreground plus one per one-shot resize.
         assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert_ne!(outputs[0], outputs[1]);
         assert_ne!(outputs[1], outputs[2]);
         assert_eq!(outputs[0], outputs[3]);
-        let endpoints_before_aa_change = session
-            .aa_endpoints
-            .lock()
-            .expect("AA endpoint cache poisoned")
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert_eq!(endpoints_before_aa_change.target, (32, 27));
-        session.resize(32, 27, options(80), &cancel).unwrap();
-        let endpoints_after_aa_change = session
-            .aa_endpoints
-            .lock()
-            .expect("AA endpoint cache poisoned")
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert!(Arc::ptr_eq(
-            &endpoints_before_aa_change,
-            &endpoints_after_aa_change
-        ));
-        // Opacity changes contour compositing and therefore rebuilds this bounded
-        // endpoint pair, while the foreground estimate stays cached.
-        session
-            .resize(
-                32,
-                27,
-                GameAssetOptions::new(GameAssetAa::new(80), 40),
-                &cancel,
-            )
-            .unwrap();
-        let endpoints_after_opacity_change = session
-            .aa_endpoints
-            .lock()
-            .expect("AA endpoint cache poisoned")
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert!(!Arc::ptr_eq(
-            &endpoints_after_aa_change,
-            &endpoints_after_opacity_change
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
-        // A different preview size replaces the bounded pair but reuses the
-        // successful foreground estimate.
-        session.resize(31, 26, options(50), &cancel).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert_eq!(
-            session
-                .aa_endpoints
-                .lock()
-                .expect("AA endpoint cache poisoned")
-                .as_ref()
-                .unwrap()
-                .target,
-            (31, 26)
-        );
+        assert_eq!(outputs[0].get_pixel(0, 0)[3], 0, "the canvas is removed");
     }
 
     #[test]
-    fn contour_opacity_blends_contours_without_recoloring_fill() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if !(16..48).contains(&x) || !(16..48).contains(&y) {
-                image::Rgba([240, 230, 220, 255])
-            } else if x == 16 || x == 47 || y == 16 || y == 47 || (30..34).contains(&y) {
-                image::Rgba([12, 10, 8, 255])
-            } else {
-                image::Rgba([180, 60, 40, 255])
-            }
-        }));
-        let session = Session::with_background_remover(
-            source,
-            Arc::new(remove_flat_background_with_soft_subject_edge),
-        );
-        let cancel = CancellationToken::default();
-        let no_contours = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(50), 0),
-                &cancel,
-            )
-            .unwrap();
-        let half_contours = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(50), 50),
-                &cancel,
-            )
-            .unwrap();
-        let full_contours = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(50), 100),
-                &cancel,
-            )
-            .unwrap();
-
-        assert!(
-            no_contours
-                .pixels()
-                .zip(half_contours.pixels())
-                .any(|(a, b)| a != b)
-        );
-        assert!(
-            half_contours
-                .pixels()
-                .zip(full_contours.pixels())
-                .any(|(a, b)| a != b)
-        );
-        // This interior subject pixel is away from the border and centerline,
-        // so opacity cannot alter its Lanczos fill or opaque alpha.
-        assert_eq!(
-            no_contours.get_pixel(12, 12),
-            half_contours.get_pixel(12, 12)
-        );
-        assert_eq!(
-            no_contours.get_pixel(12, 12),
-            full_contours.get_pixel(12, 12)
-        );
-        assert_eq!(no_contours.get_pixel(12, 12)[3], 255);
-        for ((no_contours, half_contours), full_contours) in no_contours
-            .pixels()
-            .zip(half_contours.pixels())
-            .zip(full_contours.pixels())
-        {
-            // Any fully opaque fill pixel remains opaque. Partially transparent
-            // contour destinations may gain alpha through normal compositing.
-            if no_contours[3] == 255 {
-                assert_eq!(half_contours[3], 255);
-                assert_eq!(full_contours[3], 255);
-            }
-        }
-    }
-
-    #[test]
-    fn contour_opacity_uses_original_donor_color_and_compositing_alpha() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if !(16..48).contains(&x) || !(16..48).contains(&y) {
-                image::Rgba([240, 230, 220, 255])
-            } else if x == 16 || x == 47 || y == 16 || y == 47 || (30..34).contains(&y) {
-                image::Rgba([12, 10, 8, 255])
-            } else {
-                image::Rgba([180, 60, 40, 255])
-            }
-        }));
-        let session = Session::with_background_remover(
-            source,
-            Arc::new(remove_flat_background_with_soft_subject_edge),
-        );
-        let cancel = CancellationToken::default();
-        let no_contours = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(0), 0),
-                &cancel,
-            )
-            .unwrap();
-        let full_contours = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(0), 100),
-                &cancel,
-            )
-            .unwrap();
-
-        assert!(
-            full_contours
-                .pixels()
-                .all(|pixel| pixel[3] == 0 || pixel[3] == 255)
-        );
-        assert!(
-            full_contours
-                .pixels()
-                .filter(|pixel| pixel[3] == 255)
-                .all(|pixel| pixel.0 != [0, 0, 0, 255]),
-            "full opacity must not turn opaque contour donors black"
-        );
-        assert!(
-            no_contours
-                .pixels()
-                .zip(full_contours.pixels())
-                .any(|(without, with)| without != with),
-            "zero opacity leaves the fill while full opacity adds contour paint"
-        );
-    }
-
-    #[test]
-    fn half_contour_opacity_is_premultiplied_linear_midpoint_on_partial_alpha() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if !(12..52).contains(&x) || !(12..52).contains(&y) {
-                image::Rgba([0; 4])
-            } else if (y as i32 - (x as i32 / 2 + 12)).abs() <= 2 {
-                image::Rgba([12, 10, 8, 160])
-            } else {
-                image::Rgba([180, 60, 40, 160])
-            }
-        }));
+    fn line_art_preview_is_raw_at_original_size_and_never_extracts_the_foreground() {
+        let source = outlined_fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
         let session =
-            Session::with_background_remover(source, Arc::new(|image, _| Ok(image.clone())));
+            Session::with_background_remover(source.clone(), counting_remover(calls.clone()));
         let cancel = CancellationToken::default();
-        let without = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(100), 0),
-                &cancel,
-            )
-            .unwrap();
-        let half = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(100), 50),
-                &cancel,
-            )
-            .unwrap();
-        let full = session
-            .resize(
-                32,
-                32,
-                GameAssetOptions::new(GameAssetAa::new(100), 100),
-                &cancel,
-            )
-            .unwrap();
-
-        assert!(
-            without
-                .pixels()
-                .zip(full.pixels())
-                .any(|(fill, painted)| fill != painted)
-        );
-        let mut saw_partial_alpha_change = false;
-        for ((fill, half), painted) in without.pixels().zip(half.pixels()).zip(full.pixels()) {
-            let fill_alpha = f64::from(fill[3]) / 255.;
-            let painted_alpha = f64::from(painted[3]) / 255.;
-            let expected_alpha = (fill_alpha + painted_alpha) * 0.5;
-            assert!(half[3].abs_diff((expected_alpha * 255.).round() as u8) <= 1);
-            if fill[3] != painted[3] && (1..255).contains(&fill[3]) {
-                saw_partial_alpha_change = true;
-            }
-            if half[3] == 0 {
-                assert_eq!(half.0, [0; 4]);
-                continue;
-            }
-            let actual_alpha = f64::from(half[3]) / 255.;
-            for channel in 0..3 {
-                let expected = (srgb_to_linear(fill[channel]) * fill_alpha
-                    + srgb_to_linear(painted[channel]) * painted_alpha)
-                    * 0.5
-                    / actual_alpha;
-                assert!(
-                    half[channel].abs_diff(linear_to_srgb(expected)) <= 2,
-                    "channel {channel} was not the opacity midpoint"
-                );
-            }
+        let raw = model_like_test_line_art(&source, &cancel).unwrap();
+        for strength in [0, 100] {
+            assert_eq!(
+                session
+                    .line_art(64, 64, options(strength), &cancel)
+                    .unwrap(),
+                line_art_to_rgba(&raw, &cancel).unwrap()
+            );
         }
-        assert!(
-            saw_partial_alpha_change,
-            "fixture must exercise contour compositing over partial alpha"
-        );
-    }
-
-    #[test]
-    fn shared_scaler_removes_an_opaque_canvas_before_scaling() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if (20..44).contains(&x) && (20..44).contains(&y) {
-                image::Rgba([120, 180, 90, 255])
-            } else {
-                image::Rgba([240, 230, 220, 255])
-            }
+        let reduced = session.line_art(32, 32, options(100), &cancel).unwrap();
+        assert!(reduced.pixels().all(|pixel| {
+            let [r, g, b, a] = pixel.0;
+            r == g && g == b && a == 255
         }));
-        let cancel = CancellationToken::default();
-        let remover = Arc::new(remove_flat_background);
-        let one_shot =
-            resize_with_background_remover(&source, 16, 16, options(20), &cancel, remover.clone())
-                .unwrap();
-        let cached = Session::with_background_remover(source, remover)
-            .resize(16, 16, options(20), &cancel)
-            .unwrap();
-        assert_eq!(cached, one_shot);
-        assert_eq!(one_shot.get_pixel(0, 0)[3], 0);
-    }
-
-    #[test]
-    fn zero_aa_hardens_a_model_cutout_of_an_opaque_sprite() {
-        let source = RgbaImage::from_fn(64, 64, |x, y| {
-            if !(16..48).contains(&x) || !(16..48).contains(&y) {
-                image::Rgba([240, 230, 220, 255])
-            } else if x == 16 || x == 47 || y == 16 || y == 47 || (30..34).contains(&y) {
-                image::Rgba([12, 10, 8, 255])
-            } else {
-                image::Rgba([180, 60, 40, 255])
-            }
-        });
-        let cancel = CancellationToken::default();
-        let remove_background = Arc::new(remove_flat_background_with_soft_subject_edge);
-
-        let hard = resize_with_background_remover(
-            &source,
-            32,
-            32,
-            options(0),
-            &cancel,
-            remove_background.clone(),
-        )
-        .unwrap();
-        assert!(hard.pixels().all(|pixel| pixel[3] == 0 || pixel[3] == 255));
-        let without_contours = resize_with_background_remover(
-            &source,
-            32,
-            32,
-            GameAssetOptions::new(GameAssetAa::new(0), 0),
-            &cancel,
-            remove_background.clone(),
-        )
-        .unwrap();
-        assert!(
-            hard.pixels()
-                .zip(without_contours.pixels())
-                .any(|(with_contours, fill)| with_contours != fill),
-            "full opacity must add source-derived contour paint"
+        assert!(reduced.pixels().any(|pixel| pixel[0] < 128));
+        assert!(reduced.pixels().any(|pixel| pixel.0 == [255; 4]));
+        assert_ne!(
+            reduced,
+            session.line_art(32, 32, options(0), &cancel).unwrap()
         );
-
-        let softened = resize_with_background_remover(
-            &source,
-            32,
-            32,
-            options(50),
-            &cancel,
-            remove_background,
-        )
-        .unwrap();
-        assert!(softened.pixels().any(|pixel| (1..255).contains(&pixel[3])));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn zero_aa_does_not_harden_explicit_source_alpha() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if (16..48).contains(&x) && (16..48).contains(&y) {
-                image::Rgba([180, 60, 40, 160])
-            } else {
-                image::Rgba([0; 4])
-            }
-        }));
-        let session = Session::with_background_remover(
-            source.clone(),
-            Arc::new(|image, _| Ok(image.clone())),
+    fn line_art_preview_validates_dimensions_and_cancellation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = Session::with_test_workers(
+            outlined_fixture(),
+            Arc::new(remove_flat_background),
+            counting_line_art_generator(calls.clone(), Duration::ZERO),
         );
-        let scaled = session
-            .resize(32, 32, options(0), &CancellationToken::default())
-            .unwrap();
-        assert!(scaled.pixels().any(|pixel| (1..255).contains(&pixel[3])));
-    }
-
-    #[test]
-    fn zero_aa_hardening_honors_cancellation() {
-        let cancellation = CancellationToken::default();
-        cancellation.cancel();
+        let cancel = CancellationToken::default();
         assert!(matches!(
-            harden_opaque_cutout_at_zero_aa(
-                &mut RgbaImage::from_pixel(4096, 1, image::Rgba([30, 40, 50, 160])),
-                true,
-                GameAssetAa::new(0),
-                &cancellation,
-            ),
+            session.line_art(0, 32, options(40), &cancel),
+            Err(AppError::InvalidDimensions)
+        ));
+        assert!(matches!(
+            session.line_art(65, 32, options(40), &cancel),
+            Err(AppError::InvalidDimensions)
+        ));
+        cancel.cancel();
+        assert!(matches!(
+            session.line_art(32, 32, options(40), &cancel),
             Err(AppError::Cancelled)
         ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1230,14 +708,68 @@ mod tests {
         ));
         assert!(
             session
-                .aa_endpoints
+                .foreground
                 .lock()
-                .expect("AA endpoint cache poisoned")
+                .expect("foreground cache poisoned")
                 .is_none(),
-            "a cancelled endpoint build must not publish a partial pair"
+            "a cancelled foreground must not be cached"
         );
         let retry = CancellationToken::default();
         session.resize(8, 8, Default::default(), &retry).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Runs the production line-art and BiRefNet workers through `Session::new`.
+    ///
+    /// This is deliberately opt-in: normal unit tests inject deterministic
+    /// grayscale line art and never require local inference models. Set
+    /// `DIORAMA_LINE_ART_SMOKE_INPUT` to a wizard-like PNG and, optionally,
+    /// `DIORAMA_LINE_ART_APP_OUT` to a fresh artifact directory before running:
+    ///
+    /// `cargo test --lib line_art_app_wizard_capture -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local line-art and BiRefNet inference models"]
+    fn line_art_app_wizard_capture() -> Result<()> {
+        let input = env::var_os("DIORAMA_LINE_ART_SMOKE_INPUT")
+            .map(PathBuf::from)
+            .expect("set DIORAMA_LINE_ART_SMOKE_INPUT to a wizard PNG");
+        let output = env::var_os("DIORAMA_LINE_ART_APP_OUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/diorama-line-art-app-v1"));
+        fs::create_dir_all(&output)?;
+
+        let source = Arc::new(image::open(&input)?.into_rgba8());
+        assert!(
+            source.width() >= 256 && source.height() >= 256,
+            "the smoke input must support 256px and 128px target captures"
+        );
+        let cancel = CancellationToken::default();
+        let session = Session::new(source.clone());
+
+        // Original-size `line_art` is the generated line art itself. It also
+        // ensures this capture uses Session::new's production worker rather
+        // than a test-only injected generator.
+        session
+            .line_art(
+                source.width(),
+                source.height(),
+                GameAssetOptions::default(),
+                &cancel,
+            )?
+            .save(output.join("source-line-art.png"))?;
+
+        for side in [256, 128] {
+            for strength in [0, 40, 100] {
+                let options = GameAssetOptions::new(strength);
+                session
+                    .line_art(side, side, options, &cancel)?
+                    .save(output.join(format!("line-art-{side}-strength{strength}.png")))?;
+                session
+                    .resize(side, side, options, &cancel)?
+                    .save(output.join(format!("colored-{side}-strength{strength}.png")))?;
+            }
+        }
+        eprintln!("Line-art app capture written to {}", output.display());
+        Ok(())
     }
 }

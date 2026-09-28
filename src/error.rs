@@ -30,6 +30,8 @@ pub enum AppError {
     Inpainting(String),
     #[error("Could not remove the selected background: {0}")]
     BackgroundRemoval(String),
+    #[error("Could not generate a sketch: {0}")]
+    SketchGeneration(String),
     #[error("The file changed outside Diorama: {0}")]
     ExternallyChanged(PathBuf),
     #[error("The file was deleted or moved: {0}")]

@@ -1,13 +1,7 @@
-//! One opacity per contour, using final painted length and mean source width.
-use crate::{Cancellation, Result};
+//! Convert local contour evidence and projected normal thickness into paint.
+use crate::{Cancellation, Error, Result};
 use crate::{contours::Contours, detect::Sample, raster::Mask};
 use image::{GrayImage, RgbaImage};
-
-pub fn strength(length: usize, width: f64) -> f64 {
-    let length = ((length as f64 - 4.) / 28.).clamp(0., 1.);
-    let width = ((width - 1.) / 5.).clamp(0., 1.);
-    0.95 + 0.05 * (length * width).sqrt()
-}
 
 fn measure(source: &RgbaImage, mask: &Mask, p: &Sample) -> Option<f64> {
     let on = |d: f64| {
@@ -56,50 +50,92 @@ pub fn widths(
         })
         .collect())
 }
-pub fn calculate(widths: &[f64], core: &GrayImage, pixel_owners: &[Option<usize>]) -> Vec<f64> {
-    let mut lengths = vec![0; widths.len()];
-    for (&value, owner) in core.as_raw().iter().zip(pixel_owners) {
-        if value > 0
-            && let Some(id) = owner
-        {
-            lengths[*id] += 1;
+
+/// Aggregate detector prominence by trace. Local target refinement later
+/// restores strong shoulders within a mixed trace without boosting its whole
+/// length.
+pub fn importances(samples: &[Sample], contours: &Contours, widths: &[f64]) -> Vec<f64> {
+    let mut values = vec![Vec::new(); contours.lengths.len()];
+    for (sample, owner) in samples.iter().zip(contours.sample_owners(samples)) {
+        if let Some(owner) = owner {
+            values[owner].push(sample[8]);
         }
     }
-    lengths
-        .iter()
+    values
+        .into_iter()
         .zip(widths)
-        .map(|(&l, &w)| strength(l, w))
+        .map(|(mut values, &width)| {
+            if values.is_empty() {
+                return 0.35;
+            }
+            values.sort_by(f64::total_cmp);
+            let median = values[(values.len() - 1) / 2];
+            let upper = values[(values.len() - 1) * 3 / 4];
+            // Broad, consistently supported colour boundaries must not lose
+            // to one low-contrast patch on a dark hat or cloak. A narrow
+            // hatch gets little width support and still fades with scale.
+            (0.30 * median + 0.50 * upper + 0.20 * ((width - 0.75) / 3.).clamp(0., 1.))
+                .clamp(0.08, 0.98)
+        })
         .collect()
 }
 
-pub fn apply(coverage: &GrayImage, owners: &[Option<usize>], opacities: &[f64]) -> GrayImage {
-    GrayImage::from_fn(coverage.width(), coverage.height(), |x, y| {
-        let i = (y * coverage.width() + x) as usize;
-        let opacity = owners[i].map_or(0., |id| opacities[id]);
-        image::Luma([(coverage.as_raw()[i] as f64 * opacity).round() as u8])
-    })
+/// Convert target-local structural evidence into paint strength. Weak details
+/// fade smoothly as their *normal* thickness is reduced; a line kept at full
+/// length by anisotropic scaling does not pay for the unrelated axis.
+pub fn pixel_strengths_cancellable(
+    importance: &[f64],
+    tangents: &[Option<[f64; 2]>],
+    scale: [f64; 2],
+    cancel: &dyn Cancellation,
+) -> Result<Vec<f64>> {
+    if importance.len() != tangents.len() {
+        return Err(Error::Scaling("Invalid contour opacity dimensions".into()));
+    }
+    let mut strengths = Vec::with_capacity(importance.len());
+    for (i, (&importance, tangent)) in importance.iter().zip(tangents).enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        let tangent = tangent.unwrap_or([1., 0.]);
+        let source_length = (tangent[0] / scale[0].max(1e-9))
+            .hypot(tangent[1] / scale[1].max(1e-9))
+            .max(1e-9);
+        let tangent = [
+            tangent[0] / scale[0].max(1e-9) / source_length,
+            tangent[1] / scale[1].max(1e-9) / source_length,
+        ];
+        let normal_scale = (scale[0] * scale[1]
+            / (tangent[0] * scale[0])
+                .hypot(tangent[1] * scale[1])
+                .max(1e-9))
+        .clamp(0., 1.);
+        let loss = (1. - normal_scale) * (1. - importance) * 1.3;
+        strengths.push((importance * (1. - loss)).clamp(0., 1.));
+    }
+    Ok(strengths)
+}
+
+pub fn apply_pixels(coverage: &GrayImage, strengths: &[f64]) -> Result<GrayImage> {
+    if coverage.as_raw().len() != strengths.len() {
+        return Err(Error::Scaling("Invalid contour opacity dimensions".into()));
+    }
+    Ok(GrayImage::from_fn(
+        coverage.width(),
+        coverage.height(),
+        |x, y| {
+            let i = (y * coverage.width() + x) as usize;
+            let strength = strengths[i];
+            image::Luma([(coverage.as_raw()[i] as f64 * strength).round() as u8])
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn opacity_is_bounded_monotonic_and_needs_both_length_and_width() {
-        assert_eq!(strength(4, 1.), 0.95);
-        assert_eq!(strength(100, 1.), 0.95);
-        assert_eq!(strength(4, 10.), 0.95);
-        assert_eq!(strength(32, 6.), 1.);
-        assert_eq!(strength(100, 10.), 1.);
-        for l in 0..100 {
-            for w in 1..10 {
-                assert!((0.95..=1.).contains(&strength(l, w as f64)));
-                assert!(strength(l + 1, w as f64) >= strength(l, w as f64));
-                assert!(strength(l, w as f64 + 1.) >= strength(l, w as f64));
-            }
-        }
-    }
-    #[test]
-    fn measures_actual_source_width_and_multiplies_aa_without_stacking() {
+    fn measures_actual_source_width() {
         for width in [1, 3, 7] {
             let source = RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 255]));
             let mut mask = Mask::new(20, 20);
@@ -108,13 +144,29 @@ mod tests {
                     mask.data[y * 20 + x] = true;
                 }
             }
-            let sample = [10., 10., 1., 0., 0., 0., 0., 1.];
+            let sample = [10., 10., 1., 0., 0., 0., 0., 1., 1.];
             assert_eq!(measure(&source, &mask, &sample), Some(width as f64));
         }
-        let coverage = GrayImage::from_raw(3, 1, vec![255, 128, 0]).unwrap();
-        assert_eq!(
-            apply(&coverage, &[Some(0), Some(0), None], &[0.95]).as_raw(),
-            &[242, 122, 0]
-        );
+    }
+
+    #[test]
+    fn weak_prominence_fades_with_normal_scale_and_strong_ink_survives() {
+        let tangents = [Some([1., 0.]), Some([1., 0.])];
+        let cancel = crate::CancellationToken::default();
+        let large =
+            pixel_strengths_cancellable(&[0.5, 0.95], &tangents, [0.75, 0.75], &cancel).unwrap();
+        let small =
+            pixel_strengths_cancellable(&[0.5, 0.95], &tangents, [0.25, 0.25], &cancel).unwrap();
+        assert!(small[0] * 4. < large[0] * 3.);
+        assert!(small[1] > 0.85);
+        let unchanged_normal =
+            pixel_strengths_cancellable(&[0.5], &[Some([1., 0.])], [0.25, 1.], &cancel).unwrap();
+        assert_eq!(unchanged_normal, vec![0.5]);
+        let reduced_normal =
+            pixel_strengths_cancellable(&[0.5], &[Some([1., 0.])], [1., 0.25], &cancel).unwrap();
+        assert!(reduced_normal[0] < 0.5);
+        let diagonal =
+            pixel_strengths_cancellable(&[0.5], &[Some([0.8, 0.6])], [0.5, 0.25], &cancel).unwrap();
+        assert!(diagonal[0] > 0.25 && diagonal[0] < 0.5);
     }
 }

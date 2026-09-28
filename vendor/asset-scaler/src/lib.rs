@@ -6,7 +6,11 @@
 mod api;
 pub use api::{Cancellation, CancellationToken, Error, GameAssetAa, Result};
 use image::{GrayImage, RgbaImage};
-use std::sync::{Arc, Mutex};
+pub use line_art::{LineArtSession, Strength};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 mod antialias;
 #[cfg(test)]
 mod benchmarks;
@@ -20,6 +24,7 @@ mod foreground_halo;
 mod halo;
 mod ink;
 mod lanczos;
+mod line_art;
 mod opacity;
 mod paint;
 pub mod pen_aa;
@@ -35,11 +40,13 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 // The source phase keeps the established 512 B/pixel allowance for analysis,
 // contour storage and source resampling. Target data is not concurrent
 // with analysis, but can contain two linear images, contour ownership/colors,
-// support/opacity projections, the output and cache; 160 B/pixel conservatively
+// support/opacity projections, per-pixel contour importance/tangents, their
+// canonicalization copies, per-pixel overlap aggregation, the output and cache;
+// 240 B/pixel conservatively
 // accounts for that composition peak. This phase-aware estimate is capped at
 // four GiB, independently of the decoder and canvas safety limits.
 const SOURCE_PHASE_BYTES: u64 = 512;
-const TARGET_PHASE_BYTES: u64 = 160;
+const TARGET_PHASE_BYTES: u64 = 240;
 const FOREGROUND_SOURCE_BYTES: u64 = 96;
 
 /// Colour to use when painting contours over an externally prepared fill.
@@ -112,10 +119,76 @@ fn check_foreground_working_set_budget(sw: u32, sh: u32, w: u32, h: u32, limit: 
     }
     Ok(())
 }
+
+/// Chebyshev distance to unsupported foreground or the virtual image exterior.
+/// A Chebyshev field matches the square footprint used for rasterized stroke
+/// support, and avoids scanning a width-sized neighbourhood at every core.
+pub(crate) fn foreground_exterior_distance(
+    support: &[bool],
+    w: usize,
+    h: usize,
+    cancel: &dyn Cancellation,
+) -> Result<Vec<usize>> {
+    let Some(len) = w.checked_mul(h) else {
+        return Err(Error::Scaling(
+            "Invalid foreground support dimensions".into(),
+        ));
+    };
+    if support.len() != len {
+        return Err(Error::Scaling(
+            "Invalid foreground support dimensions".into(),
+        ));
+    }
+    let mut unsupported = vec![usize::MAX; len];
+    let mut pending = VecDeque::new();
+    for (i, &inside) in support.iter().enumerate() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        if !inside {
+            unsupported[i] = 0;
+            pending.push_back(i);
+        }
+    }
+    while let Some(i) = pending.pop_front() {
+        if i.is_multiple_of(4096) {
+            cancel.check()?;
+        }
+        let x = i % w;
+        let y = i / w;
+        let next = unsupported[i] + 1;
+        for dy in -1isize..=1 {
+            for dx in -1isize..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let xx = x as isize + dx;
+                let yy = y as isize + dy;
+                if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize {
+                    continue;
+                }
+                let j = yy as usize * w + xx as usize;
+                if next < unsupported[j] {
+                    unsupported[j] = next;
+                    pending.push_back(j);
+                }
+            }
+        }
+    }
+    Ok((0..len)
+        .map(|i| {
+            let x = i % w;
+            let y = i / w;
+            unsupported[i].min((x + 1).min(y + 1).min(w - x).min(h - y))
+        })
+        .collect())
+}
 struct Prepared {
     models: Vec<detect::Model>,
     widths: Vec<f64>,
+    importances: Vec<f64>,
     contours: contours::Contours,
+    /// Detected source ink footprint.
     mask: raster::Mask,
     linear: color::LinearImage,
     silhouette: Option<silhouette::Silhouette>,
@@ -126,27 +199,24 @@ struct TargetContours {
     colors: Vec<[f64; 3]>,
 }
 
-/// Render a contour core on white, mapping the compositor's per-contour
-/// opacity strength to `round(255 * (1 - strength))` grayscale.
-fn strength_contour_image(
+fn strength_contour_image_pixels(
     core: &GrayImage,
-    owners: &[Option<usize>],
     strengths: &[f64],
     cancel: &dyn Cancellation,
 ) -> Result<GrayImage> {
-    if owners.len() != core.as_raw().len() {
+    if core.as_raw().len() != strengths.len() {
         return Err(Error::Scaling("Invalid contour mask dimensions".into()));
     }
-    let mut pixels = Vec::with_capacity(owners.len());
-    for (i, (&value, owner)) in core.as_raw().iter().zip(owners).enumerate() {
+    let mut pixels = Vec::with_capacity(strengths.len());
+    for (i, (&value, &strength)) in core.as_raw().iter().zip(strengths).enumerate() {
         if i.is_multiple_of(4096) {
             cancel.check()?;
         }
-        let strength = match owner {
-            Some(id) if value != 0 => strengths[*id],
-            _ => 0.,
-        };
-        pixels.push((255. * (1. - strength)).round() as u8);
+        pixels.push(if value == 0 {
+            255
+        } else {
+            (255. * (1. - strength)).round() as u8
+        });
     }
     GrayImage::from_vec(core.width(), core.height(), pixels)
         .ok_or_else(|| Error::Scaling("Invalid contour mask dimensions".into()))
@@ -250,6 +320,7 @@ impl Prepared {
         let mask = ink::ink_mask(image, &samples, &thinned, cancel)?;
         cancel.check()?;
         let widths = opacity::widths(image, &mask, &samples, &contours, cancel)?;
+        let importances = opacity::importances(&samples, &contours, &widths);
         let linear = color::LinearImage::from_rgba(image);
         let mut original_is_opaque = true;
         for (i, pixel) in image.pixels().enumerate() {
@@ -266,6 +337,7 @@ impl Prepared {
         Ok(Self {
             models,
             widths,
+            importances,
             contours,
             mask,
             linear,
@@ -320,8 +392,6 @@ impl Prepared {
             contours::MAX_SHORT_PIXELS
         };
         let (retained, owners) = self.contours.retain_with_ids(&self.models, scale, cutoff);
-        // Identity output keeps the established detector patch geometry.
-        // Reduced targets use ordered source traces, then bounded spline fits.
         let fitted = (scale[0] < 1. || scale[1] < 1.)
             .then(|| self.contours.polished(scale, cutoff, cancel))
             .transpose()?;
@@ -354,56 +424,50 @@ impl Prepared {
             )
         };
         cancel.check()?;
-        let mut strokes = strokes::render(&curves, &curve_owners, &self.widths, w, h, aa, cancel)?;
-        let (mut colors, visible) = if ink_source.suppress_unsupported {
-            if let Some(fitted) = &fitted {
-                paint::ink_colors_for_curves(
-                    ink_source.linear,
-                    &fitted.curves,
-                    &fitted.owners,
-                    &retained,
-                    &owners,
-                    &fitted.trace_donors,
-                    &strokes,
-                    scale,
-                    cancel,
-                )?
-            } else {
-                paint::ink_colors_with_visibility(
-                    ink_source.linear,
-                    &retained,
-                    &retained,
-                    &owners,
-                    &strokes,
-                    scale,
-                    cancel,
-                )?
-            }
+        let mut strokes = strokes::render(
+            &curves,
+            &curve_owners,
+            &self.widths,
+            &self.importances,
+            w,
+            h,
+            aa,
+            cancel,
+        )?;
+        self.refine_target_importance(&mut strokes, cancel)?;
+        let (mut colors, visible) = if let Some(fitted) = &fitted {
+            paint::ink_colors_for_curves(
+                ink_source.linear,
+                &fitted.curves,
+                &fitted.owners,
+                &retained,
+                &owners,
+                &fitted.trace_donors,
+                &strokes,
+                scale,
+                cancel,
+            )?
+        } else if ink_source.suppress_unsupported {
+            paint::ink_colors_with_visibility(
+                ink_source.linear,
+                &retained,
+                &retained,
+                &owners,
+                &strokes,
+                scale,
+                cancel,
+            )?
         } else {
-            if let Some(fitted) = &fitted {
-                paint::ink_colors_for_curves(
-                    ink_source.linear,
-                    &fitted.curves,
-                    &fitted.owners,
-                    &retained,
-                    &owners,
-                    &fitted.trace_donors,
-                    &strokes,
-                    scale,
-                    cancel,
-                )?
-            } else {
-                let colors = paint::ink_colors(
-                    ink_source.linear,
-                    &retained,
-                    &retained,
-                    &owners,
-                    &strokes,
-                    scale,
-                    cancel,
-                )?;
-                (colors, vec![true; strokes.coverage.as_raw().len()])
-            }
+            let colors = paint::ink_colors(
+                ink_source.linear,
+                &retained,
+                &retained,
+                &owners,
+                &strokes,
+                scale,
+                cancel,
+            )?;
+            (colors, vec![true; strokes.coverage.as_raw().len()])
         };
         if ink_source.suppress_unsupported {
             for (i, &supported) in visible.iter().enumerate() {
@@ -461,17 +525,19 @@ impl Prepared {
                 curve.map(|p| [(p[0] + 0.5) * scale[0] - 0.5, (p[1] + 0.5) * scale[1] - 0.5])
             })
             .collect::<Vec<_>>();
-        let strokes = strokes::render(
+        let mut strokes = strokes::render(
             &curves,
             &fitted.owners,
             &self.widths,
+            &self.importances,
             w,
             h,
             GameAssetAa::new(0),
             cancel,
         )?;
-        let strengths = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
-        strength_contour_image(&strokes.core, &strokes.owners, &strengths, cancel)
+        self.refine_target_importance(&mut strokes, cancel)?;
+        let strengths = self.intrinsic_strengths(&strokes, cancel)?;
+        strength_contour_image_pixels(&strokes.core, &strengths, cancel)
     }
 
     fn foreground_contour_mask(
@@ -519,19 +585,10 @@ impl Prepared {
             aa,
             cancel,
         )?;
-        // Show the intrinsic (AA100) strength: the AA-hardened strength is
-        // uniformly opaque at AA0 and would hide the established opacity.
-        let strengths = opacity::calculate(
-            &self.widths,
-            &contours.strokes.core,
-            &contours.strokes.owners,
-        );
-        strength_contour_image(
-            &contours.strokes.core,
-            &contours.strokes.owners,
-            &strengths,
-            cancel,
-        )
+        // The preview exposes the same intrinsic strengths used by every
+        // foreground paint mode. AA changes only coverage at the edge.
+        let strengths = self.intrinsic_strengths(&contours.strokes, cancel)?;
+        strength_contour_image_pixels(&contours.strokes.core, &strengths, cancel)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -583,12 +640,8 @@ impl Prepared {
             aa,
             cancel,
         )?;
-        let strength = self.foreground_ink_strengths(&contours.strokes, aa);
-        let paint = opacity::apply(
-            &contours.strokes.coverage,
-            &contours.strokes.owners,
-            &strength,
-        );
+        let strength = self.intrinsic_strengths(&contours.strokes, cancel)?;
+        let paint = opacity::apply_pixels(&contours.strokes.coverage, &strength)?;
         let painted = paint::composite(&finished.linear, &contours.colors, &paint);
         let painted = foreground_halo::clean(
             foreground_halo::Inputs {
@@ -639,8 +692,8 @@ impl Prepared {
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
-        let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
-        let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+        let strength = self.intrinsic_strengths(&strokes, cancel)?;
+        let paint = opacity::apply_pixels(&strokes.coverage, &strength)?;
         let fill = self
             .fill_for_target(
                 fill_linear,
@@ -708,37 +761,9 @@ impl Prepared {
             None
         };
         let base = halo::apply(fill_source, &retained_mask, base, &strokes.core, cancel)?;
-        let fill = if let Some(silhouette) = fill_silhouette {
-            let source_coverage = silhouette.coverage(w as usize, h as usize, cancel)?;
-            let coverage = silhouette.target_coverage(&source_coverage, request.aa, cancel)?;
-            let opacity = silhouette.intrinsic_opacity(
-                fill_source,
-                &source_coverage,
-                w as usize,
-                h as usize,
-                cancel,
-            )?;
-            let mut pixels = Vec::with_capacity(base.pixels.len());
-            for (i, ((pixel, support), intrinsic)) in
-                base.pixels.iter().zip(coverage).zip(opacity).enumerate()
-            {
-                if i % 4096 == 0 {
-                    cancel.check()?;
-                }
-                let alpha = (intrinsic * support).clamp(0., 1.);
-                pixels.push(if alpha <= 1e-8 {
-                    [0.; 4]
-                } else {
-                    [pixel[0], pixel[1], pixel[2], alpha]
-                });
-            }
-            color::LinearImage {
-                w: w as usize,
-                h: h as usize,
-                pixels,
-            }
-        } else {
-            base
+        let fill = match fill_silhouette {
+            Some(silhouette) => silhouette.target_alpha(base, fill_source, request.aa, cancel)?,
+            None => base,
         };
         Ok(FinishedFill {
             linear: fill,
@@ -849,12 +874,8 @@ impl Prepared {
             aa,
             cancel,
         )?;
-        let strength = self.foreground_ink_strengths(&contours.strokes, aa);
-        let paint = opacity::apply(
-            &contours.strokes.coverage,
-            &contours.strokes.owners,
-            &strength,
-        );
+        let strength = self.intrinsic_strengths(&contours.strokes, cancel)?;
+        let paint = opacity::apply_pixels(&contours.strokes.coverage, &strength)?;
         let baseline = paint::composite(&fill.linear, &contours.colors, &paint);
         foreground_halo::clean(
             foreground_halo::Inputs {
@@ -881,7 +902,7 @@ impl Prepared {
         aa: GameAssetAa,
         cancel: &dyn Cancellation,
     ) -> Result<()> {
-        let raw = raster::Mask {
+        let mut raw = raster::Mask {
             w: strokes.core.width() as usize,
             h: strokes.core.height() as usize,
             data: strokes
@@ -891,20 +912,119 @@ impl Prepared {
                 .map(|&value| value != 0)
                 .collect(),
         };
-        if colors.len() != raw.data.len() || strokes.owners.len() != raw.data.len() {
+        if colors.len() != raw.data.len()
+            || support.len() != raw.data.len()
+            || strokes.owners.len() != raw.data.len()
+            || strokes.importance.len() != raw.data.len()
+            || strokes.tangents.len() != raw.data.len()
+            || strokes.footprint.len() != raw.data.len()
+        {
             return Err(Error::Scaling(
                 "Invalid foreground contour ownership".into(),
             ));
         }
-        let canonical = target_cleanup::thin_outer(&raw, support, cancel)?;
+        let exterior_distance = foreground_exterior_distance(support, raw.w, raw.h, cancel)?;
+        // This is target-scale evidence after reduced colour-gradient
+        // refinement. Cull low-prominence interior noise before it can become
+        // a topology-preserving alternate route. Boundary ink remains: its
+        // exterior relationship is semantic, rather than texture noise.
+        for (i, &distance) in exterior_distance.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if !raw.data[i] || strokes.importance[i] >= 0.16 {
+                continue;
+            }
+            let boundary = distance as f64 <= strokes.footprint[i].ceil().max(2.);
+            if !boundary {
+                raw.data[i] = false;
+                strokes.core.as_mut()[i] = 0;
+                strokes.coverage.as_mut()[i] = 0;
+                strokes.owners[i] = None;
+            }
+        }
+        let mut cleanup_importance = strokes.importance.clone();
+        for (i, value) in cleanup_importance.iter_mut().enumerate() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if !raw.data[i] {
+                continue;
+            }
+            let touches_exterior =
+                exterior_distance[i] as f64 <= strokes.footprint[i].ceil().max(2.);
+            if touches_exterior {
+                *value = 1.;
+            }
+        }
+        let canonical =
+            target_cleanup::thin_outer_weighted(&raw, support, &cleanup_importance, cancel)?;
         let previous_coverage = strokes.coverage.as_raw().to_vec();
         let previous_owners = strokes.owners.clone();
+        let previous_importance = strokes.importance.clone();
+        let previous_tangents = strokes.tangents.clone();
         for (i, &keep) in canonical.data.iter().enumerate() {
             if i.is_multiple_of(4096) {
                 cancel.check()?;
             }
             if raw.data[i] && !keep {
                 strokes.core.as_mut()[i] = 0;
+            }
+            if keep {
+                strokes.importance[i] = cleanup_importance[i];
+                let mut contributors = std::collections::BTreeMap::<usize, f64>::new();
+                let x = i % raw.w;
+                let y = i / raw.w;
+                for dy in -2isize..=2 {
+                    for dx in -2isize..=2 {
+                        let xx = x as isize + dx;
+                        let yy = y as isize + dy;
+                        if xx < 0 || yy < 0 || xx >= raw.w as isize || yy >= raw.h as isize {
+                            continue;
+                        }
+                        let j = yy as usize * raw.w + xx as usize;
+                        let Some(owner) = previous_owners[j] else {
+                            continue;
+                        };
+                        if !raw.data[j]
+                            || canonical.data[j]
+                            || owner == previous_owners[i].unwrap_or(owner)
+                        {
+                            continue;
+                        }
+                        let (Some(a), Some(b)) = (previous_tangents[i], previous_tangents[j])
+                        else {
+                            continue;
+                        };
+                        if (a[0] * b[0] + a[1] * b[1]).abs() < 0.9 {
+                            continue;
+                        }
+                        let along = (dx as f64 * a[0] + dy as f64 * a[1]).abs();
+                        if along > 1.1 {
+                            continue;
+                        }
+                        contributors
+                            .entry(owner)
+                            .and_modify(|value| *value = value.max(previous_importance[j]))
+                            .or_insert(previous_importance[j]);
+                    }
+                }
+                let mut values: Vec<_> = contributors.into_values().collect();
+                values.push(strokes.importance[i]);
+                let strongest = values.iter().copied().fold(0., f64::max);
+                let strongest_index = values
+                    .iter()
+                    .position(|&value| value == strongest)
+                    .expect("contour aggregation has one value");
+                let residual = values
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(index, _)| index != strongest_index)
+                    .map(|(_, value)| value)
+                    .map(|value| 1. - 0.65 * value)
+                    .product::<f64>();
+                let combined = 1. - (1. - strongest) * residual;
+                strokes.importance[i] = combined;
             }
         }
         for i in 0..raw.data.len() {
@@ -946,26 +1066,127 @@ impl Prepared {
                     (ddx * ddx + ddy * ddy, j)
                 });
             if let Some(j) = donor {
-                strokes.coverage.as_mut()[i] = old_coverage;
+                // A removed core may contribute only a pen fringe. Restoring
+                // its old full coverage would recreate an interior parallel
+                // stroke after canonical outer placement.
+                strokes.coverage.as_mut()[i] = if raw.data[i] {
+                    let cap = (128_u16 * u16::from(aa.percent()) / 100) as u8;
+                    old_coverage.min(cap)
+                } else {
+                    old_coverage
+                };
                 strokes.owners[i] = previous_owners[j];
                 colors[i] = colors[j];
+                strokes.importance[i] = strokes.importance[j];
+                strokes.tangents[i] = strokes.tangents[j];
             }
         }
         Ok(())
     }
 
-    /// Foreground ink deliberately hardens its own core as antialiasing is
-    /// reduced. The intrinsic contour strength remains the AA100 endpoint.
-    fn foreground_ink_strengths(&self, strokes: &strokes::Strokes, aa: GameAssetAa) -> Vec<f64> {
-        let intrinsic = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
-        if aa.percent() == 100 {
-            return intrinsic;
+    fn intrinsic_strengths(
+        &self,
+        strokes: &strokes::Strokes,
+        cancel: &dyn Cancellation,
+    ) -> Result<Vec<f64>> {
+        opacity::pixel_strengths_cancellable(
+            &strokes.importance,
+            &strokes.tangents,
+            [
+                strokes.core.width() as f64 / self.linear.w as f64,
+                strokes.core.height() as f64 / self.linear.h as f64,
+            ],
+            cancel,
+        )
+    }
+
+    /// Measure colour edges after reduction, but only at the already accepted
+    /// source-derived contour pixels. This preserves ridge geometry and donor
+    /// ownership while allowing broad hat/cape boundaries to survive the
+    /// target scale that naturally averages away fine hatching.
+    fn refine_target_importance(
+        &self,
+        strokes: &mut strokes::Strokes,
+        cancel: &dyn Cancellation,
+    ) -> Result<()> {
+        let (w, h) = (
+            strokes.core.width() as usize,
+            strokes.core.height() as usize,
+        );
+        let reduced = lanczos::resize(&self.linear, w, h, cancel)?;
+        let colour = |x: isize, y: isize| {
+            if x < 0 || y < 0 || x >= w as isize || y >= h as isize {
+                return [1.; 3];
+            }
+            let pixel = reduced.pixels[y as usize * w + x as usize];
+            [
+                pixel[0] * pixel[3] + 1. - pixel[3],
+                pixel[1] * pixel[3] + 1. - pixel[3],
+                pixel[2] * pixel[3] + 1. - pixel[3],
+            ]
+        };
+        let sobel = |x: isize, y: isize| {
+            let mut gx = [0.; 3];
+            let mut gy = [0.; 3];
+            for (dy, row_weight) in [(-1, 1.), (0, 2.), (1, 1.)] {
+                for (dx, column_weight) in [-1, 0, 1].into_iter().zip([-1., 0., 1.]) {
+                    let value = colour(x + dx, y + dy);
+                    for channel in 0..3 {
+                        gx[channel] += row_weight * column_weight * value[channel];
+                    }
+                }
+            }
+            for (dy, row_weight) in [-1, 0, 1].into_iter().zip([-1., 0., 1.]) {
+                for (dx, column_weight) in [-1, 0, 1].into_iter().zip([1., 2., 1.]) {
+                    let value = colour(x + dx, y + dy);
+                    for channel in 0..3 {
+                        gy[channel] += row_weight * column_weight * value[channel];
+                    }
+                }
+            }
+            (gx.into_iter().map(|v| v * v).sum::<f64>()
+                + gy.into_iter().map(|v| v * v).sum::<f64>())
+            .sqrt()
+                / 5.657
+        };
+        for i in 0..strokes.importance.len() {
+            if i.is_multiple_of(4096) {
+                cancel.check()?;
+            }
+            if strokes.core.as_raw()[i] == 0 {
+                continue;
+            }
+            let x = (i % w) as isize;
+            let y = (i / w) as isize;
+            // A ridge core can lie in the middle of a wide dark band. Search
+            // two target samples around it so either shoulder supplies the
+            // Sobel evidence instead of mistaking the flat center for noise.
+            let edge = (-2..=2)
+                .flat_map(|dy| (-2..=2).map(move |dx| sobel(x + dx, y + dy)))
+                .fold(0., f64::max);
+            if let (Some(owner), Some(tangent)) = (strokes.owners[i], strokes.tangents[i]) {
+                let scale = [
+                    w as f64 / self.linear.w as f64,
+                    h as f64 / self.linear.h as f64,
+                ];
+                let source_length = (tangent[0] / scale[0].max(1e-9))
+                    .hypot(tangent[1] / scale[1].max(1e-9))
+                    .max(1e-9);
+                let tangent = [
+                    tangent[0] / scale[0].max(1e-9) / source_length,
+                    tangent[1] / scale[1].max(1e-9) / source_length,
+                ];
+                let normal_scale = scale[0] * scale[1]
+                    / (tangent[0] * scale[0])
+                        .hypot(tangent[1] * scale[1])
+                        .max(1e-9);
+                strokes.footprint[i] = (self.widths[owner] * normal_scale * 0.5 + 1.).max(2.);
+            }
+            // The reduced-edge floor is deliberately local. It cannot make a
+            // weak long path strong away from a supported target boundary.
+            strokes.importance[i] = strokes.importance[i].max((edge * 0.82).clamp(0., 0.98));
         }
-        let fraction = f64::from(aa.percent()) / 100.;
-        intrinsic
-            .into_iter()
-            .map(|strength| 1. - fraction * (1. - strength))
-            .collect()
+        Ok(())
     }
 
     fn resize_over_fill(
@@ -977,8 +1198,8 @@ impl Prepared {
     ) -> Result<RgbaImage> {
         let TargetContours { strokes, colors } =
             self.target_contours(original, request.w, request.h, request.aa, cancel)?;
-        let strength = opacity::calculate(&self.widths, &strokes.core, &strokes.owners);
-        let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+        let strength = self.intrinsic_strengths(&strokes, cancel)?;
+        let paint = opacity::apply_pixels(&strokes.coverage, &strength)?;
         let fill_source = color::LinearImage::from_rgba(fill_source);
         let base = lanczos::resize(&fill_source, request.w as usize, request.h as usize, cancel)?;
         let fill = if let Some(silhouette) = &self.silhouette {

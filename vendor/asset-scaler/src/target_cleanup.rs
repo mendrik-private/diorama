@@ -8,9 +8,19 @@ use std::{
 
 /// Thin the complete target contour union, preferring the edge nearest the
 /// unsupported foreground or virtual exterior. This never creates pixels.
+#[cfg(test)]
 pub(crate) fn thin_outer(
     raw: &Mask,
     foreground_support: &[bool],
+    cancel: &dyn Cancellation,
+) -> Result<Mask> {
+    thin_outer_weighted(raw, foreground_support, &vec![1.; raw.data.len()], cancel)
+}
+
+pub(crate) fn thin_outer_weighted(
+    raw: &Mask,
+    foreground_support: &[bool],
+    importance: &[f64],
     cancel: &dyn Cancellation,
 ) -> Result<Mask> {
     cancel.check()?;
@@ -19,7 +29,7 @@ pub(crate) fn thin_outer(
             "Invalid target contour cleanup inputs".into(),
         ));
     };
-    if raw.data.len() != len || foreground_support.len() != len {
+    if raw.data.len() != len || foreground_support.len() != len || importance.len() != len {
         return Err(Error::Scaling(
             "Invalid target contour cleanup inputs".into(),
         ));
@@ -66,14 +76,24 @@ pub(crate) fn thin_outer(
             }
         }
     }
-    let priority: Vec<_> = distance.iter().map(|&value| value as f64).collect();
+    // Preserve the exterior-supported track when two close parallel lines
+    // collapse at target resolution. Within one exterior layer, delete a weak
+    // alternative before it can become a topological route that protects a
+    // strong outline or hatching lattice.
+    let priority: Vec<_> = distance
+        .iter()
+        .zip(importance)
+        .map(|(&distance, &importance)| {
+            distance as f64 * 64. + (1. - importance.clamp(0., 1.)) * 32.
+        })
+        .collect();
     let thinned = cleanup::thin(raw, &priority, cancel)?;
     let mut result = thinned;
     remove_short_terminal_branches(&mut result, cancel)?;
-    remove_redundant_thickness(&mut result, &distance, cancel)?;
+    remove_redundant_thickness(&mut result, &distance, importance, cancel)?;
     move_endpoints_outward(&mut result, raw, &priority, cancel)?;
     remove_short_terminal_branches(&mut result, cancel)?;
-    remove_redundant_thickness(&mut result, &distance, cancel)?;
+    remove_redundant_thickness(&mut result, &distance, importance, cancel)?;
     remove_short_components(&mut result, cancel)?;
     cancel.check()?;
     Ok(result)
@@ -177,6 +197,7 @@ fn redundant_pixel(mask: &Mask, i: usize) -> bool {
 fn remove_redundant_thickness(
     mask: &mut Mask,
     distance: &[usize],
+    importance: &[f64],
     cancel: &dyn Cancellation,
 ) -> Result<()> {
     let mut candidates = BinaryHeap::new();
@@ -185,11 +206,12 @@ fn remove_redundant_thickness(
             cancel.check()?;
         }
         if redundant_pixel(mask, i) {
-            candidates.push((priority, Reverse(i)));
+            let weak_first = ((1. - importance[i].clamp(0., 1.)) * 4096.).round() as u16;
+            candidates.push((priority, weak_first, Reverse(i)));
         }
     }
     let mut visits = 0usize;
-    while let Some((_, Reverse(i))) = candidates.pop() {
+    while let Some((_, _, Reverse(i))) = candidates.pop() {
         if visits.is_multiple_of(4096) {
             cancel.check()?;
         }
@@ -200,7 +222,8 @@ fn remove_redundant_thickness(
         mask.data[i] = false;
         for neighbor in neighbors8(mask, i) {
             if redundant_pixel(mask, neighbor) {
-                candidates.push((distance[neighbor], Reverse(neighbor)));
+                let weak_first = ((1. - importance[neighbor].clamp(0., 1.)) * 4096.).round() as u16;
+                candidates.push((distance[neighbor], weak_first, Reverse(neighbor)));
             }
         }
     }
@@ -457,6 +480,86 @@ mod tests {
                 .all(|&on| !on)
         );
         assert!(no_redundant_corner(&cleaned));
+    }
+
+    #[test]
+    fn exterior_parallel_track_wins_even_when_its_source_is_weaker() {
+        let mut raw = Mask::new(7, 4);
+        for x in 1..=5 {
+            raw.data[raw.w + x] = true;
+            raw.data[2 * raw.w + x] = true;
+        }
+        let mut support = vec![true; raw.data.len()];
+        support[..raw.w].fill(false);
+        let mut importance = vec![1.; raw.data.len()];
+        for x in 1..=5 {
+            importance[raw.w + x] = 0.35;
+            importance[2 * raw.w + x] = 0.8;
+        }
+        let cleaned =
+            thin_outer_weighted(&raw, &support, &importance, &CancellationToken::default())
+                .unwrap();
+        assert!(cleaned.data[raw.w + 1..raw.w + 6].iter().all(|&on| on));
+        assert!(
+            cleaned.data[2 * raw.w + 1..2 * raw.w + 6]
+                .iter()
+                .all(|&on| !on)
+        );
+    }
+
+    #[test]
+    fn exterior_track_wins_for_diagonal_and_steep_touching_pairs() {
+        let cancel = CancellationToken::default();
+        for (outer, inner, unsupported) in [
+            (
+                vec![(10, 4), (11, 5), (12, 6), (13, 7), (14, 8), (15, 9)],
+                vec![(9, 5), (10, 6), (11, 7), (12, 8), (13, 9), (14, 10)],
+                (0..32).map(|x| (x, 0)).collect::<Vec<_>>(),
+            ),
+            (
+                vec![(4, 10), (5, 11), (5, 12), (6, 13), (6, 14), (7, 15)],
+                vec![(5, 10), (6, 11), (6, 12), (7, 13), (7, 14), (8, 15)],
+                (0..32).map(|y| (0, y)).collect::<Vec<_>>(),
+            ),
+        ] {
+            let mut points = outer.clone();
+            points.extend(&inner);
+            let raw = mask(32, 32, &points);
+            let mut support = vec![true; raw.data.len()];
+            for (x, y) in unsupported {
+                support[y * 32 + x] = false;
+            }
+            let mut importance = vec![1.; raw.data.len()];
+            for &(x, y) in &outer {
+                importance[y * 32 + x] = 0.35;
+            }
+            for &(x, y) in &inner {
+                importance[y * 32 + x] = 0.8;
+            }
+            let cleaned = thin_outer_weighted(&raw, &support, &importance, &cancel).unwrap();
+            let cleaned_points: Vec<_> = cleaned
+                .data
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &on)| on.then_some((i % 32, i / 32)))
+                .collect();
+            assert!(
+                component_sizes(&cleaned).as_slice() == [cleaned_points.len()],
+                "the merged track stays connected: {cleaned_points:?}"
+            );
+            assert!(
+                outer[1..outer.len() - 2]
+                    .iter()
+                    .all(|&(x, y)| cleaned.data[y * 32 + x]),
+                "the merged diagonal/steep path keeps its exterior middle: {cleaned_points:?}"
+            );
+            assert!(
+                inner[1..inner.len() - 2]
+                    .iter()
+                    .all(|&(x, y)| !cleaned.data[y * 32 + x]),
+                "the interior track is removed away from the raster endpoints: {cleaned_points:?}"
+            );
+        }
     }
 
     #[test]

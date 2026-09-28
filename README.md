@@ -130,11 +130,12 @@ window responsive while larger edits render.
   aspect ratio.
 - Preview scaling fitted to the window or at actual output-pixel size, and hold
   a control to compare against the original.
-- Choose nearest-neighbor, bicubic, Lanczos, or contour-preserving Game Asset
-  scaling with direct Lanczos3 source filling and bounded halo correction.
-- Game Asset analyzes the original artwork, removes its background with
-  BiRefNet, scales the isolated foreground, then paints the original contours
-  on top.
+- Choose nearest-neighbor, bicubic, Lanczos, or line-art Game Asset scaling.
+- Game Asset draws line art of the original artwork with FLUX.2 [klein],
+  removes its background with BiRefNet, and scales the isolated foreground with
+  Lanczos3. The line art is scaled with bicubic, sharpened with an unsharp
+  mask whose **Strength** (0–100, default 40) sets its amount, and multiplied
+  over the foreground. See [Game Asset scaling](docs/game-asset-scaling.md).
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
 
@@ -331,6 +332,46 @@ The default model location is `$XDG_CACHE_HOME/diorama/big-lama.pt`, or
 an app-cache model if present, then reuses this host-cache model, so it does not
 download a second copy. The setup script verifies the checksum published by the
 [IOPaint LaMa integration](https://github.com/Sanster/IOPaint/blob/main/iopaint/model/lama.py).
+
+### Local line-art generation
+
+Game Asset scaling multiplies line art that [FLUX.2 [klein]
+4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) draws from the
+original image, locally and offline, over the scaled foreground. Run setup once
+with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA):
+
+```sh
+python3 build-aux/setup-line-art.py
+```
+
+Setup is idempotent. It creates `~/.cache/diorama/line-art-venv` with
+`--system-site-packages`, so it reuses that PyTorch, and installs pinned
+diffusers, transformers, and accelerate. It then downloads the pinned model
+revision (about 16 GB) to `$XDG_CACHE_HOME/diorama/flux2-klein-4b`, and records
+the environment in `~/.config/diorama/line-art-runtime.conf`. An interrupted
+download can be resumed by rerunning it; completed files are kept.
+
+Inference runs in bf16 with every component loaded straight onto the GPU. The
+fixed prompt is encoded once and its embeddings are cached next to the model, so
+the text encoder (about 8 GB) and the transformer (about 8 GB) are never loaded
+together; plan for about 8 GB of free GPU memory. Diorama refuses CPU inference
+unless `DIORAMA_LINE_ART_DEVICE=cpu` is set. `DIORAMA_LINE_ART_PYTHON` and
+`DIORAMA_LINE_ART_MODEL` override the interpreter and model directory. The
+model must carry setup's revision marker; the worker never downloads anything.
+Flatpak uses the host runtime and an app-cache or host-cache model through its
+host-launch permission.
+
+Input is white-composited, reduced to at most 1024 pixels on its longest side
+with both sides rounded down to multiples of 16, and the result is restored to
+the original dimensions. Accepted results are cached in
+`$XDG_CACHE_HOME/diorama/line-art`, keyed by the input pixels, model revision,
+prompt, and generation settings, so a repeated image skips inference; the 64
+most recently used results are kept. Diorama rejects solid results and line art
+that does not line up with the source's colour edges; sparse or empty line art
+is accepted, so a flat source scales with fill only. Rejected, failed, and
+cancelled runs are never cached.
+The model is licensed under Apache 2.0; see [the attribution
+notice](THIRD_PARTY_FLUX2.md).
 
 ### Optional embedded Python runtime
 

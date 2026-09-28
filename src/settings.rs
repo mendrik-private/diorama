@@ -2,7 +2,7 @@ use gio::prelude::*;
 
 use crate::APP_ID;
 use crate::canvas::{Background, ZoomFilter};
-use crate::document::{GameAssetAa, GameAssetOptions, Resampling};
+use crate::document::{GameAssetOptions, Resampling};
 use crate::navigation::SortOrder;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -167,31 +167,18 @@ impl Settings {
         );
     }
 
-    pub fn game_asset_aa(&self) -> GameAssetAa {
-        GameAssetAa::new(self.integer("game-asset-aa").unwrap_or(50).clamp(0, 100) as u8)
-    }
-
-    pub fn set_game_asset_aa(&self, aa: GameAssetAa) {
-        self.set_integer("game-asset-aa", i32::from(aa.percent()));
-    }
-
-    pub fn game_asset_contour_opacity(&self) -> u8 {
-        self.integer("game-asset-contour-opacity")
-            .unwrap_or(100)
-            .clamp(0, 100) as u8
-    }
-
-    pub fn set_game_asset_contour_opacity(&self, opacity: u8) {
-        self.set_integer("game-asset-contour-opacity", i32::from(opacity.min(100)));
-    }
-
     pub fn game_asset_options(&self) -> GameAssetOptions {
-        GameAssetOptions::new(self.game_asset_aa(), self.game_asset_contour_opacity())
+        self.integer("game-asset-strength")
+            .map_or_else(GameAssetOptions::default, |strength| {
+                GameAssetOptions::new(strength.clamp(0, 100) as u8)
+            })
     }
 
     pub fn set_game_asset_options(&self, options: GameAssetOptions) {
-        self.set_game_asset_aa(options.aa());
-        self.set_game_asset_contour_opacity(options.contour_opacity());
+        self.set_integer(
+            "game-asset-strength",
+            i32::from(options.strength().percent()),
+        );
     }
 
     pub fn color_picker_format(&self) -> ColorFormat {
@@ -431,7 +418,7 @@ fn has_key(settings: &gio::Settings, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ColorFormat, Settings, ZoomMode};
-    use crate::document::{GameAssetAa, GameAssetOptions, Resampling};
+    use crate::document::{GameAssetOptions, Resampling};
 
     #[test]
     fn color_format_defaults_to_hex() {
@@ -452,8 +439,8 @@ mod tests {
         assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
         settings.set_pasted_image_resampling(Resampling::Lanczos);
         assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
-        settings.set_game_asset_options(GameAssetOptions::new(GameAssetAa::new(100), 0));
-        assert_eq!(settings.game_asset_contour_opacity(), 100);
+        settings.set_game_asset_options(GameAssetOptions::new(100));
+        assert_eq!(settings.game_asset_options(), GameAssetOptions::default());
         settings.set_pencil_size(128);
         settings.set_pencil_antialiasing(true);
         settings.set_mesh_grid_size(100);
@@ -482,5 +469,8 @@ mod tests {
         assert_eq!(settings.pasted_image_resampling(), Resampling::Bicubic);
         settings.set_pasted_image_resampling(Resampling::Lanczos);
         assert_eq!(settings.pasted_image_resampling(), Resampling::Lanczos);
+        assert_eq!(settings.game_asset_options(), GameAssetOptions::new(40));
+        settings.set_game_asset_options(GameAssetOptions::new(73));
+        assert_eq!(settings.game_asset_options(), GameAssetOptions::new(73));
     }
 }

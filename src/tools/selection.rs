@@ -1,16 +1,17 @@
 use std::{
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
+    time::Duration,
 };
 
 use image::{GrayImage, Rgba, RgbaImage};
 
 use crate::error::{AppError, Result};
-use crate::tools::crop::CropBounds;
+use crate::tools::{
+    crop::CropBounds,
+    worker_process::{self, Launch, WaitError},
+};
 
 pub fn bounds_between(
     start: (u32, u32),
@@ -142,7 +143,7 @@ fn birefnet_runtime() -> Result<BiRefNetRuntime> {
         backend: std::env::var("SPRITE_STUDIO_BIREFNET_BACKEND").unwrap_or_else(|_| "gpu".into()),
         timeout: Duration::from_secs(600),
         poll_interval: Duration::from_millis(20),
-        launch: launch_mode_from(Path::new("/.flatpak-info")),
+        launch: Launch::detect(),
         temporary_root: shared_cache_directory()?,
     })
 }
@@ -154,75 +155,24 @@ struct BiRefNetRuntime {
     backend: String,
     timeout: Duration,
     poll_interval: Duration,
-    launch: BiRefNetLaunch,
+    launch: Launch,
     temporary_root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BiRefNetLaunch {
-    Direct,
-    FlatpakHost { launcher: PathBuf },
-}
-
-fn launch_mode_from(flatpak_info: &Path) -> BiRefNetLaunch {
-    if flatpak_info.is_file() {
-        BiRefNetLaunch::FlatpakHost {
-            launcher: PathBuf::from("flatpak-spawn"),
-        }
-    } else {
-        BiRefNetLaunch::Direct
-    }
-}
-
 fn shared_cache_directory() -> Result<PathBuf> {
-    let cache_home = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .ok_or_else(|| {
-            AppError::BackgroundRemoval("HOME is unavailable; configure vision.cpp".into())
-        })?;
+    let cache_home = worker_process::cache_home().ok_or_else(|| {
+        AppError::BackgroundRemoval("HOME is unavailable; configure vision.cpp".into())
+    })?;
     let directory = cache_home.join("diorama").join("background-removal");
     fs::create_dir_all(&directory)?;
     Ok(directory)
 }
 
-const LOG_TAIL_BYTES: u64 = 8 * 1024;
-
-fn log_tail(path: &std::path::Path) -> String {
-    let Ok(mut log) = File::open(path) else {
-        return "<unavailable>".into();
-    };
-    let start = log
-        .metadata()
-        .map(|metadata| metadata.len().saturating_sub(LOG_TAIL_BYTES))
-        .unwrap_or(0);
-    if log.seek(SeekFrom::Start(start)).is_err() {
-        return "<unavailable>".into();
-    }
-    let mut tail = String::new();
-    if log.take(LOG_TAIL_BYTES).read_to_string(&mut tail).is_err() {
-        return "<unavailable>".into();
-    }
-    if start > 0 {
-        tail.insert_str(0, "…\n");
-    }
-    tail.trim().to_owned()
-}
-
-fn runtime_error(message: impl std::fmt::Display, log: &std::path::Path) -> AppError {
-    AppError::BackgroundRemoval(format!("{message}. BiRefNet log tail: {}", log_tail(log)))
-}
-
-fn kill_and_reap(child: &mut Child) {
-    // `kill` reports InvalidInput when `try_wait` raced with normal exit; the
-    // following `wait` still reaps that child (or confirms it was already reaped).
-    let _ = child.kill();
-    let _ = child.wait();
+fn runtime_error(message: impl std::fmt::Display, log: &Path) -> AppError {
+    AppError::BackgroundRemoval(format!(
+        "{message}. BiRefNet log tail: {}",
+        worker_process::log_tail(log)
+    ))
 }
 
 fn birefnet_command(
@@ -231,21 +181,7 @@ fn birefnet_command(
     output: &Path,
     foreground: Option<&Path>,
 ) -> Command {
-    let mut command = match &runtime.launch {
-        BiRefNetLaunch::Direct => Command::new(&runtime.executable),
-        BiRefNetLaunch::FlatpakHost { launcher } => {
-            let mut command = Command::new(launcher);
-            command
-                .args([
-                    "--host",
-                    "--watch-bus",
-                    "--unset-env=LD_LIBRARY_PATH",
-                    "--unset-env=LD_PRELOAD",
-                ])
-                .arg(&runtime.executable);
-            command
-        }
-    };
+    let mut command = runtime.launch.command(&runtime.executable, None);
     command
         .args(["birefnet", "-m"])
         .arg(&runtime.model)
@@ -327,46 +263,38 @@ fn birefnet_with_runtime(
     let foreground = directory.path().join("foreground.png");
     let log = directory.path().join("birefnet.log");
     image.save(&input)?;
-    let log_file = File::create(&log)?;
-    let mut child = birefnet_command(
-        runtime,
-        &input,
-        &output,
-        estimate_foreground.then_some(foreground.as_path()),
+    let mut child = worker_process::spawn_logged(
+        &mut birefnet_command(
+            runtime,
+            &input,
+            &output,
+            estimate_foreground.then_some(foreground.as_path()),
+        ),
+        &log,
     )
-    .stdin(Stdio::null())
-    .stdout(log_file.try_clone()?)
-    .stderr(log_file)
-    .spawn()
     .map_err(|error| {
         AppError::BackgroundRemoval(format!("Could not launch vision.cpp: {error}"))
     })?;
-    let started = Instant::now();
-    loop {
-        if let Err(error) = cancellation.check() {
-            kill_and_reap(&mut child);
-            return Err(error);
+    match worker_process::wait(
+        &mut child,
+        cancellation,
+        runtime.timeout,
+        runtime.poll_interval,
+    ) {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return Err(runtime_error(
+                format!("BiRefNet failed with status {status}"),
+                &log,
+            ));
         }
-        if started.elapsed() >= runtime.timeout {
-            kill_and_reap(&mut child);
-            return Err(runtime_error("BiRefNet timed out", &log));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(status)) => {
-                return Err(runtime_error(
-                    format!("BiRefNet failed with status {status}"),
-                    &log,
-                ));
-            }
-            Ok(None) => thread::sleep(runtime.poll_interval),
-            Err(error) => {
-                kill_and_reap(&mut child);
-                return Err(runtime_error(
-                    format!("Could not wait for BiRefNet: {error}"),
-                    &log,
-                ));
-            }
+        Err(WaitError::Cancelled(error)) => return Err(error),
+        Err(WaitError::TimedOut) => return Err(runtime_error("BiRefNet timed out", &log)),
+        Err(WaitError::Io(error)) => {
+            return Err(runtime_error(
+                format!("Could not wait for BiRefNet: {error}"),
+                &log,
+            ));
         }
     }
     let mask = image::open(output)?.into_luma8();
@@ -495,16 +423,6 @@ mod tests {
         assert_eq!(image.get_pixel(3, 0).0, [9, 9, 9, 255]);
     }
 
-    #[test]
-    fn birefnet_log_tail_is_bounded() {
-        let directory = tempfile::tempdir().unwrap();
-        let log = directory.path().join("runtime.log");
-        std::fs::write(&log, vec![b'x'; super::LOG_TAIL_BYTES as usize + 512]).unwrap();
-        let tail = super::log_tail(&log);
-        assert!(tail.starts_with('…'));
-        assert!(tail.len() <= super::LOG_TAIL_BYTES as usize + "…\n".len());
-    }
-
     #[cfg(unix)]
     fn fake_runtime(
         directory: &std::path::Path,
@@ -512,10 +430,8 @@ mod tests {
         script: &str,
         timeout: std::time::Duration,
     ) -> super::BiRefNetRuntime {
-        use std::os::unix::fs::PermissionsExt;
         let executable = directory.join(name);
-        std::fs::write(&executable, script).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::tools::worker_process::write_test_executable(&executable, script);
         let model = directory.join("model.gguf");
         std::fs::write(&model, b"GGUF").unwrap();
         super::BiRefNetRuntime {
@@ -524,26 +440,9 @@ mod tests {
             backend: "cpu".into(),
             timeout,
             poll_interval: std::time::Duration::from_millis(2),
-            launch: super::BiRefNetLaunch::Direct,
+            launch: crate::tools::worker_process::Launch::Direct,
             temporary_root: directory.join("cache with spaces"),
         }
-    }
-
-    #[test]
-    fn launch_mode_detects_flatpak_explicitly() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("flatpak-info");
-        assert_eq!(
-            super::launch_mode_from(&marker),
-            super::BiRefNetLaunch::Direct
-        );
-        std::fs::write(&marker, "[Instance]\n").unwrap();
-        assert_eq!(
-            super::launch_mode_from(&marker),
-            super::BiRefNetLaunch::FlatpakHost {
-                launcher: PathBuf::from("flatpak-spawn"),
-            }
-        );
     }
 
     #[test]
@@ -554,7 +453,7 @@ mod tests {
             backend: "gpu".into(),
             timeout: std::time::Duration::from_secs(1),
             poll_interval: std::time::Duration::from_millis(1),
-            launch: super::BiRefNetLaunch::FlatpakHost {
+            launch: crate::tools::worker_process::Launch::FlatpakHost {
                 launcher: PathBuf::from("/sandbox/bin/flatpak spawn"),
             },
             temporary_root: PathBuf::from("/host/cache/diorama"),
@@ -784,8 +683,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn host_launch_cancellation_kills_and_reaps_the_launcher_process() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().unwrap();
         let mut runtime = fake_runtime(
             root.path(),
@@ -794,9 +691,11 @@ mod tests {
             std::time::Duration::from_secs(5),
         );
         let launcher = root.path().join("flatpak-spawn");
-        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-        runtime.launch = super::BiRefNetLaunch::FlatpakHost { launcher };
+        crate::tools::worker_process::write_test_executable(
+            &launcher,
+            "#!/bin/sh\nexec sleep 60\n",
+        );
+        runtime.launch = crate::tools::worker_process::Launch::FlatpakHost { launcher };
         let source = RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]));
         let token = crate::document::CancellationToken::default();
         let worker_token = token.clone();

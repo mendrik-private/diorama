@@ -464,18 +464,24 @@ fn foreground_ink_coalesces_adjacent_target_runs_at_every_scale() {
         let output = session
             .resize_with_foreground_ink(&foreground, size, size, GameAssetAa::new(0), 0., &cancel)
             .unwrap();
-        let dark = |x: u32, y: u32| {
+        let painted = |x: u32, y: u32| {
             let pixel = output.get_pixel(x, y);
-            pixel[3] > 200 && pixel[0] < 24 && pixel[1] < 24 && pixel[2] < 24
+            pixel[3] > 200
+                && pixel[0].saturating_add(8) < 190
+                && pixel[1].saturating_add(8) < 130
+                && pixel[2].saturating_add(8) < 80
         };
         assert!(
-            (0..size).any(|y| (0..size).filter(|&x| dark(x, y)).count() >= size as usize / 4),
+            (0..size).any(|y| (0..size).filter(|&x| painted(x, y)).count() >= size as usize / 4),
             "{size}px fixture must retain the combined contour"
         );
         for y in 0..size - 1 {
             for x in 0..size - 1 {
                 assert!(
-                    !(dark(x, y) && dark(x + 1, y) && dark(x, y + 1) && dark(x + 1, y + 1)),
+                    !(painted(x, y)
+                        && painted(x + 1, y)
+                        && painted(x, y + 1)
+                        && painted(x + 1, y + 1)),
                     "{size}px adjacent contours must collapse before AA0 paint"
                 );
             }

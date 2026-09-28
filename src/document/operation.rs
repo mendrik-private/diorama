@@ -20,41 +20,24 @@ impl Resampling {
     }
 }
 
-pub use asset_scaler::GameAssetAa;
-
 /// All Game Asset controls captured by a scale operation. Keeping this value
 /// with the operation makes preview, Apply, undo/redo, and export independent
 /// from later preference changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GameAssetOptions {
-    aa: GameAssetAa,
-    contour_opacity: u8,
+    strength: asset_scaler::Strength,
 }
 
 impl GameAssetOptions {
-    pub fn new(aa: GameAssetAa, contour_opacity: u8) -> Self {
+    /// Line-art sharpening strength in percent, clamped to 0–100.
+    pub fn new(strength: u8) -> Self {
         Self {
-            aa,
-            contour_opacity: contour_opacity.min(100),
+            strength: asset_scaler::Strength::new(strength),
         }
     }
 
-    pub fn aa(self) -> GameAssetAa {
-        self.aa
-    }
-
-    pub fn contour_opacity(self) -> u8 {
-        self.contour_opacity
-    }
-
-    pub fn contour_opacity_fraction(self) -> f64 {
-        f64::from(self.contour_opacity) / 100.
-    }
-}
-
-impl Default for GameAssetOptions {
-    fn default() -> Self {
-        Self::new(GameAssetAa::default(), 100)
+    pub fn strength(self) -> asset_scaler::Strength {
+        self.strength
     }
 }
 
@@ -131,21 +114,12 @@ pub enum Operation {
 
 #[cfg(test)]
 mod tests {
-    use super::{GameAssetAa, GameAssetOptions};
+    use super::GameAssetOptions;
 
     #[test]
     fn game_asset_options_default_and_clamp_are_stable() {
-        assert_eq!(
-            GameAssetOptions::default(),
-            GameAssetOptions::new(GameAssetAa::new(50), 100)
-        );
-        let options = GameAssetOptions::new(GameAssetAa::new(42), 255);
-        assert_eq!(options.aa(), GameAssetAa::new(42));
-        assert_eq!(options.contour_opacity(), 100);
-        assert_eq!(options.contour_opacity_fraction(), 1.);
-        assert_eq!(
-            GameAssetOptions::new(GameAssetAa::new(42), 0).contour_opacity_fraction(),
-            0.
-        );
+        assert_eq!(GameAssetOptions::default(), GameAssetOptions::new(40));
+        assert_eq!(GameAssetOptions::new(42).strength().percent(), 42);
+        assert_eq!(GameAssetOptions::new(255).strength().percent(), 100);
     }
 }

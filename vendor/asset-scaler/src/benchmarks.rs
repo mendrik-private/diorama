@@ -132,10 +132,16 @@ fn game_asset_visual_check() {
         aa.save(format!("{directory}/aa-{size}.png")).unwrap();
         if size == 128 {
             use std::io::Write;
-            let strength = opacity::calculate(&prepared.widths, core, &target.strokes.owners);
-            let applied = opacity::apply(aa, &target.strokes.owners, &strength);
+            let strength = prepared
+                .intrinsic_strengths(&target.strokes, &cancel)
+                .unwrap();
+            let applied = opacity::apply_pixels(aa, &strength).unwrap();
             let mut csv = std::fs::File::create(format!("{directory}/core-pixels.csv")).unwrap();
-            writeln!(csv, "x,y,owner,width,strength,aa,applied,ink_r,ink_g,ink_b").unwrap();
+            writeln!(
+                csv,
+                "x,y,owner,importance,strength,aa,applied,ink_r,ink_g,ink_b"
+            )
+            .unwrap();
             for (i, &on) in core.as_raw().iter().enumerate() {
                 if on == 0 {
                     continue;
@@ -148,8 +154,8 @@ fn game_asset_visual_check() {
                     "{},{},{id},{:.6},{:.6},{},{},{},{},{}",
                     i % 128,
                     i / 128,
-                    prepared.widths[id],
-                    strength[id],
+                    target.strokes.importance[i],
+                    strength[i],
                     aa.as_raw()[i],
                     applied.as_raw()[i],
                     rgb[0],

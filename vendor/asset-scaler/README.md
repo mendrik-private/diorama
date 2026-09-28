@@ -11,3 +11,11 @@ policies, thick-stroke work, experiments, services, and model runtimes are not
 included.
 
 The original project license remains [GPL-3.0-only](LICENSE).
+
+`LineArtSession` reduces an extracted foreground with application-supplied,
+source-aligned line art: the line art is reduced with bicubic resampling,
+sharpened with an unsharp mask (radius 1, amount 0.5–3.0 from `Strength`
+0–100) and multiplied over the Lanczos foreground fill in 8-bit sRGB, keeping
+the fill's alpha. Diorama's Game Asset mode uses it; see Diorama's
+`docs/game-asset-scaling.md`. `Session` and the `resize*` functions keep the
+traced-contour reduction.

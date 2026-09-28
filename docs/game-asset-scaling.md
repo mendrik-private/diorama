@@ -1,63 +1,40 @@
 # Game Asset scaling
 
-Game Asset scaling vendors the `asset-scaler` baseline at `cff93b5`. This change
-ports only the clean vector extraction from `b6bc785`, plus Diorama's local
-contour-opacity and pen-AA integration. Diorama adapts cancellation and errors:
-live previews use a cached `Session`, while document rendering calls the same
-pipeline through `resize`. A scale operation stores both AA strength and contour
-opacity, so Apply, undo/redo, and export retain the selected result. A separately
-run foreground estimate can make preview and committed pixels differ slightly.
+Game Asset scaling reduces an illustrated asset by multiplying line art over a
+foreground fill. It only downscales: targets must be positive and no larger
+than the source. The source size returns the source unchanged.
 
-The pipeline prepares contours from the untouched source, obtains a foreground
-estimate for the Lanczos fill, then composites the original-source contour
-geometry over that fill. Explicit source alpha remains authoritative. Identity
-scaling preserves the source exactly; Game Asset scaling otherwise accepts only
-positive output dimensions no greater than the source dimensions.
+1. **Line art.** The local FLUX.2 [klein] model draws grayscale line art of the
+   untouched source (white is no ink), restored to the source dimensions. See
+   [local line-art generation](../README.md#local-line-art-generation) for
+   model setup and caching. The line art is used as generated.
+2. **Fill.** BiRefNet removes the background. The extracted foreground is
+   reduced with Lanczos3 in premultiplied linear light. Its alpha is the
+   foreground's silhouette coverage at the target size times its intrinsic
+   alpha, with a fixed 50% edge softness. Explicit source alpha remains
+   authoritative.
+3. **Bicubic.** The line art is reduced to the target size with Catmull-Rom
+   bicubic resampling of its stored 8-bit values.
+4. **Unsharp mask.** The reduced line art is sharpened like GIMP's Unsharp
+   Mask with radius 1 and threshold 0:
+   `clamp(x + amount · (x − blur(x)), 0, 255)`, where `blur` is a Gaussian with
+   σ = 1 truncated at 3σ and clamped at the image edges. **Strength** 0–100
+   (default 40) maps linearly to amount 0.5–3.0, so 40 gives 1.5.
+5. **Multiply.** The sharpened line art multiplies the fill's encoded 8-bit
+   sRGB channels like GIMP's Multiply mode:
+   `rgb = round(fill_rgb · line / 255)`. The fill's alpha is kept, so
+   transparent pixels stay transparent and the line art never extends the
+   silhouette.
 
-## Clean vector extraction
+The shared implementation is `asset_scaler::LineArtSession`. It caches the
+reduced fill and the reduced, blurred line art for the latest target size, so
+a Strength change only re-sharpens and multiplies. Diorama generates the line
+art and the foreground once per source; cancelled work never enters a cache.
 
-Five Gaussian scales and four scan directions find dark ridges. Aligned ridge
-samples joined by continuous ink collapse to the darkest representative, avoiding
-parallel traces in a wide outline. Supported samples fit quadratic patches;
-rasterization fills narrow overlapping slivers and topology-preserving thinning
-yields a trace graph. Spurs up to four pixels are pruned unless they continue a
-longer branch through a junction. Direction-compatible continuations merge across
-small junction loops, and supported endpoints bridge small gaps. Ordered traces are
-fitted as bounded cubics with shared tangents at joins, while real corners and shared
-junctions remain fixed anchors. The target rasterizer adaptively converts the cubics
-to quadratics.
+The **Strength** spinner appears only for Game Asset scaling and is stored in
+the `game-asset-strength` setting. A scale operation stores its strength, so
+preview, Apply, undo/redo, and export produce the same result.
 
-Each source trace measures its contiguous ink span along the local normal in
-quarter-pixel steps. The mean supported span gives its source thickness. Analysis,
-widths, and one successful foreground estimate are cached for each immutable source.
-An ordinary target contour needs more than two distinct Bresenham pixels. Foreground
-canonicalization uses its own minimum of three pixels. Core ownership is resolved
-before donor lookup, so overlaps do not stack coverage and contour colors come only
-from supported original-source foreground donors.
-
-## Contour opacity and AA
-
-The **AA** and **Opacity** numeric spinners appear for Game Asset scaling. AA is
-0–100% and defaults to 50%. Opacity is 0–100% and defaults to 100%. Opacity 0%
-adds no contour paint; 100% composites the full detected contour over the existing
-fill. It changes contour coverage, including alpha when compositing over partial
-alpha, and never darkens or recolors a donor. The opacity setting is stored in
-`game-asset-contour-opacity`; the former darkening preference is not read as
-opacity.
-
-AA uses the same softened edge curve as the pen tool. The AA percentage scales
-that contour edge coverage: 0% gives hard contour edges and 100% gives the full
-pen-style softened coverage. Diorama renders and caches the 0% and 100% AA
-endpoints for one target size and opacity; intermediate AA values blend that pair
-in premultiplied linear RGBA. Changing AA reuses the pair, while changing target
-size or opacity rebuilds it. Cancelled work never enters the cache.
-
-The contour inspection preview at source size shows the cleaned fitted traces
-without foreground inference. At reduced sizes it shows the foreground-supported
-target contour core.
-
-## Verification scope
-
-Tests cover vector topology, opacity 0/50/100 compositing, donor-color retention,
-unrelated fill preservation, AA endpoints, bounded endpoint-cache reuse,
-cancellation, dimensions, preview parity, and persisted operation options.
+**Show line art** previews the line art as it is multiplied: the generated
+line art at the source size, the bicubic and sharpened line art for the
+current Strength otherwise.

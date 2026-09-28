@@ -44,10 +44,64 @@ fn distance_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     norm(sub(p, add(a, mul(d, t))))
 }
 
+#[cfg(test)]
 fn distance_to_polyline(p: [f64; 2], path: &[[f64; 2]]) -> f64 {
     path.windows(2)
         .map(|edge| distance_to_segment(p, edge[0], edge[1]))
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Consecutive segments grouped under bounding boxes. The nearest distance is
+/// the exact minimum over all segments, but a group whose box is no nearer
+/// than the best distance so far is skipped. Starting at the group that held
+/// the previous query's nearest segment makes ordered queries near-linear.
+struct Chunked {
+    segments: Vec<[[f64; 2]; 2]>,
+    boxes: Vec<[[f64; 2]; 2]>,
+}
+
+const CHUNK: usize = 32;
+
+impl Chunked {
+    fn new(segments: Vec<[[f64; 2]; 2]>) -> Self {
+        let boxes = segments
+            .chunks(CHUNK)
+            .map(|chunk| {
+                let mut bounds = [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]];
+                for p in chunk.iter().flatten() {
+                    for axis in 0..2 {
+                        bounds[0][axis] = bounds[0][axis].min(p[axis]);
+                        bounds[1][axis] = bounds[1][axis].max(p[axis]);
+                    }
+                }
+                bounds
+            })
+            .collect();
+        Self { segments, boxes }
+    }
+
+    /// Nearest distance and the group that holds it, searched from `hint`.
+    fn distance(&self, p: [f64; 2], hint: usize) -> (f64, usize) {
+        let mut best = (f64::INFINITY, hint);
+        let hint = hint.min(self.boxes.len().saturating_sub(1));
+        let order = std::iter::once(hint).chain((0..self.boxes.len()).filter(|&c| c != hint));
+        for chunk in order {
+            let [low, high] = self.boxes[chunk];
+            let dx = (low[0] - p[0]).max(p[0] - high[0]).max(0.);
+            let dy = (low[1] - p[1]).max(p[1] - high[1]).max(0.);
+            if dx.hypot(dy) >= best.0 {
+                continue;
+            }
+            let end = (chunk * CHUNK + CHUNK).min(self.segments.len());
+            for segment in &self.segments[chunk * CHUNK..end] {
+                let d = distance_to_segment(p, segment[0], segment[1]);
+                if d < best.0 {
+                    best = (d, chunk);
+                }
+            }
+        }
+        best
+    }
 }
 
 type Cubic = [[f64; 2]; 4];
@@ -161,6 +215,8 @@ fn flatten_cubic(
 fn cubic_error(c: Cubic, path: &[[f64; 2]], cancel: &dyn Cancellation) -> Result<(f64, usize)> {
     let mut pieces = Vec::new();
     flatten_cubic(c, &mut pieces, 0, cancel)?;
+    let curve = Chunked::new(pieces);
+    let mut hint = 0;
     let mut error = 0.;
     let mut split = path.len() / 2;
     // Source samples are at most 0.2px apart. Distance to a set is
@@ -173,11 +229,9 @@ fn cubic_error(c: Cubic, path: &[[f64; 2]], cancel: &dyn Cancellation) -> Result
         let count = (norm(sub(edge[1], edge[0])) / 0.2).ceil().max(1.) as usize;
         for k in 0..=count {
             let p = add(edge[0], mul(sub(edge[1], edge[0]), k as f64 / count as f64));
-            let d = pieces
-                .iter()
-                .map(|&line| distance_to_segment(p, line[0], line[1]))
-                .fold(f64::INFINITY, f64::min)
-                + 0.11;
+            let (nearest, chunk) = curve.distance(p, hint);
+            hint = chunk;
+            let d = nearest + 0.11;
             if d > error + 1e-9 {
                 split =
                     (i + usize::from(k * 2 >= count)).clamp(1, path.len().saturating_sub(2).max(1));
@@ -187,12 +241,17 @@ fn cubic_error(c: Cubic, path: &[[f64; 2]], cancel: &dyn Cancellation) -> Result
     }
     // Flattened curve endpoints are at most 0.08px apart. Their 0.04px
     // covering radius plus the cubic flatten bound bounds all curve points.
-    for (i, edge) in pieces.into_iter().enumerate() {
+    let trace = Chunked::new(path.windows(2).map(|e| [e[0], e[1]]).collect());
+    let mut hint = 0;
+    for (i, edge) in curve.segments.iter().enumerate() {
         if i.is_multiple_of(256) {
             cancel.check()?;
         }
-        error = error.max(distance_to_polyline(edge[0], path) + 0.05);
-        error = error.max(distance_to_polyline(edge[1], path) + 0.05);
+        for point in *edge {
+            let (nearest, chunk) = trace.distance(point, hint);
+            hint = chunk;
+            error = error.max(nearest + 0.05);
+        }
     }
     Ok((error, split.clamp(1, path.len().saturating_sub(2).max(1))))
 }

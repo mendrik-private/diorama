@@ -597,7 +597,7 @@ fn retained_ink_excludes_short_neighbors() {
 }
 
 #[test]
-fn aa_zero_foreground_ink_keeps_owned_core_black_and_uses_exact_darkened_donor_colours() {
+fn foreground_ink_uses_intrinsic_alpha_and_exact_darkened_donor_colours() {
     let original = RgbaImage::from_fn(64, 64, |x, y| {
         if (12..52).contains(&x) && (12..52).contains(&y) {
             if y == 31 && (21..43).contains(&x) {
@@ -619,119 +619,141 @@ fn aa_zero_foreground_ink_keeps_owned_core_black_and_uses_exact_darkened_donor_c
     let cancel = CancellationToken::default();
     let prepared = Prepared::new(&original, &cancel).unwrap();
     let foreground_linear = color::LinearImage::from_rgba(&foreground);
-    let request = ForegroundInkResize {
-        w: 32,
-        h: 32,
-        aa: GameAssetAa::new(0),
-        brightness: 0.,
-    };
-    let black_target = prepared
-        .target_contours_with_ink_source(
-            &original,
-            request.w,
-            request.h,
+    let silhouette = silhouette::Silhouette::detect(&foreground, &cancel)
+        .unwrap()
+        .expect("fixture has a foreground silhouette");
+    let canonical = |brightness| {
+        let request = ForegroundInkResize {
+            w: 32,
+            h: 32,
+            aa: GameAssetAa::new(0),
+            brightness,
+        };
+        let TargetContours {
+            mut strokes,
+            mut colors,
+        } = prepared
+            .target_contours_with_ink_source(
+                &original,
+                request.w,
+                request.h,
+                request.aa,
+                InkSource {
+                    linear: &foreground_linear,
+                    suppress_unsupported: true,
+                    brightness: Some(brightness),
+                },
+                &cancel,
+            )
+            .unwrap();
+        let FinishedFill {
+            linear: fill,
+            foreground_support,
+        } = prepared
+            .fill_for_target(
+                &foreground_linear,
+                Some(&silhouette),
+                &strokes,
+                FillTarget {
+                    target: (request.w, request.h),
+                    aa: request.aa,
+                    foreground_support: true,
+                },
+                &cancel,
+            )
+            .unwrap();
+        let support = foreground_support.expect("foreground support was requested");
+        Prepared::canonicalize_foreground_strokes(
+            &mut strokes,
+            &mut colors,
+            &support,
             request.aa,
-            InkSource {
-                linear: &foreground_linear,
-                suppress_unsupported: true,
-                brightness: Some(request.brightness),
-            },
             &cancel,
         )
         .unwrap();
-    let black = prepared
-        .resize_with_foreground_ink(&original, &foreground, request, &cancel)
-        .unwrap();
-    let owned_core: Vec<_> = black_target
-        .strokes
-        .core
-        .as_raw()
-        .iter()
-        .zip(&black_target.strokes.owners)
-        .enumerate()
-        .filter_map(|(i, (&core, owner))| (core != 0 && owner.is_some()).then_some(i))
-        .collect();
-    assert!(
-        !owned_core.is_empty(),
-        "fixture retains a narrow contour core"
-    );
-    let owner = black_target.strokes.owners[owned_core[0]].unwrap();
-    let intrinsic = opacity::calculate(
-        &prepared.widths,
-        &black_target.strokes.core,
-        &black_target.strokes.owners,
-    )[owner];
-    let strengths: Vec<_> = [0, 1, 50, 99, 100]
-        .into_iter()
-        .map(|aa| {
-            prepared.foreground_ink_strengths(&black_target.strokes, GameAssetAa::new(aa))[owner]
-        })
-        .collect();
-    assert_eq!(strengths[0], 1.);
-    assert_eq!(strengths[4], intrinsic);
-    assert!(strengths.windows(2).all(|pair| pair[0] >= pair[1]));
-    assert!(strengths[1] < 1. && strengths[3] > intrinsic);
-    for i in &owned_core {
-        assert_eq!(
-            &black.as_raw()[i * 4..i * 4 + 4],
-            &[0, 0, 0, 255],
-            "AA0 owned core {i} must be solid black"
-        );
-    }
+        let strengths = prepared.intrinsic_strengths(&strokes, &cancel).unwrap();
+        (request, strokes, fill, support, strengths)
+    };
 
-    let dark_target = prepared
-        .target_contours_with_ink_source(
-            &original,
-            32,
-            32,
-            GameAssetAa::new(0),
-            InkSource {
-                linear: &foreground_linear,
-                suppress_unsupported: true,
-                brightness: Some(0.8),
-            },
-            &cancel,
-        )
+    let (black_request, black_strokes, black_fill, black_support, black_strengths) = canonical(0.);
+    let black = prepared
+        .resize_with_foreground_ink(&original, &foreground, black_request, &cancel)
         .unwrap();
+    let (dark_request, dark_strokes, dark_fill, dark_support, dark_strengths) = canonical(0.8);
     let dark = prepared
-        .resize_with_foreground_ink(
-            &original,
-            &foreground,
-            ForegroundInkResize {
-                w: 32,
-                h: 32,
-                aa: GameAssetAa::new(0),
-                brightness: 0.8,
-            },
-            &cancel,
-        )
+        .resize_with_foreground_ink(&original, &foreground, dark_request, &cancel)
         .unwrap();
-    let clean = dark_target
-        .strokes
+
+    let assert_core_matches_oracle = |output: &RgbaImage,
+                                      strokes: &strokes::Strokes,
+                                      fill: &color::LinearImage,
+                                      strengths: &[f64],
+                                      brightness: f64| {
+        let donor =
+            [200_u8, 150, 100].map(|channel| color::decode(f64::from(channel) * brightness / 255.));
+        let mut samples = 0;
+        for (i, ((&core, &coverage), owner)) in strokes
+            .core
+            .as_raw()
+            .iter()
+            .zip(strokes.coverage.as_raw())
+            .zip(&strokes.owners)
+            .enumerate()
+        {
+            if core == 0 || coverage == 0 || owner.is_none() || output.as_raw()[i * 4 + 3] != 255 {
+                continue;
+            }
+            let paint = (f64::from(coverage) * strengths[i]).round() as u8;
+            let paint_alpha = f64::from(paint) / 255.;
+            let fill_pixel = fill.pixels[i];
+            let alpha = paint_alpha + fill_pixel[3] * (1. - paint_alpha);
+            let expected = color::rgba([
+                (donor[0] * paint_alpha + fill_pixel[0] * fill_pixel[3] * (1. - paint_alpha))
+                    / alpha,
+                (donor[1] * paint_alpha + fill_pixel[1] * fill_pixel[3] * (1. - paint_alpha))
+                    / alpha,
+                (donor[2] * paint_alpha + fill_pixel[2] * fill_pixel[3] * (1. - paint_alpha))
+                    / alpha,
+                alpha,
+            ]);
+            let actual = output.get_pixel((i % fill.w) as u32, (i / fill.w) as u32);
+            assert_eq!(actual[3], expected[3], "core {i} alpha");
+            for channel in 0..3 {
+                assert!(
+                    actual[channel].abs_diff(expected[channel]) <= 1,
+                    "core {i} channel {channel} uses the scaled uniform donor: actual {}, expected {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+            samples += 1;
+        }
+        assert!(samples > 0, "fixture retains opaque canonical core samples");
+    };
+    assert_core_matches_oracle(&black, &black_strokes, &black_fill, &black_strengths, 0.);
+    assert_core_matches_oracle(&dark, &dark_strokes, &dark_fill, &dark_strengths, 0.8);
+
+    let intrinsic = black_strengths
+        .iter()
+        .copied()
+        .zip(black_strokes.core.as_raw())
+        .find_map(|(strength, &core)| (core != 0).then_some(strength))
+        .expect("fixture retains a canonical core");
+    assert!(intrinsic < 1., "AA0 retains intrinsic weak-line opacity");
+    let clean = black_strokes
         .coverage
         .as_raw()
         .iter()
         .enumerate()
-        .find_map(|(i, &coverage)| (coverage == 0 && black.as_raw()[i * 4 + 3] == 255).then_some(i))
-        .expect("fixture retains an opaque unpainted interior");
+        .find_map(|(i, &coverage)| {
+            (coverage == 0 && black_support[i] && dark_support[i]).then_some(i)
+        })
+        .expect("fixture retains a supported unpainted fill pixel");
     assert_eq!(
-        &black.as_raw()[clean * 4..clean * 4 + 4],
-        &dark.as_raw()[clean * 4..clean * 4 + 4],
-        "foreground ink brightness leaves the finished fill unchanged"
+        black.get_pixel((clean % black_fill.w) as u32, (clean / black_fill.w) as u32),
+        dark.get_pixel((clean % dark_fill.w) as u32, (clean / dark_fill.w) as u32),
+        "foreground ink brightness leaves the supported unpainted fill unchanged"
     );
-    for i in owned_core {
-        let expected = color::rgba([
-            dark_target.colors[i][0],
-            dark_target.colors[i][1],
-            dark_target.colors[i][2],
-            1.,
-        ]);
-        assert_eq!(
-            &dark.as_raw()[i * 4..i * 4 + 4],
-            &expected.0,
-            "AA0 owned core {i} must use its exact darkened foreground donor"
-        );
-    }
 }
 
 #[test]
@@ -742,6 +764,11 @@ fn canonical_cleanup_drops_short_components_without_aa_ghosts() {
             core: image::GrayImage::new(8, 4),
             coverage: image::GrayImage::new(8, 4),
             owners: vec![None; 32],
+            importance: vec![0.; 32],
+            tangents: vec![None; 32],
+            overlap_max: vec![0.; 32],
+            overlap_residual: vec![1.; 32],
+            footprint: vec![0.; 32],
         };
         // Two core pixels plus a formerly antialiased neighbor. The target
         // component is below the three-pixel cutoff and must leave no paint at
@@ -768,6 +795,287 @@ fn canonical_cleanup_drops_short_components_without_aa_ghosts() {
             assert_eq!(strokes.owners[i], None, "AA{aa} owner {i}");
         }
     }
+}
+
+#[test]
+fn canonical_parallel_merge_keeps_outer_owner_and_adds_one_aligned_contributor() {
+    let cancel = CancellationToken::default();
+    let make_strokes = || strokes::Strokes {
+        core: image::GrayImage::new(7, 4),
+        coverage: image::GrayImage::new(7, 4),
+        owners: vec![None; 28],
+        importance: vec![0.; 28],
+        tangents: vec![None; 28],
+        overlap_max: vec![0.; 28],
+        overlap_residual: vec![1.; 28],
+        footprint: vec![0.; 28],
+    };
+    for aa in [0, 1, 50, 100] {
+        let mut strokes = make_strokes();
+        for x in 1..=5 {
+            for (y, owner, importance) in [(1, 0, 0.35), (2, 1, 0.8)] {
+                let i = y * 7 + x;
+                strokes.core.as_mut()[i] = 255;
+                strokes.coverage.as_mut()[i] = 255;
+                strokes.owners[i] = Some(owner);
+                strokes.importance[i] = importance;
+                strokes.tangents[i] = Some([1., 0.]);
+            }
+        }
+        let mut colors = vec![[0.2, 0.1, 0.05]; 28];
+        let mut support = vec![true; 28];
+        support[..7].fill(false);
+        Prepared::canonicalize_foreground_strokes(
+            &mut strokes,
+            &mut colors,
+            &support,
+            GameAssetAa::new(aa),
+            &cancel,
+        )
+        .unwrap();
+        for x in 1..=5 {
+            let outer = 7 + x;
+            assert_eq!(strokes.owners[outer], Some(0));
+            assert_eq!(strokes.importance[outer], 1.);
+            assert_eq!(strokes.core.as_raw()[14 + x], 0);
+            assert_eq!(
+                strokes.coverage.as_raw()[14 + x],
+                (128_u16 * u16::from(aa) / 100) as u8,
+                "AA{aa} may restore only a proportional pen fringe"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_crossing_does_not_add_perpendicular_strength() {
+    let cancel = CancellationToken::default();
+    let mut strokes = strokes::Strokes {
+        core: image::GrayImage::new(15, 15),
+        coverage: image::GrayImage::new(15, 15),
+        owners: vec![None; 225],
+        importance: vec![0.; 225],
+        tangents: vec![None; 225],
+        overlap_max: vec![0.; 225],
+        overlap_residual: vec![1.; 225],
+        footprint: vec![2.; 225],
+    };
+    for x in 2..=12 {
+        let i = 7 * 15 + x;
+        strokes.core.as_mut()[i] = 255;
+        strokes.coverage.as_mut()[i] = 255;
+        strokes.owners[i] = Some(0);
+        strokes.importance[i] = 0.8;
+        strokes.tangents[i] = Some([1., 0.]);
+    }
+    for y in [2, 3, 4, 5, 6, 8, 9, 10, 11, 12] {
+        let i = y * 15 + 7;
+        strokes.core.as_mut()[i] = 255;
+        strokes.coverage.as_mut()[i] = 255;
+        strokes.owners[i] = Some(1);
+        strokes.importance[i] = 0.35;
+        strokes.tangents[i] = Some([0., 1.]);
+    }
+    let mut colors = vec![[0.2, 0.1, 0.05]; 225];
+    Prepared::canonicalize_foreground_strokes(
+        &mut strokes,
+        &mut colors,
+        &[true; 225],
+        GameAssetAa::new(0),
+        &cancel,
+    )
+    .unwrap();
+    let strong: Vec<_> = strokes
+        .core
+        .as_raw()
+        .iter()
+        .enumerate()
+        .filter(|&(i, &core)| core != 0 && strokes.owners[i] == Some(0))
+        .collect();
+    let weak: Vec<_> = strokes
+        .core
+        .as_raw()
+        .iter()
+        .enumerate()
+        .filter(|&(i, &core)| core != 0 && strokes.owners[i] == Some(1))
+        .collect();
+    for (x, y) in [(2, 7), (12, 7), (7, 2), (7, 12)] {
+        assert_ne!(
+            strokes.core.as_raw()[y * 15 + x],
+            0,
+            "endpoint ({x}, {y}) survives"
+        );
+    }
+    let core = raster::Mask {
+        w: 15,
+        h: 15,
+        data: strokes
+            .core
+            .as_raw()
+            .iter()
+            .map(|&value| value != 0)
+            .collect(),
+    };
+    assert_eq!(
+        cleanup::labels(&core, true, true).1.len() - 1,
+        1,
+        "crossing arms remain one 8-connected component"
+    );
+    assert!(strong.iter().any(|&(i, _)| i % 15 <= 6));
+    assert!(strong.iter().any(|&(i, _)| i % 15 >= 8));
+    assert!(
+        (6..=8).any(|y| (6..=8).any(|x| strokes.core.as_raw()[y * 15 + x] != 0)),
+        "the retained arms stay connected through the crossing neighbourhood"
+    );
+    assert!(
+        strong.iter().all(|&(i, _)| strokes.importance[i] <= 0.8),
+        "perpendicular geometry must not add paint strength"
+    );
+    assert!(
+        weak.iter().all(|&(i, _)| strokes.importance[i] <= 0.35),
+        "the crossing cannot strengthen the weak arm either"
+    );
+}
+
+#[test]
+fn measured_broad_boundary_footprints_keep_distant_cores_at_full_strength() {
+    let cancel = CancellationToken::default();
+    for source_width in [8_f64, 12., 32.] {
+        let footprint = source_width * 0.75 * 0.5 + 1.;
+        let y = footprint.ceil() as usize;
+        let (w, h) = (48, 45);
+        let mut prepared = Prepared::new(&outlined_fixture(true), &cancel).unwrap();
+        prepared.widths = vec![source_width];
+        let mut strokes = strokes::Strokes {
+            core: image::GrayImage::new(w, h),
+            coverage: image::GrayImage::new(w, h),
+            owners: vec![None; (w * h) as usize],
+            importance: vec![0.; (w * h) as usize],
+            tangents: vec![None; (w * h) as usize],
+            overlap_max: vec![0.; (w * h) as usize],
+            overlap_residual: vec![1.; (w * h) as usize],
+            footprint: vec![0.; (w * h) as usize],
+        };
+        for x in 8..40 {
+            let i = y * w as usize + x;
+            strokes.core.as_mut()[i] = 255;
+            strokes.coverage.as_mut()[i] = 255;
+            strokes.owners[i] = Some(0);
+            strokes.importance[i] = 0.2;
+            strokes.tangents[i] = Some([1., 0.]);
+        }
+        prepared
+            .refine_target_importance(&mut strokes, &cancel)
+            .unwrap();
+        assert!(
+            (8..40).all(|x| { (strokes.footprint[y * w as usize + x] - footprint).abs() < 1e-9 }),
+            "target refinement projects the {source_width}px source footprint"
+        );
+        let mut support = vec![true; (w * h) as usize];
+        support[..w as usize].fill(false);
+        let mut colors = vec![[0.2, 0.1, 0.05]; (w * h) as usize];
+        Prepared::canonicalize_foreground_strokes(
+            &mut strokes,
+            &mut colors,
+            &support,
+            GameAssetAa::new(0),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            (8..40).all(|x| strokes.importance[y * w as usize + x] == 1.),
+            "{source_width}px source outline keeps its full boundary strength"
+        );
+    }
+}
+
+#[test]
+fn interior_equal_parallel_contributors_combine_without_boundary_floor() {
+    let cancel = CancellationToken::default();
+    let (w, h) = (15, 15);
+    let mut strokes = strokes::Strokes {
+        core: image::GrayImage::new(w, h),
+        coverage: image::GrayImage::new(w, h),
+        owners: vec![None; (w * h) as usize],
+        importance: vec![0.; (w * h) as usize],
+        tangents: vec![None; (w * h) as usize],
+        overlap_max: vec![0.; (w * h) as usize],
+        overlap_residual: vec![1.; (w * h) as usize],
+        footprint: vec![2.; (w * h) as usize],
+    };
+    for x in 3..=11 {
+        for (y, owner) in [(3, 0), (4, 1)] {
+            let i = y * w as usize + x;
+            strokes.core.as_mut()[i] = 255;
+            strokes.coverage.as_mut()[i] = 255;
+            strokes.owners[i] = Some(owner);
+            strokes.importance[i] = 0.5;
+            strokes.tangents[i] = Some([1., 0.]);
+        }
+    }
+    let mut colors = vec![[0.2, 0.1, 0.05]; (w * h) as usize];
+    let mut support = vec![true; (w * h) as usize];
+    support[..w as usize].fill(false);
+    Prepared::canonicalize_foreground_strokes(
+        &mut strokes,
+        &mut colors,
+        &support,
+        GameAssetAa::new(0),
+        &cancel,
+    )
+    .unwrap();
+    for x in 4..=10 {
+        let outer = 3 * w as usize + x;
+        assert_eq!(strokes.owners[outer], Some(0));
+        assert!(strokes.importance[outer] > 0.5 && strokes.importance[outer] < 1.);
+        assert_eq!(strokes.core.as_raw()[4 * w as usize + x], 0);
+    }
+}
+
+#[test]
+fn negligible_interior_loop_cannot_change_a_strong_path_topology() {
+    let cancel = CancellationToken::default();
+    let mut strokes = strokes::Strokes {
+        core: image::GrayImage::new(12, 9),
+        coverage: image::GrayImage::new(12, 9),
+        owners: vec![None; 108],
+        importance: vec![0.; 108],
+        tangents: vec![None; 108],
+        overlap_max: vec![0.; 108],
+        overlap_residual: vec![1.; 108],
+        footprint: vec![2.; 108],
+    };
+    for x in 1..11 {
+        let i = 4 * 12 + x;
+        strokes.core.as_mut()[i] = 255;
+        strokes.coverage.as_mut()[i] = 255;
+        strokes.owners[i] = Some(0);
+        strokes.importance[i] = 0.8;
+        strokes.tangents[i] = Some([1., 0.]);
+    }
+    for (x, y) in [(5, 2), (6, 2), (5, 3), (6, 3)] {
+        let i = y * 12 + x;
+        strokes.core.as_mut()[i] = 255;
+        strokes.coverage.as_mut()[i] = 255;
+        strokes.owners[i] = Some(1);
+        strokes.importance[i] = 0.1;
+        strokes.tangents[i] = Some([1., 0.]);
+    }
+    let mut colors = vec![[0.2, 0.1, 0.05]; 108];
+    Prepared::canonicalize_foreground_strokes(
+        &mut strokes,
+        &mut colors,
+        &[true; 108],
+        GameAssetAa::new(0),
+        &cancel,
+    )
+    .unwrap();
+    assert!((1..11).all(|x| strokes.core.as_raw()[4 * 12 + x] != 0));
+    assert!(
+        [(5, 2), (6, 2), (5, 3), (6, 3)]
+            .into_iter()
+            .all(|(x, y)| strokes.core.as_raw()[y * 12 + x] == 0)
+    );
 }
 
 struct ForegroundInkBeforeHaloCleanup {
@@ -835,8 +1143,8 @@ fn foreground_ink_before_halo_cleanup(
         cancel,
     )
     .unwrap();
-    let strength = prepared.foreground_ink_strengths(&strokes, request.aa);
-    let paint = opacity::apply(&strokes.coverage, &strokes.owners, &strength);
+    let strength = prepared.intrinsic_strengths(&strokes, cancel).unwrap();
+    let paint = opacity::apply_pixels(&strokes.coverage, &strength).unwrap();
     let baseline = paint::composite(&fill, &colors, &paint);
     ForegroundInkBeforeHaloCleanup {
         image: baseline,
@@ -1044,7 +1352,7 @@ fn cancelled_cached_requests_and_working_set_preflight_are_rejected() {
         session.resize(6, 4, GameAssetAa::default(), &cancel),
         Err(Error::Cancelled)
     ));
-    assert_eq!(working_set_estimate(2560, 1440, 1280, 720), 2_034_892_800);
+    assert_eq!(working_set_estimate(2560, 1440, 1280, 720), 2_108_620_800);
     assert!(check_working_set_budget(2560, 1440, 1280, 720, DEFAULT_MEMORY_LIMIT).is_ok());
     let large = Session::new(Arc::new(RgbaImage::new(4096, 4096)));
     let error = large
@@ -1071,20 +1379,18 @@ fn cancelled_cached_requests_and_working_set_preflight_are_rejected() {
 #[test]
 fn contour_inspection_shades_core_ink_by_contour_strength() {
     let core = GrayImage::from_raw(4, 1, vec![255, 255, 0, 255]).unwrap();
-    let owners = [Some(0), Some(1), Some(0), None];
-    let image = strength_contour_image(&core, &owners, &[1.0, 0.95], &|| false).unwrap();
+    let image = strength_contour_image_pixels(&core, &[1.0, 0.95, 0., 0.], &|| false).unwrap();
     assert_eq!(image.as_raw(), &[0, 13, 255, 255]);
-    assert!(strength_contour_image(&core, &owners[..3], &[1.0, 0.95], &|| false).is_err());
+    assert!(strength_contour_image_pixels(&core, &[1.0, 0.95, 0.], &|| false).is_err());
 }
 
 #[test]
 fn contour_strength_render_checks_cancellation_during_large_masks() {
     let core = GrayImage::from_pixel(4097, 1, image::Luma([255]));
-    let owners = vec![Some(0); 4097];
     let checks = AtomicUsize::new(0);
 
     assert!(matches!(
-        strength_contour_image(&core, &owners, &[1.0], &|| {
+        strength_contour_image_pixels(&core, &vec![1.0; 4097], &|| {
             checks.fetch_add(1, Ordering::Relaxed) >= 1
         }),
         Err(Error::Cancelled)

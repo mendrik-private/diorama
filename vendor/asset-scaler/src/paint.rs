@@ -332,6 +332,11 @@ mod tests {
             core,
             coverage,
             owners,
+            importance: vec![0.; (w * h) as usize],
+            tangents: vec![None; (w * h) as usize],
+            overlap_max: vec![0.; (w * h) as usize],
+            overlap_residual: vec![1.; (w * h) as usize],
+            footprint: vec![0.; (w * h) as usize],
         }
     }
 
@@ -356,6 +361,11 @@ mod tests {
             core: GrayImage::new(20, 20),
             coverage: GrayImage::new(20, 20),
             owners: vec![None; 400],
+            importance: vec![0.; 400],
+            tangents: vec![None; 400],
+            overlap_max: vec![0.; 400],
+            overlap_residual: vec![1.; 400],
+            footprint: vec![0.; 400],
         };
         for x in 1..19 {
             strokes.core.put_pixel(x, 9, image::Luma([255]));
@@ -375,7 +385,7 @@ mod tests {
         for x in 1..19 {
             assert_eq!(colors[9 * 20 + x], [0.; 3]);
         }
-        let coverage = opacity::apply(&strokes.coverage, &strokes.owners, &[1., 0.95]);
+        let coverage = opacity::apply_pixels(&strokes.coverage, &vec![1.; 400]).unwrap();
         assert_eq!(coverage.get_pixel(8, 9)[0], 243);
         let composite = composite(&source, &colors, &coverage);
         assert_eq!(
@@ -410,6 +420,11 @@ mod tests {
             core: GrayImage::new(20, 20),
             coverage: GrayImage::new(20, 20),
             owners: vec![None; 400],
+            importance: vec![0.; 400],
+            tangents: vec![None; 400],
+            overlap_max: vec![0.; 400],
+            overlap_residual: vec![1.; 400],
+            footprint: vec![0.; 400],
         };
         strokes.core.put_pixel(10, 10, image::Luma([255]));
         strokes.coverage.put_pixel(10, 10, image::Luma([255]));
