@@ -1,7 +1,7 @@
 # Game Asset scaling
 
-Game Asset scaling reduces an illustrated asset by multiplying line art over a
-fill without ink contours, both generated at the target size. It only
+Game Asset scaling reduces an illustrated asset by drawing line art as ink
+over a fill without ink contours, both generated at the target size. It only
 downscales: targets must be positive and no larger than the source. The source
 size returns the source unchanged.
 
@@ -29,7 +29,7 @@ size returns the source unchanged.
    side or more is then complete and never resampled; a smaller one is
    reduced to the target, the line art with bicubic (Catmull-Rom) and the
    others with Lanczos3.
-4. **Alpha.** The result's alpha is the reduced mask. If the source has any
+4. **Alpha.** The fill's alpha is the reduced mask. If the source has any
    alpha below 255, its alpha is resized, cropped and reduced the same way,
    and caps the mask: `alpha = min(mask, source alpha)`.
 5. **Colour restoration.** The de-inked fill drifts brighter and more
@@ -60,22 +60,28 @@ size returns the source unchanged.
    a Gaussian with σ = 1 truncated at 3σ and clamped at the image edges.
    **Strength** 0–100 (default 40) maps linearly to amount 0.5–3.0, so 40
    gives 1.5.
-7. **Multiply.** The sharpened line art multiplies the cleaned fill's
-   encoded 8-bit sRGB channels like GIMP's Multiply mode:
-   `rgb = round(fill_rgb · line / 255)`. The result is straight alpha with the
-   alpha from step 4, so the line art and fill never extend the silhouette.
+7. **Ink over.** The sharpened line art `g` becomes black ink of coverage
+   `ink = round(clamp((230 − g) · 255 / 230, 0, 255))`: white point 230,
+   since the generated paper is 250–254 rather than 255 and the unsharp mask
+   amplifies that noise. With `a = ink / 255` and `A` the alpha from step 4,
+   the ink is composited over the cleaned fill's encoded 8-bit sRGB channels
+   (source-over, straight alpha): `out_alpha = a + A · (1 − a)` and
+   `rgb = fill_rgb · A · (1 − a) / out_alpha`, each rounded once; where
+   `out_alpha` is 0 the fill's colour is kept. So the fill never extends the
+   silhouette, but ink does: the outer outline, which lies outside the cutout
+   of the ink-free fill, is kept.
 
 The shared implementation is `asset_scaler::LineArtLayers`, which takes the
 four target-sized layers, restores the fill once and keeps it with the alpha
 and the line art's blur. Diorama keeps the layers of the latest target per
-source, so a Strength change only re-sharpens and multiplies; another size
+source, so a Strength change only re-sharpens and composites; another size
 generates again or reads the disk cache. Cancelled work never enters a cache.
 
 The **Strength** spinner appears only for Game Asset scaling and is stored in
 the `game-asset-strength` setting. A scale operation stores its strength, so
 preview, Apply, undo/redo, and export produce the same result.
 
-**Show line art** previews the line art as it is multiplied: at the target
+**Show line art** previews the line art the ink is taken from: at the target
 size and sharpened at the current Strength.
 
 Generation runs in a resident worker process that loads the model once and

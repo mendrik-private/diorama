@@ -1,12 +1,14 @@
 //! Line-art composition at the target size.
 //!
 //! The application supplies four target-sized, aligned layers: grayscale line
-//! art (white is no ink), an opaque fill without ink contours, the alpha of
-//! the result, and the original's colours as a reference. Nothing is
+//! art (white is no ink), an opaque fill without ink contours, the fill's
+//! alpha, and the original's colours as a reference. Nothing is
 //! resampled here. The fill's local colour is first restored towards the
-//! reference by an edge-aware correction; the line art, sharpened with an
-//! unsharp mask of radius 1, then multiplies it in 8-bit sRGB, like GIMP's
-//! Multiply layer mode, and the alpha is attached unchanged.
+//! reference by an edge-aware correction. The line art, sharpened with an
+//! unsharp mask of radius 1, then becomes black ink whose coverage rises
+//! from 0 at `INK_WHITE_POINT` to 255 at black, and the ink is composited
+//! over the fill and its alpha in 8-bit sRGB (source-over, straight alpha),
+//! so ink outside the alpha extends the silhouette.
 use crate::{Cancellation, DEFAULT_MEMORY_LIMIT, Error, Result};
 use image::{
     GrayImage, ImageBuffer, Rgb, RgbImage, Rgba, RgbaImage,
@@ -29,6 +31,11 @@ const BACKGROUND_DISTANCE: f64 = 40.;
 /// Line art brighter than this throughout a 3×3 neighbourhood is free of
 /// ink; only there does the colour restoration compare colours.
 const INK_FREE_THRESHOLD: u8 = 200;
+/// Sharpened line art at or above this is paper and carries no ink. The
+/// generated paper is not pure white (250–254), and the unsharp mask
+/// amplifies that noise, so a white point of 255 would leave a faint haze of
+/// ink over the transparent background.
+const INK_WHITE_POINT: u8 = 230;
 /// Standard deviation, in pixels, of the colour restoration's spatial
 /// Gaussian at a working grid whose shorter side is 128 pixels; it scales
 /// with that side.
@@ -71,7 +78,7 @@ impl Default for Strength {
 
 /// Target-sized, aligned layers of one result. The fill is cleaned and the
 /// line art's blur computed once, so a strength change only re-sharpens and
-/// multiplies.
+/// composites the ink.
 pub struct LineArtLayers {
     line_art: GrayImage,
     fill: RgbImage,
@@ -81,7 +88,7 @@ pub struct LineArtLayers {
 
 impl LineArtLayers {
     /// All layers must have the same, non-zero dimensions. `alpha` is the
-    /// result's straight alpha, and `reference` the original's colours that
+    /// fill's straight alpha, and `reference` the original's colours that
     /// the fill's local colour is restored towards (see [`clean_fill`]).
     pub fn new(
         line_art: GrayImage,
@@ -132,17 +139,18 @@ impl LineArtLayers {
         self.line_art.dimensions()
     }
 
-    /// The line art as it is multiplied: sharpened at `strength`.
+    /// The line art the ink is taken from: sharpened at `strength`.
     pub fn line_art(&self, strength: Strength, cancel: &dyn Cancellation) -> Result<GrayImage> {
         cancel.check()?;
         sharpen(&self.line_art, &self.blurred, strength.amount(), cancel)
     }
 
-    /// `rgb = round(cleaned fill · sharpened line art / 255)` with the
-    /// layers' alpha, in straight alpha.
+    /// Black ink from the sharpened line art (see [`ink`]) composited over
+    /// the cleaned fill with the layers' alpha, in straight alpha (see
+    /// [`ink_over`]).
     pub fn compose(&self, strength: Strength, cancel: &dyn Cancellation) -> Result<RgbaImage> {
         let line_art = self.line_art(strength, cancel)?;
-        multiply(&self.fill, &line_art, self.alpha.as_raw(), cancel)
+        ink_over(&self.fill, &line_art, self.alpha.as_raw(), cancel)
     }
 }
 
@@ -170,9 +178,9 @@ fn fill_background(fill: &RgbImage, alpha: &[u8]) -> [f64; 3] {
 }
 
 /// Restore the fill's local colour towards `reference`, the original's
-/// colours, before it is multiplied: by the edge-aware correction of
-/// [`restoration`], weighted by the valid, ink-free pixels. A pixel is valid
-/// where `alpha` ≥ `OPAQUE_ALPHA` and its colour is at least
+/// colours, before the ink is composited over it: by the edge-aware
+/// correction of [`restoration`], weighted by the valid, ink-free pixels. A
+/// pixel is valid where `alpha` ≥ `OPAQUE_ALPHA` and its colour is at least
 /// `BACKGROUND_DISTANCE` from the fill's own background
 /// ([`fill_background`]), and ink-free where the unsharpened line art stays
 /// above `INK_FREE_THRESHOLD` throughout a 3×3 neighbourhood. Clamped and
@@ -482,9 +490,24 @@ fn sharpen(
         .ok_or_else(|| Error::Scaling("Invalid line-art dimensions".into()))
 }
 
-/// GIMP Multiply on encoded 8-bit channels, `round(fill · line / 255)` for
-/// RGB, with `alpha` attached as straight alpha.
-fn multiply(
+/// The ink coverage of sharpened line art `g`:
+/// `round(clamp((W − g) · 255 / W, 0, 255))` with `W = INK_WHITE_POINT`, so
+/// black is opaque ink and anything at or above the white point is none.
+fn ink(line: u8) -> u8 {
+    let white = u32::from(INK_WHITE_POINT);
+    let line = u32::from(line);
+    if line >= white {
+        return 0;
+    }
+    (((white - line) * 255 + white / 2) / white) as u8
+}
+
+/// Black ink of coverage `a = ink(line) / 255` composited source-over the
+/// fill of alpha `A = alpha / 255`, on encoded 8-bit channels in straight
+/// alpha: `out_alpha = a + A · (1 − a)` and
+/// `out_rgb = fill · A · (1 − a) / out_alpha`, each rounded once. Where
+/// `out_alpha` is 0 the fill's colour is kept with alpha 0.
+fn ink_over(
     fill: &RgbImage,
     line_art: &GrayImage,
     alpha: &[u8],
@@ -505,9 +528,23 @@ fn multiply(
         if i.is_multiple_of(4096) {
             cancel.check()?;
         }
-        let line = u16::from(line[0]);
-        let product = |channel: u8| ((u16::from(channel) * line + 127) / 255) as u8;
-        output.0 = [product(fill[0]), product(fill[1]), product(fill[2]), alpha];
+        let ink = u32::from(ink(line[0]));
+        // In units of 1/255²: the fill's visible share `A · (1 − a)` and the
+        // total coverage `out_alpha`.
+        let fill_share = u32::from(alpha) * (255 - ink);
+        let coverage = ink * 255 + fill_share;
+        output.0 = if coverage == 0 {
+            [fill[0], fill[1], fill[2], 0]
+        } else {
+            let colour =
+                |channel: u8| ((u32::from(channel) * fill_share + coverage / 2) / coverage) as u8;
+            [
+                colour(fill[0]),
+                colour(fill[1]),
+                colour(fill[2]),
+                ((coverage + 127) / 255) as u8,
+            ]
+        };
     }
     cancel.check()?;
     Ok(output)
@@ -562,14 +599,49 @@ mod tests {
         GrayImage::from_pixel(SIZE.0, SIZE.1, Luma([value]))
     }
 
-    /// The fill as it is multiplied under `line_art`: cleaned against the
-    /// reference.
+    /// The fill as the ink of `line_art` is composited over it: cleaned
+    /// against the reference.
     fn expected_fill(line_art: &GrayImage) -> RgbImage {
         let reference = reference()
             .pixels()
             .map(|pixel| pixel.0)
             .collect::<Vec<_>>();
         clean(&fill(), line_art, alpha().as_raw(), &reference)
+    }
+
+    /// The source-over formula in floating point, independent of
+    /// [`ink_over`]'s integer arithmetic.
+    fn expected_ink_over(fill: [u8; 3], line: u8, alpha: u8) -> [u8; 4] {
+        let white = f64::from(INK_WHITE_POINT);
+        let ink = ((white - f64::from(line)) * 255. / white)
+            .clamp(0., 255.)
+            .round();
+        let (a, fill_alpha) = (ink / 255., f64::from(alpha) / 255.);
+        let out_alpha = a + fill_alpha * (1. - a);
+        if out_alpha == 0. {
+            return [fill[0], fill[1], fill[2], 0];
+        }
+        let colour =
+            |channel: u8| (f64::from(channel) * fill_alpha * (1. - a) / out_alpha).round() as u8;
+        [
+            colour(fill[0]),
+            colour(fill[1]),
+            colour(fill[2]),
+            (out_alpha * 255.).round() as u8,
+        ]
+    }
+
+    /// [`ink_over`] of a single pixel.
+    fn ink_over_pixel(fill: [u8; 3], line: u8, alpha: u8) -> [u8; 4] {
+        ink_over(
+            &RgbImage::from_pixel(1, 1, Rgb(fill)),
+            &GrayImage::from_pixel(1, 1, Luma([line])),
+            &[alpha],
+            &CancellationToken::default(),
+        )
+        .unwrap()
+        .get_pixel(0, 0)
+        .0
     }
 
     fn clean(
@@ -641,66 +713,155 @@ mod tests {
     }
 
     #[test]
-    fn black_line_art_is_black_with_the_given_alpha() {
+    fn black_line_art_is_opaque_black_even_outside_the_alpha() {
         let output = layers(flat(0))
             .compose(Strength::default(), &|| false)
             .unwrap();
-        for (output, alpha) in output.pixels().zip(alpha().pixels()) {
-            assert_eq!(output.0, [0, 0, 0, alpha[0]]);
+        let alpha = alpha();
+        assert!(alpha.pixels().any(|alpha| alpha[0] == 0));
+        assert!(alpha.pixels().any(|alpha| (1..255).contains(&alpha[0])));
+        for output in output.pixels() {
+            assert_eq!(output.0, [0, 0, 0, 255]);
         }
     }
 
     #[test]
-    fn mid_gray_multiplies_each_channel_exactly() {
+    fn mid_gray_ink_is_composited_over_every_pixel_exactly() {
         let output = layers(flat(128))
             .compose(Strength::new(0), &|| false)
             .unwrap();
         // Mid-gray line art counts as ink everywhere, so nothing is restored.
         assert_eq!(expected_fill(&flat(128)), fill());
+        // 128 is (230 − 128) · 255 / 230 = 113.09 → 113 ink.
+        assert_eq!(ink(128), 113);
         for ((output, fill), alpha) in output.pixels().zip(fill().pixels()).zip(alpha().pixels()) {
-            for channel in 0..3 {
-                let expected = (f64::from(fill[channel]) * 128. / 255.).round() as u8;
-                assert_eq!(output[channel], expected);
-            }
-            assert_eq!(output[3], alpha[0]);
+            assert_eq!(output.0, expected_ink_over(fill.0, 128, alpha[0]));
         }
-        assert_eq!(
-            multiply(
-                &RgbImage::from_pixel(1, 1, Rgb([200, 255, 1])),
-                &GrayImage::from_pixel(1, 1, Luma([128])),
-                &[77],
-                &CancellationToken::default()
-            )
-            .unwrap()
-            .get_pixel(0, 0)
-            .0,
-            [100, 128, 1, 77]
-        );
+        // Opaque: the fill is scaled by 1 − a; transparent: the ink alone.
+        assert_eq!(ink_over_pixel([200, 255, 1], 128, 255), [111, 142, 1, 255]);
+        assert_eq!(ink_over_pixel([200, 255, 1], 128, 0), [0, 0, 0, 113]);
     }
 
     #[test]
-    fn the_sharpened_line_art_multiplies_the_cleaned_fill_at_every_strength() {
+    fn the_sharpened_line_art_is_composited_as_ink_over_the_cleaned_fill_at_every_strength() {
         let line_art = GrayImage::from_fn(SIZE.0, SIZE.1, |x, y| {
             Luma([if x == 9 || y == 13 { 0 } else { 230 }])
         });
         let layers = layers(line_art.clone());
         let fill = expected_fill(&line_art);
+        let alpha = alpha();
         for strength in [0, 40, 100].map(Strength::new) {
             let sharpened = layers.line_art(strength, &|| false).unwrap();
             let output = layers.compose(strength, &|| false).unwrap();
-            for ((output, fill), line) in output.pixels().zip(fill.pixels()).zip(sharpened.pixels())
+            for (((output, fill), line), alpha) in output
+                .pixels()
+                .zip(fill.pixels())
+                .zip(sharpened.pixels())
+                .zip(alpha.pixels())
             {
-                for channel in 0..3 {
-                    let expected =
-                        (f64::from(fill[channel]) * f64::from(line[0]) / 255.).round() as u8;
-                    assert_eq!(output[channel], expected);
-                }
+                assert_eq!(output.0, expected_ink_over(fill.0, line[0], alpha[0]));
             }
+            // The line leaves the cutout at the top and the bottom and is
+            // drawn there too, extending the silhouette.
+            assert_eq!(alpha.get_pixel(9, 0)[0], 0);
+            assert_eq!(output.get_pixel(9, 0).0, [0, 0, 0, 255]);
+            assert_eq!(output.get_pixel(9, SIZE.1 - 1).0, [0, 0, 0, 255]);
+            assert_eq!(output.get_pixel(0, 13).0, [0, 0, 0, 255]);
         }
         assert_ne!(
             layers.line_art(Strength::new(0), &|| false).unwrap(),
             layers.line_art(Strength::new(100), &|| false).unwrap()
         );
+    }
+
+    #[test]
+    fn ink_falls_from_black_to_none_at_the_white_point() {
+        assert_eq!(ink(0), 255);
+        assert_eq!(ink(60), 188);
+        // (230 − 115) · 255 / 230 = 127.5 rounds up.
+        assert_eq!(ink(115), 128);
+        assert_eq!(ink(229), 1);
+        for line in INK_WHITE_POINT..=255 {
+            assert_eq!(ink(line), 0, "{line}");
+        }
+        for line in 0..INK_WHITE_POINT {
+            assert!(ink(line) > 0, "{line}");
+            assert!(ink(line) >= ink(line + 1), "{line}");
+        }
+    }
+
+    #[test]
+    fn ink_outside_the_alpha_keeps_its_own_coverage() {
+        for line in 0..=255 {
+            assert_eq!(
+                ink_over_pixel([180, 60, 40], line, 0),
+                if line >= INK_WHITE_POINT {
+                    [180, 60, 40, 0]
+                } else {
+                    [0, 0, 0, ink(line)]
+                },
+                "{line}"
+            );
+        }
+        assert_eq!(ink_over_pixel([180, 60, 40], 60, 0), [0, 0, 0, 188]);
+    }
+
+    #[test]
+    fn paper_leaves_no_haze_and_the_fill_unchanged() {
+        for line in INK_WHITE_POINT..=255 {
+            for fill in [[0, 0, 0], [180, 60, 40], [255, 255, 255]] {
+                for alpha in [0, 1, 77, 128, 254, 255] {
+                    assert_eq!(
+                        ink_over_pixel(fill, line, alpha),
+                        [fill[0], fill[1], fill[2], alpha],
+                        "{line} {alpha}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn black_ink_is_opaque_black_over_any_fill_and_alpha() {
+        for alpha in [0, 1, 77, 128, 254, 255] {
+            for fill in [[0, 0, 0], [180, 60, 40], [255, 255, 255]] {
+                assert_eq!(ink_over_pixel(fill, 0, alpha), [0, 0, 0, 255], "{alpha}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_ink_over_partial_alpha_matches_the_hand_computed_value() {
+        // g = 115 is a = 128/255 ink over A = 128/255: out_alpha =
+        // (128 · 255 + 128 · 127) / 255² = 48896 / 65025, 191.75 → 192, and
+        // rgb = fill · 16256 / 48896: 200 → 66.49, 100 → 33.25.
+        assert_eq!(ink_over_pixel([200, 100, 0], 115, 128), [66, 33, 0, 192]);
+        // Every partial combination agrees with the floating-point formula.
+        for line in (0..=255).step_by(7) {
+            for alpha in (0..=255).step_by(5) {
+                for fill in [[0, 0, 0], [200, 100, 1], [255, 255, 255]] {
+                    assert_eq!(
+                        ink_over_pixel(fill, line, alpha),
+                        expected_ink_over(fill, line, alpha),
+                        "{fill:?} {line} {alpha}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ink_over_validates_dimensions() {
+        let cancel = CancellationToken::default();
+        let fill = RgbImage::new(4, 3);
+        assert!(matches!(
+            ink_over(&fill, &GrayImage::new(4, 2), &[0; 12], &cancel),
+            Err(Error::InvalidDimensions)
+        ));
+        assert!(matches!(
+            ink_over(&fill, &GrayImage::new(4, 3), &[0; 11], &cancel),
+            Err(Error::InvalidDimensions)
+        ));
     }
 
     #[test]

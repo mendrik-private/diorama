@@ -1,6 +1,6 @@
 //! Application boundary for Game Asset scaling: FLUX line art and a de-inked
 //! fill generated at the target size, cut out by BiRefNet from the generated
-//! fill, then sharpened and multiplied by the shared scaler.
+//! fill, then sharpened and drawn as ink over the fill by the shared scaler.
 use crate::{
     document::{CancellationToken, GameAssetOptions},
     error::{AppError, Result},
@@ -57,7 +57,7 @@ struct TargetLayers {
 }
 
 /// A preview session keeps the source and the layers of the latest target
-/// size, so a Strength change only re-sharpens and multiplies. The cache is
+/// size, so a Strength change only re-sharpens and composites. The cache is
 /// published only by work that finished without cancellation.
 pub struct Session {
     source: Arc<RgbaImage>,
@@ -156,7 +156,7 @@ impl Session {
         }
     }
 
-    /// Return the line art as the result multiplies it: generated at the
+    /// Return the line art the result's ink is taken from: generated at the
     /// target size and sharpened at `options`'s strength. `progress` reports
     /// a running generation.
     pub fn line_art(
@@ -544,11 +544,11 @@ mod tests {
     }
 
     #[test]
-    fn the_cleaned_fill_is_multiplied_by_the_line_art_under_the_generated_alpha() {
+    fn the_line_art_is_drawn_as_ink_over_the_cleaned_fill_and_the_generated_alpha() {
         // A flat subject but a striped generated fill on a white background:
         // the colour restoration pulls the stripes back to the reference's
-        // colour away from the ink, the line art darkens it where it has
-        // ink, and alpha is the generated cutout.
+        // colour away from the ink, alpha is the generated cutout, and the
+        // ink is drawn over both, also where it leaves the cutout.
         let source = Arc::new(RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255])));
         let generator: Arc<LineArtGenerator> = Arc::new(|_, (w, h), cancel, _| {
             cancel.check()?;
@@ -588,6 +588,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.get_pixel(10, 15).0, [0, 0, 0, 255]);
         assert_eq!(result.get_pixel(10, 8).0, [190, 95, 55, 255]);
+        for x in [0, 1, 30, 31] {
+            for y in [15, 16] {
+                assert_eq!(result.get_pixel(x, y).0, [0, 0, 0, 255], "({x}, {y})");
+            }
+        }
         assert_eq!(result.get_pixel(0, 0)[3], 0);
         assert_eq!(result.get_pixel(31, 31)[3], 0);
     }
