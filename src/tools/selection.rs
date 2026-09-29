@@ -200,7 +200,15 @@ struct BiRefNetOutput {
     foreground: Option<RgbaImage>,
 }
 
-#[cfg(test)]
+/// BiRefNet's foreground mask of `image`, at its size.
+pub fn birefnet_mask(
+    image: &RgbaImage,
+    cancellation: &crate::document::CancellationToken,
+) -> Result<GrayImage> {
+    cancellation.check()?;
+    birefnet_mask_with_runtime(image, cancellation, &birefnet_runtime()?)
+}
+
 fn birefnet_mask_with_runtime(
     image: &RgbaImage,
     cancellation: &crate::document::CancellationToken,

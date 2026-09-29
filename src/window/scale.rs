@@ -1,6 +1,10 @@
 use std::time::Duration;
 
-use crate::{document::Resampling, i18n::gettext, tools::line_art::Progress};
+use crate::{
+    document::Resampling,
+    i18n::gettext,
+    tools::line_art::{Progress, Stage},
+};
 
 /// How often a pending Game Asset preview shows the latest generation
 /// progress.
@@ -52,18 +56,24 @@ pub(super) fn scale_unit(index: u32) -> ScaleUnit {
     }
 }
 
-/// The progress bar's text: whole seconds left, rounded up, or minutes from
-/// 90 s. Once the model is done, the preview is still being composed.
+/// The progress bar's text: the stage and whole seconds left, rounded up, or
+/// minutes from 90 s. Once the generation is done, the preview is still
+/// being composed.
 pub(super) fn generation_progress_text(progress: Progress) -> String {
     if progress.fraction >= 1. {
         return gettext("Finishing line art…");
     }
     let seconds = progress.remaining.as_secs_f64().ceil().max(1.) as u64;
-    if seconds < 90 {
-        gettext("Generating line art… ~{seconds} s left").replace("{seconds}", &seconds.to_string())
-    } else {
-        gettext("Generating line art… ~{minutes} min left")
-            .replace("{minutes}", &seconds.div_ceil(60).to_string())
+    match (progress.stage, seconds < 90) {
+        (Stage::Generating, true) => gettext("Generating line art… ~{seconds} s left")
+            .replace("{seconds}", &seconds.to_string()),
+        (Stage::Generating, false) => gettext("Generating line art… ~{minutes} min left")
+            .replace("{minutes}", &seconds.div_ceil(60).to_string()),
+        (Stage::CuttingOut, true) => {
+            gettext("Cutting out… ~{seconds} s left").replace("{seconds}", &seconds.to_string())
+        }
+        (Stage::CuttingOut, false) => gettext("Cutting out… ~{minutes} min left")
+            .replace("{minutes}", &seconds.div_ceil(60).to_string()),
     }
 }
 
@@ -87,21 +97,15 @@ pub(super) fn resampling_at(index: u32) -> Resampling {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::tools::line_art::Stage;
 
-    fn identity_background_remover(
-        image: &image::RgbaImage,
-        _: &CancellationToken,
-    ) -> crate::error::Result<image::RgbaImage> {
-        Ok(image.clone())
-    }
-
-    fn fixture_pair(
+    fn fixture_layers(
         image: &image::RgbaImage,
         size: (u32, u32),
         cancel: &CancellationToken,
         progress: &dyn Fn(Progress),
-    ) -> crate::error::Result<crate::tools::line_art::LineArtPair> {
-        crate::tools::scale::game_asset::model_like_test_pair(image, size, cancel, progress)
+    ) -> crate::error::Result<crate::tools::line_art::GameAssetLayers> {
+        crate::tools::scale::game_asset::model_like_test_layers(image, size, cancel, progress)
     }
 
     #[test]
@@ -110,6 +114,7 @@ mod tests {
             generation_progress_text(Progress {
                 fraction,
                 remaining: Duration::from_secs_f64(seconds),
+                stage: Stage::Generating,
             })
         };
         for (seconds, expected) in [
@@ -122,6 +127,17 @@ mod tests {
             assert_eq!(text(0.5, seconds), expected);
         }
         assert_eq!(text(1., 0.), "Finishing line art…");
+        let cutting_out = |fraction, seconds| {
+            generation_progress_text(Progress {
+                fraction,
+                remaining: Duration::from_secs_f64(seconds),
+                stage: Stage::CuttingOut,
+            })
+        };
+        assert_eq!(cutting_out(0.9, 1.6), "Cutting out… ~2 s left");
+        assert_eq!(cutting_out(0.9, 0.), "Cutting out… ~1 s left");
+        assert_eq!(cutting_out(0.9, 100.), "Cutting out… ~2 min left");
+        assert_eq!(cutting_out(1., 0.), "Finishing line art…");
     }
 
     #[test]
@@ -157,12 +173,12 @@ mod tests {
         window.0.rendered.replace(Some((*source).clone()));
         window.0.content_stack.set_visible_child_name("viewer");
         window.update_action_states();
-        let remove_background = Arc::new(identity_background_remover);
-        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
-            source.clone(),
-            remove_background,
-            Arc::new(fixture_pair),
-        ));
+        let session = Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_generator(
+                source.clone(),
+                Arc::new(fixture_layers),
+            ),
+        );
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(0);
         assert!(!window.0.scale_strength_controls.get_visible());
@@ -402,19 +418,21 @@ mod tests {
                 progress(Progress {
                     fraction: 0.25,
                     remaining: Duration::from_millis(11_200),
+                    stage: crate::tools::line_art::Stage::Generating,
                 });
                 while !release.load(Ordering::Relaxed) {
                     cancel.check()?;
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                fixture_pair(image, size, cancel, progress)
+                fixture_layers(image, size, cancel, progress)
             })
         };
-        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
-            source.clone(),
-            Arc::new(identity_background_remover),
-            generator,
-        ));
+        let session = Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_generator(
+                source.clone(),
+                generator,
+            ),
+        );
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(2);
         window.0.scale_game_asset.replace(Some(session.clone()));
@@ -601,11 +619,12 @@ echo stopped >> "$dir/launches"
         window.0.rendered.replace(Some((*source).clone()));
         window.0.content_stack.set_visible_child_name("viewer");
         window.update_action_states();
-        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
-            source.clone(),
-            Arc::new(identity_background_remover),
-            Arc::new(fixture_pair),
-        ));
+        let session = Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_generator(
+                source.clone(),
+                Arc::new(fixture_layers),
+            ),
+        );
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(2);
         window.0.scale_game_asset.replace(Some(session.clone()));

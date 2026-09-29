@@ -12534,10 +12534,9 @@ mod tests {
         // is checked with the deterministic stand-in instead.
         let scale_source = window.0.scale_source.borrow().clone().unwrap();
         window.0.scale_game_asset.replace(Some(Arc::new(
-            crate::tools::scale::game_asset::Session::with_test_workers(
+            crate::tools::scale::game_asset::Session::with_test_generator(
                 scale_source,
-                Arc::new(|image: &image::RgbaImage, _: &CancellationToken| Ok(image.clone())),
-                Arc::new(crate::tools::scale::game_asset::model_like_test_pair),
+                Arc::new(crate::tools::scale::game_asset::model_like_test_layers),
             ),
         )));
         window.0.scale_method.set_selected(2);

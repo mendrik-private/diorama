@@ -31,7 +31,7 @@ use crate::{
     tools::worker_process::{self, InferenceGate, Launch, RuntimeConfiguration, StdoutLines},
 };
 use estimate::Calibration;
-pub use progress::Progress;
+pub use progress::{Progress, Stage};
 use progress::{Tracker, WorkerEvent};
 use resident::{Job, RESIDENCY, Residency};
 
@@ -52,6 +52,7 @@ const RUNTIME_CONFIG: &str = "line-art-runtime.conf";
 const MAX_CACHED_PAIRS: usize = 64;
 const LINE_ART_SUFFIX: &str = "-line-art.png";
 const FILL_SUFFIX: &str = "-fill.png";
+const CUTOUT_SUFFIX: &str = "-cutout.png";
 const SETUP: &str = "python3 build-aux/setup-line-art.py";
 /// FLUX.2 works on 16-pixel latent patches.
 const MULTIPLE: u32 = 16;
@@ -118,13 +119,27 @@ const RECIPE: Recipe = Recipe {
     guidance: "1.0",
 };
 
-/// Target-sized, aligned Game Asset layers: grayscale line art (white is no
-/// ink) and an opaque fill without ink contours.
+/// What FLUX generates for one reference: grayscale line art (white is no
+/// ink) and an opaque fill without ink contours, at the generation size.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LineArtPair {
+struct LineArtPair {
+    line_art: GrayImage,
+    fill: RgbImage,
+}
+
+/// Target-sized, aligned Game Asset layers: the line art, the fill, the
+/// result's alpha (the fill's cutout, capped by the source's own alpha) and
+/// the source's white-composited colours as the fill's colour reference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameAssetLayers {
     pub line_art: GrayImage,
     pub fill: RgbImage,
+    pub alpha: GrayImage,
+    pub reference: RgbImage,
 }
+
+/// Cuts out an opaque image: its foreground mask, at its size.
+type Cutout<'a> = dyn Fn(&RgbaImage, &CancellationToken) -> Result<GrayImage> + 'a;
 
 struct Runtime {
     python: PathBuf,
@@ -139,19 +154,21 @@ struct Runtime {
     inference: std::sync::Arc<InferenceGate>,
 }
 
-/// Generate the line art and fill for `target` (at most the source size).
+/// Generate the Game Asset layers for `target` (at most the source size).
 ///
 /// The white-composited source is resized with Lanczos to the generation
-/// size of [`plan`]; both generated images are center-cropped to its crop
-/// size and, when that is larger than `target`, reduced to `target`: the
-/// line art with bicubic, the fill with Lanczos. `progress` is called on this
-/// thread while the worker runs, never for a cache hit.
+/// size of [`plan`], where FLUX generates the line art and the fill, and
+/// BiRefNet cuts the generated fill out, so the alpha lines up with both.
+/// Every layer is center-cropped to the plan's crop size and, when that is
+/// larger than `target`, reduced to `target`: the line art with bicubic, the
+/// others with Lanczos. `progress` is called on this thread while the worker
+/// or the cutout runs, never when all three layers are cached.
 pub fn generate(
     source: &RgbaImage,
     target: (u32, u32),
     cancellation: &CancellationToken,
     progress: &dyn Fn(Progress),
-) -> Result<LineArtPair> {
+) -> Result<GameAssetLayers> {
     cancellation.check()?;
     generate_in(
         source,
@@ -160,6 +177,7 @@ pub fn generate(
         &cache_directory()?,
         Runtime::from_environment,
         &RESIDENCY,
+        &crate::tools::selection::birefnet_mask,
         progress,
     )
 }
@@ -308,9 +326,10 @@ impl Runtime {
     }
 }
 
-/// `cache` holds accepted pairs, the timing calibration and the worker's
-/// host-visible scratch directories. The runtime is resolved only on a cache
-/// miss.
+/// `cache` holds accepted pairs with their cutouts, the timing calibration
+/// and the worker's host-visible scratch directories. The runtime is
+/// resolved only on a cache miss; `cutout` is BiRefNet in production.
+#[allow(clippy::too_many_arguments)]
 fn generate_in(
     source: &RgbaImage,
     target: (u32, u32),
@@ -318,8 +337,9 @@ fn generate_in(
     cache: &Path,
     runtime: impl FnOnce() -> Result<Runtime>,
     residency: &Residency,
+    cutout: &Cutout<'_>,
     progress: &dyn Fn(Progress),
-) -> Result<LineArtPair> {
+) -> Result<GameAssetLayers> {
     let plan = plan(target)?;
     let size = plan.generation;
     if source.width() == 0 || source.height() == 0 {
@@ -327,7 +347,7 @@ fn generate_in(
     }
     let reference = reference(source, size, cancellation)?;
     let key = cache_key(&RECIPE, &reference);
-    let generated = if let Some(cached) = read_cached(cache, &key, size) {
+    let (generated, mask) = if let Some(cached) = read_cached(cache, &key, size) {
         if let Err(error) = check_line_art(&cached.line_art, &reference, cancellation) {
             // Only accepted results belong in the cache; a cancelled check
             // says nothing about the entry.
@@ -337,9 +357,31 @@ fn generate_in(
             return Err(error);
         }
         touch_cached(cache, &key);
-        cached
+        // A pair cached without its cutout only needs the cutout.
+        let mask = match read_cached_cutout(cache, &key, size) {
+            Some(mask) => mask,
+            None => {
+                let remaining = Calibration::load(cache).factor() * estimate::CUTOUT_SECONDS;
+                progress(Progress {
+                    fraction: 0.,
+                    remaining: Duration::from_secs_f64(remaining),
+                    stage: Stage::CuttingOut,
+                });
+                let mask = cut_out(&cached.fill, cutout, cancellation)?;
+                progress(Progress {
+                    fraction: 1.,
+                    remaining: Duration::ZERO,
+                    stage: Stage::CuttingOut,
+                });
+                if let Err(error) = store_cached_cutout(cache, &key, &mask) {
+                    tracing::warn!(%error, cache = %cache.display(), "Could not cache the cutout");
+                }
+                mask
+            }
+        };
+        (cached, mask)
     } else {
-        let generated = run_worker(
+        let run = run_worker(
             &reference,
             cancellation,
             &runtime()?,
@@ -347,27 +389,76 @@ fn generate_in(
             residency,
             progress,
         )?;
-        check_line_art(&generated.line_art, &reference, cancellation)?;
+        check_line_art(&run.pair.line_art, &reference, cancellation)?;
         cancellation.check()?;
-        match store_cached(cache, &key, &generated) {
+        // The pair is cached before the cutout, so a failed cutout does not
+        // cost the generation.
+        let stored = store_cached(cache, &key, &run.pair);
+        match &stored {
             Ok(()) => evict_cached(cache, MAX_CACHED_PAIRS),
             Err(error) => {
                 tracing::warn!(%error, cache = %cache.display(), "Could not cache line art");
             }
         }
-        generated
+        let mut tracker = run.tracker;
+        tracker.cutting_out(Instant::now());
+        progress(tracker.progress(Instant::now()));
+        let mask = cut_out(&run.pair.fill, cutout, cancellation)?;
+        tracker.finish(Instant::now());
+        run.calibration
+            .updated(run.started.elapsed(), tracker.predicted())
+            .store(cache);
+        progress(tracker.progress(Instant::now()));
+        cancellation.check()?;
+        if stored.is_ok()
+            && let Err(error) = store_cached_cutout(cache, &key, &mask)
+        {
+            tracing::warn!(%error, cache = %cache.display(), "Could not cache the cutout");
+        }
+        (run.pair, mask)
     };
-    let line_art = center_crop(&generated.line_art, plan.crop);
-    let fill = center_crop(&generated.fill, plan.crop);
-    if plan.crop == target {
-        return Ok(LineArtPair { line_art, fill });
+    // The source's own transparency, resized like the reference, caps the
+    // cutout's alpha.
+    let source_alpha = source.pixels().any(|pixel| pixel[3] < u8::MAX).then(|| {
+        let alpha = GrayImage::from_fn(source.width(), source.height(), |x, y| {
+            image::Luma([source.get_pixel(x, y)[3]])
+        });
+        if alpha.dimensions() == size {
+            alpha
+        } else {
+            image::imageops::resize(&alpha, size.0, size.1, FilterType::Lanczos3)
+        }
+    });
+    let reference = image::DynamicImage::ImageRgba8(reference).into_rgb8();
+    let mut alpha = place(&mask, &plan, target, FilterType::Lanczos3);
+    if let Some(source_alpha) = source_alpha {
+        let source_alpha = place(&source_alpha, &plan, target, FilterType::Lanczos3);
+        for (alpha, cap) in alpha.pixels_mut().zip(source_alpha.pixels()) {
+            alpha[0] = alpha[0].min(cap[0]);
+        }
     }
-    let pair = LineArtPair {
-        line_art: image::imageops::resize(&line_art, target.0, target.1, FilterType::CatmullRom),
-        fill: image::imageops::resize(&fill, target.0, target.1, FilterType::Lanczos3),
+    let layers = GameAssetLayers {
+        line_art: place(&generated.line_art, &plan, target, FilterType::CatmullRom),
+        fill: place(&generated.fill, &plan, target, FilterType::Lanczos3),
+        alpha,
+        reference: place(&reference, &plan, target, FilterType::Lanczos3),
     };
     cancellation.check()?;
-    Ok(pair)
+    Ok(layers)
+}
+
+/// The foreground mask of a generated fill, at its size.
+fn cut_out(
+    fill: &RgbImage,
+    cutout: &Cutout<'_>,
+    cancellation: &CancellationToken,
+) -> Result<GrayImage> {
+    let opaque = image::DynamicImage::ImageRgb8(fill.clone()).into_rgba8();
+    let mask = cutout(&opaque, cancellation)?;
+    if mask.dimensions() != fill.dimensions() {
+        return Err(AppError::InvalidDimensions);
+    }
+    Ok(mask)
 }
 
 /// `side` rounded up to a multiple of 16, at least 16.
@@ -430,6 +521,22 @@ fn plan((width, height): (u32, u32)) -> Result<Plan> {
 /// down.
 fn crop_offset(size: (u32, u32), target: (u32, u32)) -> (u32, u32) {
     ((size.0 - target.0) / 2, (size.1 - target.1) / 2)
+}
+
+/// A generation-sized layer center-cropped to the plan's crop size and,
+/// when that is larger than `target`, reduced to `target` with `filter`.
+fn place<P: Pixel + 'static>(
+    image: &ImageBuffer<P, Vec<P::Subpixel>>,
+    plan: &Plan,
+    target: (u32, u32),
+    filter: FilterType,
+) -> ImageBuffer<P, Vec<P::Subpixel>> {
+    let cropped = center_crop(image, plan.crop);
+    if plan.crop == target {
+        cropped
+    } else {
+        image::imageops::resize(&cropped, target.0, target.1, filter)
+    }
 }
 
 fn center_crop<P: Pixel + 'static>(
@@ -527,15 +634,17 @@ fn prompt_embeds_path(model: &Path, recipe: &Recipe, prompt: &str) -> PathBuf {
     model.join(format!(".diorama-prompt-{key}.safetensors"))
 }
 
-fn cached_paths(cache: &Path, key: &str) -> [PathBuf; 2] {
+/// The line art, fill and cutout of one cached generation.
+fn cached_paths(cache: &Path, key: &str) -> [PathBuf; 3] {
     [
         cache.join(format!("{key}{LINE_ART_SUFFIX}")),
         cache.join(format!("{key}{FILL_SUFFIX}")),
+        cache.join(format!("{key}{CUTOUT_SUFFIX}")),
     ]
 }
 
 fn read_cached(cache: &Path, key: &str, size: (u32, u32)) -> Option<LineArtPair> {
-    let [line_art, fill] = cached_paths(cache, key);
+    let [line_art, fill, _] = cached_paths(cache, key);
     let line_art = image::open(line_art).ok()?.into_luma8();
     let fill = image::open(fill).ok()?.into_rgb8();
     (line_art.dimensions() == size && fill.dimensions() == size)
@@ -546,25 +655,46 @@ fn read_cached(cache: &Path, key: &str, size: (u32, u32)) -> Option<LineArtPair>
 /// target, then renamed. The line art goes last, and a lone fill is a miss.
 fn store_cached(cache: &Path, key: &str, pair: &LineArtPair) -> Result<()> {
     fs::create_dir_all(cache)?;
-    let [line_art, fill] = cached_paths(cache, key);
-    let store = |path: &Path, save: &dyn Fn(&Path) -> image::ImageResult<()>| -> Result<()> {
-        let temporary = tempfile::Builder::new()
-            .prefix(".store-")
-            .suffix(".png")
-            .tempfile_in(cache)?;
-        save(temporary.path())?;
-        temporary
-            .persist(path)
-            .map_err(|error| AppError::Io(error.error))?;
-        Ok(())
-    };
-    store(&fill, &|path| {
+    let [line_art, fill, _] = cached_paths(cache, key);
+    store_image(cache, &fill, &|path| {
         pair.fill.save_with_format(path, image::ImageFormat::Png)
     })?;
-    store(&line_art, &|path| {
+    store_image(cache, &line_art, &|path| {
         pair.line_art
             .save_with_format(path, image::ImageFormat::Png)
     })
+}
+
+/// A cached pair without its cutout is still valid; only the cutout is then
+/// computed again.
+fn read_cached_cutout(cache: &Path, key: &str, size: (u32, u32)) -> Option<GrayImage> {
+    let [_, _, cutout] = cached_paths(cache, key);
+    let mask = image::open(cutout).ok()?.into_luma8();
+    (mask.dimensions() == size).then_some(mask)
+}
+
+fn store_cached_cutout(cache: &Path, key: &str, mask: &GrayImage) -> Result<()> {
+    fs::create_dir_all(cache)?;
+    let [_, _, cutout] = cached_paths(cache, key);
+    store_image(cache, &cutout, &|path| {
+        mask.save_with_format(path, image::ImageFormat::Png)
+    })
+}
+
+fn store_image(
+    cache: &Path,
+    path: &Path,
+    save: &dyn Fn(&Path) -> image::ImageResult<()>,
+) -> Result<()> {
+    let temporary = tempfile::Builder::new()
+        .prefix(".store-")
+        .suffix(".png")
+        .tempfile_in(cache)?;
+    save(temporary.path())?;
+    temporary
+        .persist(path)
+        .map_err(|error| AppError::Io(error.error))?;
+    Ok(())
 }
 
 /// Eviction is least recently used, not least recently made.
@@ -592,7 +722,7 @@ fn cached_key(name: &str) -> Option<&str> {
     let key = name.get(..64)?;
     let suffix = &name[64..];
     (key.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && [LINE_ART_SUFFIX, FILL_SUFFIX, ".png"].contains(&suffix))
+        && [LINE_ART_SUFFIX, FILL_SUFFIX, CUTOUT_SUFFIX, ".png"].contains(&suffix))
     .then_some(key)
 }
 
@@ -683,7 +813,7 @@ fn run_worker(
     cache: &Path,
     residency: &Residency,
     progress: &dyn Fn(Progress),
-) -> Result<LineArtPair> {
+) -> Result<Run> {
     verify_model(&runtime.model)?;
     verify_gguf(&runtime.gguf)?;
     // Another window may be running a model that takes minutes; only
@@ -776,12 +906,21 @@ fn run_worker(
         line_art: read(&line_art)?.into_luma8(),
         fill: read(&fill)?.into_rgb8(),
     };
-    let mut tracker = tracker;
-    calibration
-        .updated(started.elapsed(), tracker.predicted())
-        .store(cache);
-    progress(tracker.progress(Instant::now()));
-    Ok(pair)
+    Ok(Run {
+        pair,
+        tracker,
+        calibration,
+        started,
+    })
+}
+
+/// A finished worker job, with what the rest of the generation's progress
+/// and calibration need.
+struct Run {
+    pair: LineArtPair,
+    tracker: Tracker,
+    calibration: Calibration,
+    started: Instant,
 }
 
 /// Run one worker process to completion, feeding its progress events to
@@ -1118,8 +1257,22 @@ mod tests {
 
     fn no_progress(_: Progress) {}
 
+    /// A stand-in for BiRefNet: everything that is not near-white is
+    /// foreground.
+    fn fake_cutout(image: &RgbaImage, cancellation: &CancellationToken) -> Result<GrayImage> {
+        cancellation.check()?;
+        Ok(GrayImage::from_fn(image.width(), image.height(), |x, y| {
+            let pixel = image.get_pixel(x, y);
+            Luma([if pixel.0[..3].iter().all(|&channel| channel >= 245) {
+                0
+            } else {
+                255
+            }])
+        }))
+    }
+
     /// Generate with a resident worker of its own that is not kept warm, so
-    /// every run starts and stops a worker.
+    /// every run starts and stops a worker, and the stand-in cutout.
     fn generate_in(
         source: &RgbaImage,
         target: (u32, u32),
@@ -1127,7 +1280,7 @@ mod tests {
         cache: &Path,
         runtime: impl FnOnce() -> Result<Runtime>,
         progress: &dyn Fn(Progress),
-    ) -> Result<LineArtPair> {
+    ) -> Result<GameAssetLayers> {
         super::generate_in(
             source,
             target,
@@ -1135,6 +1288,7 @@ mod tests {
             cache,
             runtime,
             &Residency::default(),
+            &fake_cutout,
             progress,
         )
     }
@@ -1692,6 +1846,51 @@ echo stopped >> "$dir/launches"
             pair
         }
 
+        /// A stand-in for BiRefNet that records what it cuts out and
+        /// returns a mask encoding each pixel's coordinates.
+        #[derive(Default)]
+        struct RecordingCutout(std::sync::Mutex<Vec<RgbaImage>>);
+
+        impl RecordingCutout {
+            fn mask((width, height): (u32, u32)) -> GrayImage {
+                GrayImage::from_fn(width, height, |x, y| Luma([(x * 3 + y * 5) as u8]))
+            }
+
+            fn cut_out(
+                &self,
+                image: &RgbaImage,
+                cancellation: &CancellationToken,
+            ) -> Result<GrayImage> {
+                cancellation.check()?;
+                self.0.lock().unwrap().push(image.clone());
+                Ok(Self::mask(image.dimensions()))
+            }
+
+            fn calls(&self) -> usize {
+                self.0.lock().unwrap().len()
+            }
+        }
+
+        fn generate_cutting_out(
+            source: &RgbaImage,
+            target: (u32, u32),
+            cache: &Path,
+            runtime: impl FnOnce() -> Result<Runtime>,
+            cutout: &Cutout<'_>,
+            progress: &dyn Fn(Progress),
+        ) -> Result<GameAssetLayers> {
+            super::super::generate_in(
+                source,
+                target,
+                &token(),
+                cache,
+                runtime,
+                &Residency::default(),
+                cutout,
+                progress,
+            )
+        }
+
         fn key_for(source: &RgbaImage, target: (u32, u32)) -> String {
             let size = plan(target).unwrap().generation;
             cache_key(&RECIPE, &reference(source, size, &token()).unwrap())
@@ -1763,13 +1962,254 @@ echo stopped >> "$dir/launches"
             );
             let last = reported.last().unwrap();
             assert_eq!((last.fraction, last.remaining), (1., Duration::ZERO));
+            // The cutout is the last stage, after the worker's job.
+            let cutting_out = reported
+                .iter()
+                .position(|progress| progress.stage == Stage::CuttingOut)
+                .expect("a cutout stage");
+            assert!(reported[cutting_out].fraction < 1.);
+            assert!(
+                reported[cutting_out..]
+                    .iter()
+                    .all(|progress| progress.stage == Stage::CuttingOut)
+            );
 
-            // One pair (two images) and the timing calibration are kept.
+            // One generation (three images) and the timing calibration are
+            // kept.
             let entries = cache_entries(&cache);
             assert_eq!(pairs(&cache), 1, "{entries:?}");
-            assert_eq!(entries.len(), 3, "{entries:?}");
+            assert_eq!(entries.len(), 4, "{entries:?}");
             assert!(entries.contains(&"timing-calibration".to_owned()));
             assert_ne!(Calibration::load(&cache), Calibration::default());
+        }
+
+        #[test]
+        fn the_alpha_is_the_generated_fills_cutout_placed_like_the_fill() {
+            let root = tempfile::tempdir().unwrap();
+            let source = shapes(700);
+            let lanczos =
+                |image: &GrayImage, (w, h)| imageops::resize(image, w, h, FilterType::Lanczos3);
+            // 513 × 600 is generated at 528 × 608 and cropped; 128² at 512²,
+            // cropped to 512² and reduced.
+            for (target, generation) in [((513, 600), (528, 608)), ((128, 128), (512, 512))] {
+                let cache = root.path().join(format!("cache-{}", target.0));
+                let generated = prepare_results(root.path(), &source, target);
+                let cutout = RecordingCutout::default();
+                let layers = generate_cutting_out(
+                    &source,
+                    target,
+                    &cache,
+                    || Ok(succeeding(root.path())),
+                    &|image, cancellation| cutout.cut_out(image, cancellation),
+                    &no_progress,
+                )
+                .unwrap();
+                // BiRefNet ran once, on the generated fill at the generation
+                // size, never on the source.
+                let inputs = cutout.0.into_inner().unwrap();
+                assert_eq!(inputs.len(), 1);
+                assert_eq!(
+                    inputs[0],
+                    image::DynamicImage::ImageRgb8(generated.fill.clone()).into_rgba8()
+                );
+                let crop = plan(target).unwrap().crop;
+                let mask = center_crop(&RecordingCutout::mask(generation), crop);
+                let reference = image::DynamicImage::ImageRgba8(
+                    reference(&source, generation, &token()).unwrap(),
+                )
+                .into_rgb8();
+                let reference = center_crop(&reference, crop);
+                if crop == target {
+                    assert_eq!(layers.alpha, mask);
+                    assert_eq!(layers.reference, reference);
+                    // The alpha's pixels line up with the fill's.
+                    assert_eq!(layers.fill.get_pixel(0, 0).0, [7, 4, 200]);
+                    assert_eq!(layers.alpha.get_pixel(0, 0)[0], (7 * 3 + 4 * 5) as u8);
+                } else {
+                    assert_eq!(layers.alpha, lanczos(&mask, target));
+                    assert_eq!(
+                        layers.reference,
+                        imageops::resize(&reference, target.0, target.1, FilterType::Lanczos3)
+                    );
+                }
+                assert_eq!(layers.alpha.dimensions(), target);
+                assert_eq!(layers.reference.dimensions(), target);
+            }
+        }
+
+        #[test]
+        fn a_transparent_source_caps_the_cutout_alpha() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let opaque = shapes(600);
+            let mut transparent = opaque.clone();
+            for (x, _, pixel) in transparent.enumerate_pixels_mut() {
+                pixel[3] = match x {
+                    0..200 => 0,
+                    200..400 => 128,
+                    _ => 255,
+                };
+            }
+            let everything = |image: &RgbaImage, _: &CancellationToken| {
+                Ok(GrayImage::from_pixel(
+                    image.width(),
+                    image.height(),
+                    Luma([255]),
+                ))
+            };
+            let run = |source: &RgbaImage| {
+                prepare_results(root.path(), source, (128, 128));
+                generate_cutting_out(
+                    source,
+                    (128, 128),
+                    &cache,
+                    || Ok(succeeding(root.path())),
+                    &everything,
+                    &no_progress,
+                )
+                .unwrap()
+            };
+            // An opaque source keeps the cutout's alpha.
+            assert!(run(&opaque).alpha.pixels().all(|alpha| alpha[0] == 255));
+            // The source's alpha, placed like the other layers, caps it.
+            let alpha = run(&transparent).alpha;
+            let source_alpha =
+                GrayImage::from_fn(600, 600, |x, y| Luma([transparent.get_pixel(x, y)[3]]));
+            let source_alpha = imageops::resize(&source_alpha, 512, 512, FilterType::Lanczos3);
+            let source_alpha = imageops::resize(&source_alpha, 128, 128, FilterType::Lanczos3);
+            assert_eq!(alpha, source_alpha);
+            assert_eq!(alpha.get_pixel(10, 64)[0], 0);
+            assert_eq!(alpha.get_pixel(64, 64)[0], 128);
+            assert_eq!(alpha.get_pixel(120, 64)[0], 255);
+        }
+
+        #[test]
+        fn a_cached_pair_without_its_cutout_only_cuts_out_again() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (128, 128));
+            let cutout = RecordingCutout::default();
+            let reported = RefCell::new(Vec::new());
+            let run = || {
+                reported.borrow_mut().clear();
+                generate_cutting_out(
+                    &source,
+                    (128, 128),
+                    &cache,
+                    || Ok(succeeding(root.path())),
+                    &|image, cancellation| cutout.cut_out(image, cancellation),
+                    &|progress| reported.borrow_mut().push(progress),
+                )
+                .unwrap()
+            };
+            let first = run();
+            assert_eq!((launches(root.path()), cutout.calls()), (1, 1));
+            let [_, _, cutout_path] = cached_paths(&cache, &key_for(&source, (128, 128)));
+            assert!(cutout_path.exists());
+
+            // Everything cached: nothing runs and nothing is reported.
+            assert_eq!(run(), first);
+            assert_eq!((launches(root.path()), cutout.calls()), (1, 1));
+            assert!(reported.borrow().is_empty());
+
+            // Without the cutout, only the cutout runs, and reports its stage.
+            fs::remove_file(&cutout_path).unwrap();
+            assert_eq!(run(), first);
+            assert_eq!((launches(root.path()), cutout.calls()), (1, 2));
+            assert!(cutout_path.exists());
+            let reported = reported.borrow();
+            assert!(!reported.is_empty());
+            assert!(
+                reported
+                    .iter()
+                    .all(|progress| progress.stage == Stage::CuttingOut)
+            );
+            assert_eq!(reported.last().unwrap().fraction, 1.);
+        }
+
+        #[test]
+        fn a_failed_cutout_keeps_the_generated_pair() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (128, 128));
+            let failing = |_: &RgbaImage, _: &CancellationToken| -> Result<GrayImage> {
+                Err(AppError::BackgroundRemoval(
+                    "BiRefNet is unavailable".into(),
+                ))
+            };
+            let error = generate_cutting_out(
+                &source,
+                (128, 128),
+                &cache,
+                || Ok(succeeding(root.path())),
+                &failing,
+                &no_progress,
+            )
+            .unwrap_err();
+            assert!(matches!(error, AppError::BackgroundRemoval(_)), "{error}");
+            let [line_art, fill, cutout_path] = cached_paths(&cache, &key_for(&source, (128, 128)));
+            assert!(line_art.exists() && fill.exists() && !cutout_path.exists());
+            // A cutout of the wrong size is rejected, and not cached.
+            let wrong_size = |_: &RgbaImage, _: &CancellationToken| Ok(GrayImage::new(3, 3));
+            assert!(matches!(
+                generate_cutting_out(
+                    &source,
+                    (128, 128),
+                    &cache,
+                    || panic!("no launch"),
+                    &wrong_size,
+                    &no_progress,
+                ),
+                Err(AppError::InvalidDimensions)
+            ));
+            assert!(!cutout_path.exists());
+            let cutout = RecordingCutout::default();
+            generate_cutting_out(
+                &source,
+                (128, 128),
+                &cache,
+                || panic!("no launch"),
+                &|image, cancellation| cutout.cut_out(image, cancellation),
+                &no_progress,
+            )
+            .unwrap();
+            assert_eq!((launches(root.path()), cutout.calls()), (1, 1));
+            assert!(cutout_path.exists());
+        }
+
+        #[test]
+        fn targets_sharing_a_generation_size_share_one_cutout() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let source = shapes(600);
+            // 128² and 100² are both generated at 512², from one reference.
+            assert_eq!(plan((100, 100)).unwrap().generation, (512, 512));
+            assert_eq!(key_for(&source, (100, 100)), key_for(&source, (128, 128)));
+            prepare_results(root.path(), &source, (128, 128));
+            let cutout = RecordingCutout::default();
+            let mut alphas = Vec::new();
+            for target in [(128, 128), (100, 100), (128, 128)] {
+                let layers = generate_cutting_out(
+                    &source,
+                    target,
+                    &cache,
+                    || Ok(succeeding(root.path())),
+                    &|image, cancellation| cutout.cut_out(image, cancellation),
+                    &no_progress,
+                )
+                .unwrap();
+                assert_eq!(layers.alpha.dimensions(), target);
+                alphas.push(layers.alpha);
+            }
+            assert_eq!((launches(root.path()), cutout.calls()), (1, 1));
+            assert_eq!(alphas[0], alphas[2]);
+            let mask = RecordingCutout::mask((512, 512));
+            assert_eq!(
+                alphas[1],
+                imageops::resize(&mask, 100, 100, FilterType::Lanczos3)
+            );
         }
 
         #[test]
@@ -2107,7 +2547,7 @@ echo stopped >> "$dir/launches"
             assert!(error.to_string().contains("nearly solid"), "{error}");
             assert!(cached_paths(&cache, &key).iter().all(|path| !path.exists()));
 
-            let [_, fill] = cached_paths(&cache, &key);
+            let [_, fill, _] = cached_paths(&cache, &key);
             RgbImage::new(w, h).save(&fill).unwrap();
             prepare_results(root.path(), &source, (64, 64));
             generate_in(
@@ -2250,7 +2690,7 @@ echo "{\"event\": \"cancelled\", \"job\": $job}""#;
             cache: &Path,
             runtime: Runtime,
             residency: &Residency,
-        ) -> Result<LineArtPair> {
+        ) -> Result<GameAssetLayers> {
             let cancellation = token();
             let stepped = std::sync::atomic::AtomicBool::new(false);
             thread::scope(|scope| {
@@ -2262,6 +2702,7 @@ echo "{\"event\": \"cancelled\", \"job\": $job}""#;
                         cache,
                         || Ok(runtime),
                         residency,
+                        &super::fake_cutout,
                         &|progress| {
                             // The first step's estimate replaces the initial one.
                             if progress.fraction > 0. {
@@ -2328,6 +2769,7 @@ echo "{\"event\": \"cancelled\", \"job\": $job}""#;
                     &cache,
                     || Ok(succeeding(root.path())),
                     &residency,
+                    &super::fake_cutout,
                     &|progress| reported.borrow_mut().push(progress),
                 )
                 .unwrap();
@@ -2386,6 +2828,7 @@ esac"#
                     &cache,
                     runtime,
                     &residency,
+                    &super::fake_cutout,
                     &no_progress,
                 )
             };
@@ -2413,6 +2856,7 @@ esac"#
                 &cache,
                 runtime,
                 &residency,
+                &super::fake_cutout,
                 &no_progress,
             )
             .unwrap();
@@ -2455,6 +2899,7 @@ fi"#
                 &cache,
                 || Ok(fake_runtime(root.path(), READY, &job)),
                 &residency,
+                &super::fake_cutout,
                 &no_progress,
             )
             .unwrap();
@@ -2495,6 +2940,7 @@ fi"#
                 &cache,
                 || Ok(fake_runtime(root.path(), READY, &job)),
                 &residency,
+                &super::fake_cutout,
                 &no_progress,
             )
             .unwrap();
@@ -2520,6 +2966,7 @@ fi"#
                     &cache,
                     || Ok(fake_runtime(root.path(), READY, &job)),
                     &residency,
+                    &super::fake_cutout,
                     &no_progress,
                 )
             };

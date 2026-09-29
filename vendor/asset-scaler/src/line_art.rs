@@ -1,34 +1,22 @@
 //! Line-art composition at the target size.
 //!
-//! The application supplies two target-sized layers: grayscale line art
-//! (white is no ink) and an opaque fill without ink contours. Neither layer is
-//! resampled here. The fill is cleaned first: where the foreground is not
-//! opaque, or the fill still shows its own background, it takes colour bled
-//! from the valid pixels around, so no background shows as a halo along the
-//! silhouette; its local colour is then pulled back to the foreground's. The
-//! line art is sharpened with an unsharp mask of radius 1 and multiplies the
-//! fill in 8-bit sRGB, like GIMP's Multiply layer mode. Alpha comes from the
-//! foreground alone: its Lanczos reduction's silhouette alpha at the target
-//! size, with a fixed edge softness.
-use crate::{
-    Cancellation, DEFAULT_MEMORY_LIMIT, Error, GameAssetAa, Result, color, lanczos,
-    silhouette::Silhouette,
-};
+//! The application supplies four target-sized, aligned layers: grayscale line
+//! art (white is no ink), an opaque fill without ink contours, the alpha of
+//! the result, and the original's colours as a reference. Nothing is
+//! resampled here. The fill's local colour is first restored towards the
+//! reference by an edge-aware correction; the line art, sharpened with an
+//! unsharp mask of radius 1, then multiplies it in 8-bit sRGB, like GIMP's
+//! Multiply layer mode, and the alpha is attached unchanged.
+use crate::{Cancellation, DEFAULT_MEMORY_LIMIT, Error, Result};
 use image::{
     GrayImage, ImageBuffer, Rgb, RgbImage, Rgba, RgbaImage,
     imageops::{FilterType, resize},
 };
-use std::sync::{Arc, Mutex};
 
-/// Source-sized working set of the alpha: the caller's foreground, its linear
-/// and isolated copies (2 × 32 B), premultiplied Lanczos input and its
-/// vertical pass (2 × 16 B), silhouette support, flood fill and projections.
-const SOURCE_BYTES: u64 = 160;
-/// Target-sized working set: the line art, its blur and horizontal pass, the
-/// sharpened copy, the fill and its cleaned copy, the cleaning's colour,
-/// weight and blur planes (10 × 8 B), the linear Lanczos reduction,
-/// silhouette coverage/opacity, the cached alpha and colours, and the output.
-const TARGET_BYTES: u64 = 200;
+/// Target-sized working set: the four layers, the line art's blur and
+/// horizontal pass, the sharpened copy, the cleaning's colour and weight
+/// planes (5 × 8 B), and the output.
+const TARGET_BYTES: u64 = 96;
 /// Gaussian standard deviation of the unsharp mask, in target pixels.
 const SHARPEN_RADIUS: f32 = 1.;
 /// Kernel half-width: the Gaussian is truncated at three standard deviations.
@@ -38,11 +26,6 @@ const OPAQUE_ALPHA: u8 = 250;
 /// Fill colours closer than this (Euclidean, in 8-bit RGB) to the fill's
 /// background are background showing through, not the subject.
 const BACKGROUND_DISTANCE: f64 = 40.;
-/// Standard deviations, in target pixels, of the Gaussians that bleed valid
-/// colour outward, tried in turn for pixels the narrower ones do not reach.
-const BLEED_SIGMAS: [f64; 3] = [1.5, 4.5, 13.5];
-/// A Gaussian reaches a pixel when the valid weight there is at least this.
-const MIN_REACH: f64 = 1e-3;
 /// Line art brighter than this throughout a 3×3 neighbourhood is free of
 /// ink; only there does the colour restoration compare colours.
 const INK_FREE_THRESHOLD: u8 = 200;
@@ -61,12 +44,6 @@ const RESTORE_RANGE_SIGMA: f64 = 25.;
 const RESTORE_MIN_SHARE: f64 = 0.15;
 /// The restoration's window spans this many spatial standard deviations.
 const RESTORE_WINDOW: f64 = 3.;
-/// The cleaning Gaussians are truncated at this many standard deviations,
-/// like scipy's `gaussian_filter` default.
-const CLEANING_TRUNCATE: f64 = 4.;
-/// The silhouette's edge softness; this is the traced API's default AA.
-const ALPHA_EDGE: GameAssetAa = GameAssetAa::new(50);
-
 /// Unsharp-mask strength in percent, clamped to 0–100; the default is 40%.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Strength(u8);
@@ -92,27 +69,63 @@ impl Default for Strength {
     }
 }
 
-/// Target-sized line art and fill, aligned pixel for pixel. The line art's
-/// blur is computed once, so a strength change only re-sharpens.
+/// Target-sized, aligned layers of one result. The fill is cleaned and the
+/// line art's blur computed once, so a strength change only re-sharpens and
+/// multiplies.
 pub struct LineArtLayers {
     line_art: GrayImage,
     fill: RgbImage,
+    alpha: GrayImage,
     blurred: Vec<f32>,
 }
 
 impl LineArtLayers {
-    /// Both layers must have the same, non-zero dimensions.
-    pub fn new(line_art: GrayImage, fill: RgbImage, cancel: &dyn Cancellation) -> Result<Self> {
+    /// All layers must have the same, non-zero dimensions. `alpha` is the
+    /// result's straight alpha, and `reference` the original's colours that
+    /// the fill's local colour is restored towards (see [`clean_fill`]).
+    pub fn new(
+        line_art: GrayImage,
+        fill: RgbImage,
+        alpha: GrayImage,
+        reference: &RgbImage,
+        cancel: &dyn Cancellation,
+    ) -> Result<Self> {
         let (w, h) = line_art.dimensions();
-        if w == 0 || h == 0 || fill.dimensions() != (w, h) {
+        if w == 0
+            || h == 0
+            || fill.dimensions() != (w, h)
+            || alpha.dimensions() != (w, h)
+            || reference.dimensions() != (w, h)
+        {
             return Err(Error::InvalidDimensions);
         }
+        Self::preflight((w, h))?;
+        let reference = reference.pixels().map(|pixel| pixel.0).collect::<Vec<_>>();
+        let fill = clean_fill(&fill, &line_art, alpha.as_raw(), &reference, cancel)?;
         let blurred = gaussian_blur(&line_art, cancel)?;
         Ok(Self {
             line_art,
             fill,
+            alpha,
             blurred,
         })
+    }
+
+    /// Whether layers of `dimensions` fit the working-memory limit; callers
+    /// check this before generating them.
+    pub fn preflight((w, h): (u32, u32)) -> Result<()> {
+        if w == 0 || h == 0 {
+            return Err(Error::InvalidDimensions);
+        }
+        let estimate = u64::from(w)
+            .saturating_mul(u64::from(h))
+            .saturating_mul(TARGET_BYTES);
+        if estimate > DEFAULT_MEMORY_LIMIT {
+            return Err(Error::GameAssetMemoryLimit {
+                limit_bytes: DEFAULT_MEMORY_LIMIT,
+            });
+        }
+        Ok(())
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -124,178 +137,12 @@ impl LineArtLayers {
         cancel.check()?;
         sharpen(&self.line_art, &self.blurred, strength.amount(), cancel)
     }
-}
-
-/// The foreground at one target size: its silhouette alpha and its straight
-/// colours, the reference of the colour restoration.
-struct TargetForeground {
-    size: (u32, u32),
-    alpha: Vec<u8>,
-    colours: Vec<[u8; 3]>,
-}
-
-/// One set of layers' fill after cleaning.
-struct CleanedFill {
-    layers: Arc<LineArtLayers>,
-    fill: Arc<RgbImage>,
-}
-
-/// Composes target-sized layers over an extracted foreground's silhouette
-/// alpha. The foreground at the latest target size and the cleaned fill of
-/// the latest layers are cached, so a strength change only re-sharpens and
-/// multiplies; heavy work stays outside the locks and a cancelled request
-/// never populates them.
-pub struct LineArtComposer {
-    foreground: Arc<RgbaImage>,
-    target: Mutex<Option<Arc<TargetForeground>>>,
-    cleaned: Mutex<Option<Arc<CleanedFill>>>,
-}
-
-impl LineArtComposer {
-    /// Check source-only limits, e.g. before an application generates the
-    /// layers for `source`.
-    pub fn preflight(source: &RgbaImage) -> Result<()> {
-        let (w, h) = source.dimensions();
-        if w == 0 || h == 0 {
-            return Err(Error::InvalidDimensions);
-        }
-        check_budget((w, h), (1, 1))
-    }
-
-    /// `foreground` is the extracted, straight-alpha foreground at the source
-    /// size.
-    pub fn new(foreground: Arc<RgbaImage>) -> Result<Self> {
-        Self::preflight(&foreground)?;
-        Ok(Self {
-            foreground,
-            target: Mutex::new(None),
-            cleaned: Mutex::new(None),
-        })
-    }
 
     /// `rgb = round(cleaned fill · sharpened line art / 255)` with the
-    /// foreground's silhouette alpha at the layers' size, in straight alpha.
-    /// The layers must be no larger than the foreground.
-    pub fn compose(
-        &self,
-        layers: &Arc<LineArtLayers>,
-        strength: Strength,
-        cancel: &dyn Cancellation,
-    ) -> Result<RgbaImage> {
-        cancel.check()?;
-        let (w, h) = layers.dimensions();
-        let (sw, sh) = self.foreground.dimensions();
-        if w > sw || h > sh {
-            return Err(Error::InvalidDimensions);
-        }
-        check_budget((sw, sh), (w, h))?;
-        let target = self.target(w, h, cancel)?;
-        let fill = self.cleaned_fill(layers, &target, cancel)?;
-        let line_art = layers.line_art(strength, cancel)?;
-        multiply(&fill, &line_art, &target.alpha, cancel)
-    }
-
-    fn cleaned_fill(
-        &self,
-        layers: &Arc<LineArtLayers>,
-        target: &TargetForeground,
-        cancel: &dyn Cancellation,
-    ) -> Result<Arc<RgbImage>> {
-        if let Some(cached) = self
-            .cleaned
-            .lock()
-            .expect("line-art fill cache poisoned")
-            .as_ref()
-            .filter(|cached| Arc::ptr_eq(&cached.layers, layers))
-        {
-            return Ok(cached.fill.clone());
-        }
-        let fill = Arc::new(clean_fill(
-            &layers.fill,
-            &layers.line_art,
-            &target.alpha,
-            &target.colours,
-            cancel,
-        )?);
-        let mut cache = self.cleaned.lock().expect("line-art fill cache poisoned");
-        cancel.check()?;
-        *cache = Some(Arc::new(CleanedFill {
-            layers: layers.clone(),
-            fill: fill.clone(),
-        }));
-        Ok(fill)
-    }
-
-    fn target(&self, w: u32, h: u32, cancel: &dyn Cancellation) -> Result<Arc<TargetForeground>> {
-        if let Some(cached) = self
-            .target
-            .lock()
-            .expect("line-art target cache poisoned")
-            .as_ref()
-            .filter(|cached| cached.size == (w, h))
-        {
-            return Ok(cached.clone());
-        }
-        let linear = color::LinearImage::from_rgba(&self.foreground);
-        let silhouette = Silhouette::detect(&self.foreground, cancel)?;
-        let reduced = foreground_fill(&linear, silhouette.as_ref(), w, h, cancel)?;
-        let mut alpha = Vec::with_capacity(reduced.pixels.len());
-        let mut colours = Vec::with_capacity(reduced.pixels.len());
-        for (i, pixel) in reduced.pixels.iter().enumerate() {
-            if i.is_multiple_of(4096) {
-                cancel.check()?;
-            }
-            let [r, g, b, a] = color::rgba(*pixel).0;
-            alpha.push(a);
-            colours.push([r, g, b]);
-        }
-        let built = Arc::new(TargetForeground {
-            size: (w, h),
-            alpha,
-            colours,
-        });
-        let mut cache = self.target.lock().expect("line-art target cache poisoned");
-        cancel.check()?;
-        *cache = Some(built.clone());
-        Ok(built)
-    }
-}
-
-fn check_budget((sw, sh): (u32, u32), (w, h): (u32, u32)) -> Result<()> {
-    let estimate = u64::from(sw)
-        .saturating_mul(u64::from(sh))
-        .saturating_mul(SOURCE_BYTES)
-        .saturating_add(
-            u64::from(w)
-                .saturating_mul(u64::from(h))
-                .saturating_mul(TARGET_BYTES),
-        );
-    if estimate > DEFAULT_MEMORY_LIMIT {
-        return Err(Error::GameAssetMemoryLimit {
-            limit_bytes: DEFAULT_MEMORY_LIMIT,
-        });
-    }
-    Ok(())
-}
-
-/// Lanczos3 of the silhouette-isolated foreground in premultiplied linear
-/// light, with alpha from the silhouette's target coverage and the
-/// foreground's intrinsic alpha.
-fn foreground_fill(
-    linear: &color::LinearImage,
-    silhouette: Option<&Silhouette>,
-    w: u32,
-    h: u32,
-    cancel: &dyn Cancellation,
-) -> Result<color::LinearImage> {
-    let isolated = silhouette
-        .map(|silhouette| silhouette.isolated(linear, cancel))
-        .transpose()?;
-    let fill_source = isolated.as_ref().unwrap_or(linear);
-    let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
-    match silhouette {
-        Some(silhouette) => silhouette.target_alpha(base, fill_source, ALPHA_EDGE, cancel),
-        None => Ok(base),
+    /// layers' alpha, in straight alpha.
+    pub fn compose(&self, strength: Strength, cancel: &dyn Cancellation) -> Result<RgbaImage> {
+        let line_art = self.line_art(strength, cancel)?;
+        multiply(&self.fill, &line_art, self.alpha.as_raw(), cancel)
     }
 }
 
@@ -322,22 +169,14 @@ fn fill_background(fill: &RgbImage, alpha: &[u8]) -> [f64; 3] {
     })
 }
 
-/// Clean the fill before it is multiplied:
-///
-/// 1. A fill pixel is valid where the foreground is opaque (alpha ≥
-///    `OPAQUE_ALPHA`) and its colour is at least `BACKGROUND_DISTANCE` from
-///    the fill's own background ([`fill_background`]): FLUX draws the
-///    background where its shapes and the cutout's disagree.
-/// 2. Every invalid pixel takes colour bled from the valid ones by
-///    normalized convolution, `G_σ(fill · valid) / G_σ(valid)`, with the
-///    first σ of `BLEED_SIGMAS` whose valid weight there reaches
-///    `MIN_REACH`; a pixel none reaches keeps its colour.
-/// 3. Its local colour is restored towards `reference`, the foreground's
-///    colours, by the edge-aware correction of [`restoration`], with `w` =
-///    valid pixels whose unsharpened line art stays above
-///    `INK_FREE_THRESHOLD` throughout a 3×3 neighbourhood.
-///
-/// Clamped and rounded once.
+/// Restore the fill's local colour towards `reference`, the original's
+/// colours, before it is multiplied: by the edge-aware correction of
+/// [`restoration`], weighted by the valid, ink-free pixels. A pixel is valid
+/// where `alpha` ≥ `OPAQUE_ALPHA` and its colour is at least
+/// `BACKGROUND_DISTANCE` from the fill's own background
+/// ([`fill_background`]), and ink-free where the unsharpened line art stays
+/// above `INK_FREE_THRESHOLD` throughout a 3×3 neighbourhood. Clamped and
+/// rounded once.
 fn clean_fill(
     fill: &RgbImage,
     line_art: &GrayImage,
@@ -370,36 +209,6 @@ fn clean_fill(
         })
         .collect::<Vec<_>>();
     cancel.check()?;
-
-    // Bleed valid colour outward, widening until every invalid pixel within
-    // reach has colour.
-    let mut filled = valid.iter().map(|&valid| valid == 1.).collect::<Vec<_>>();
-    for sigma in BLEED_SIGMAS {
-        if filled.iter().all(|&filled| filled) {
-            break;
-        }
-        let kernel = cleaning_kernel(sigma);
-        let reach = reflect_blur(&valid, w, h, &kernel, cancel)?;
-        let bled = colours
-            .iter()
-            .map(|colour| {
-                let weighted = colour
-                    .iter()
-                    .zip(&valid)
-                    .map(|(colour, valid)| colour * valid)
-                    .collect::<Vec<_>>();
-                reflect_blur(&weighted, w, h, &kernel, cancel)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for i in 0..w * h {
-            if !filled[i] && reach[i] >= MIN_REACH {
-                for channel in 0..3 {
-                    colours[channel][i] = bled[channel][i] / reach[i];
-                }
-                filled[i] = true;
-            }
-        }
-    }
 
     // Restore the local colour from valid, ink-free samples.
     let lines = line_art.as_raw();
@@ -604,62 +413,6 @@ fn restoration(
     }))
 }
 
-/// A normalized Gaussian of radius `round(CLEANING_TRUNCATE · σ)`.
-fn cleaning_kernel(sigma: f64) -> Vec<f64> {
-    let radius = (CLEANING_TRUNCATE * sigma).round() as i64;
-    let kernel = (-radius..=radius)
-        .map(|offset| (-(offset * offset) as f64 / (2. * sigma * sigma)).exp())
-        .collect::<Vec<_>>();
-    let sum: f64 = kernel.iter().sum();
-    kernel.into_iter().map(|weight| weight / sum).collect()
-}
-
-/// Separable convolution with symmetric reflection at the borders
-/// (`d c b a | a b c d | d c b a`), scipy's "reflect" mode.
-fn reflect_blur(
-    plane: &[f64],
-    w: usize,
-    h: usize,
-    kernel: &[f64],
-    cancel: &dyn Cancellation,
-) -> Result<Vec<f64>> {
-    let radius = (kernel.len() / 2) as i64;
-    let reflect = |index: i64, len: usize| {
-        let period = 2 * len as i64;
-        let index = index.rem_euclid(period);
-        (if index < len as i64 {
-            index
-        } else {
-            period - 1 - index
-        }) as usize
-    };
-    let mut horizontal = vec![0f64; w * h];
-    for y in 0..h {
-        cancel.check()?;
-        for x in 0..w {
-            horizontal[y * w + x] = kernel
-                .iter()
-                .enumerate()
-                .map(|(k, weight)| weight * plane[y * w + reflect(x as i64 + k as i64 - radius, w)])
-                .sum();
-        }
-    }
-    let mut blurred = vec![0f64; w * h];
-    for y in 0..h {
-        cancel.check()?;
-        for x in 0..w {
-            blurred[y * w + x] = kernel
-                .iter()
-                .enumerate()
-                .map(|(k, weight)| {
-                    weight * horizontal[reflect(y as i64 + k as i64 - radius, h) * w + x]
-                })
-                .sum();
-        }
-    }
-    Ok(blurred)
-}
-
 fn gaussian_kernel() -> [f32; 2 * KERNEL_RADIUS + 1] {
     let mut kernel = std::array::from_fn(|i| {
         let offset = i as f32 - KERNEL_RADIUS as f32;
@@ -764,76 +517,59 @@ fn multiply(
 mod tests {
     use super::*;
     use crate::CancellationToken;
-    use image::{Luma, Rgb, Rgba};
+    use image::Luma;
 
-    /// A red square on transparency with one soft alpha row.
-    fn foreground() -> Arc<RgbaImage> {
-        Arc::new(RgbaImage::from_fn(48, 40, |x, y| {
-            if !(8..40).contains(&x) || !(6..34).contains(&y) {
-                Rgba([0; 4])
-            } else if y == 6 {
-                Rgba([200, 90, 60, 128])
+    const SIZE: (u32, u32) = (24, 20);
+
+    /// A soft-edged opaque square: 0 outside, 128 on two borders, 255 inside.
+    fn alpha() -> GrayImage {
+        GrayImage::from_fn(SIZE.0, SIZE.1, |x, y| {
+            Luma([if !(4..20).contains(&x) || !(3..17).contains(&y) {
+                0
+            } else if x == 4 || y == 3 {
+                128
             } else {
-                Rgba([200, 90, 60 + (x as u8 % 7) * 10, 255])
-            }
-        }))
+                255
+            }])
+        })
     }
 
-    /// A fill whose RGB differs from the foreground's, so the result's RGB
-    /// can only come from the fill and its alpha only from the foreground.
-    fn fill(w: u32, h: u32) -> RgbImage {
-        RgbImage::from_fn(w, h, |x, y| {
+    /// A fill whose RGB differs from the reference's.
+    fn fill() -> RgbImage {
+        RgbImage::from_fn(SIZE.0, SIZE.1, |x, y| {
             Rgb([(x * 9) as u8, (y * 11 + 3) as u8, 255 - (x + y) as u8])
         })
     }
 
-    fn layers(line_art: GrayImage) -> Arc<LineArtLayers> {
-        let (w, h) = line_art.dimensions();
-        Arc::new(LineArtLayers::new(line_art, fill(w, h), &|| false).unwrap())
+    fn reference() -> RgbImage {
+        RgbImage::from_fn(SIZE.0, SIZE.1, |x, _| {
+            Rgb([200, 90, 60 + (x as u8 % 7) * 10])
+        })
     }
 
-    fn flat(value: u8) -> Arc<LineArtLayers> {
-        layers(GrayImage::from_pixel(24, 20, Luma([value])))
+    fn layers(line_art: GrayImage) -> LineArtLayers {
+        LineArtLayers::new(line_art, fill(), alpha(), &reference(), &|| false).unwrap()
     }
 
-    fn composer() -> LineArtComposer {
-        LineArtComposer::new(foreground()).unwrap()
-    }
-
-    /// The foreground's alpha and colours at `w`×`h`, computed independently.
-    fn expected_target(w: u32, h: u32) -> (Vec<u8>, Vec<[u8; 3]>) {
+    /// Sharpen line art of any size as the layers do.
+    fn sharpened(line_art: &GrayImage, strength: Strength) -> GrayImage {
         let cancel = CancellationToken::default();
-        let foreground = foreground();
-        let linear = color::LinearImage::from_rgba(&foreground);
-        let silhouette = Silhouette::detect(&foreground, &cancel).unwrap();
-        let reduced = foreground_fill(&linear, silhouette.as_ref(), w, h, &cancel).unwrap();
-        reduced
-            .pixels
-            .iter()
-            .map(|pixel| {
-                let [r, g, b, a] = color::rgba(*pixel).0;
-                (a, [r, g, b])
-            })
-            .unzip()
+        let blurred = gaussian_blur(line_art, &cancel).unwrap();
+        sharpen(line_art, &blurred, strength.amount(), &cancel).unwrap()
     }
 
-    fn expected_alpha(w: u32, h: u32) -> Vec<u8> {
-        expected_target(w, h).0
+    fn flat(value: u8) -> GrayImage {
+        GrayImage::from_pixel(SIZE.0, SIZE.1, Luma([value]))
     }
 
     /// The fill as it is multiplied under `line_art`: cleaned against the
-    /// expected foreground.
+    /// reference.
     fn expected_fill(line_art: &GrayImage) -> RgbImage {
-        let (w, h) = line_art.dimensions();
-        let (alpha, colours) = expected_target(w, h);
-        clean_fill(
-            &fill(w, h),
-            line_art,
-            &alpha,
-            &colours,
-            &CancellationToken::default(),
-        )
-        .unwrap()
+        let reference = reference()
+            .pixels()
+            .map(|pixel| pixel.0)
+            .collect::<Vec<_>>();
+        clean(&fill(), line_art, alpha().as_raw(), &reference)
     }
 
     fn clean(
@@ -867,7 +603,7 @@ mod tests {
         // 0.300478 (±1..3), 0.058438 (±2..3) and 0.004433 (±3). A 64|192
         // step at amount 1.5 moves each side by 1.5 · 128 · tail.
         let step = GrayImage::from_fn(12, 3, |x, _| Luma([if x < 6 { 64 } else { 192 }]));
-        let sharpened = layers(step).line_art(Strength::new(40), &|| false).unwrap();
+        let sharpened = sharpened(&step, Strength::new(40));
         for y in 0..3 {
             let row: Vec<u8> = (0..12).map(|x| sharpened.get_pixel(x, y)[0]).collect();
             assert_eq!(
@@ -882,57 +618,51 @@ mod tests {
     fn unsharp_mask_leaves_a_flat_image_unchanged() {
         for value in [0, 1, 128, 254, 255] {
             let flat = GrayImage::from_pixel(9, 7, Luma([value]));
-            assert_eq!(
-                layers(flat.clone())
-                    .line_art(Strength::new(100), &|| false)
-                    .unwrap(),
-                flat
-            );
+            assert_eq!(sharpened(&flat, Strength::new(100)), flat);
         }
     }
 
     #[test]
-    fn white_line_art_leaves_the_fill_rgb_with_the_foreground_alpha() {
-        let output = composer()
-            .compose(&flat(255), Strength::new(100), &|| false)
+    fn white_line_art_leaves_the_cleaned_fill_with_the_given_alpha() {
+        let output = layers(flat(255))
+            .compose(Strength::new(100), &|| false)
             .unwrap();
-        let alpha = expected_alpha(24, 20);
-        assert!(alpha.iter().any(|alpha| (1..255).contains(alpha)));
-        assert!(alpha.contains(&0) && alpha.contains(&255));
+        let alpha = alpha();
+        assert!(alpha.pixels().any(|alpha| (1..255).contains(&alpha[0])));
         for ((output, fill), alpha) in output
             .pixels()
-            .zip(expected_fill(&GrayImage::from_pixel(24, 20, Luma([255]))).pixels())
-            .zip(alpha)
+            .zip(expected_fill(&flat(255)).pixels())
+            .zip(alpha.pixels())
         {
-            assert_eq!(output.0, [fill[0], fill[1], fill[2], alpha]);
+            assert_eq!(output.0, [fill[0], fill[1], fill[2], alpha[0]]);
         }
+        // Valid, ink-free pixels were restored towards the reference.
+        assert_ne!(expected_fill(&flat(255)), fill());
     }
 
     #[test]
-    fn black_line_art_is_black_with_the_foreground_alpha() {
-        let output = composer()
-            .compose(&flat(0), Strength::default(), &|| false)
+    fn black_line_art_is_black_with_the_given_alpha() {
+        let output = layers(flat(0))
+            .compose(Strength::default(), &|| false)
             .unwrap();
-        for (output, alpha) in output.pixels().zip(expected_alpha(24, 20)) {
-            assert_eq!(output.0, [0, 0, 0, alpha]);
+        for (output, alpha) in output.pixels().zip(alpha().pixels()) {
+            assert_eq!(output.0, [0, 0, 0, alpha[0]]);
         }
     }
 
     #[test]
     fn mid_gray_multiplies_each_channel_exactly() {
-        let output = composer()
-            .compose(&flat(128), Strength::new(0), &|| false)
+        let output = layers(flat(128))
+            .compose(Strength::new(0), &|| false)
             .unwrap();
-        for ((output, fill), alpha) in output
-            .pixels()
-            .zip(expected_fill(&GrayImage::from_pixel(24, 20, Luma([128]))).pixels())
-            .zip(expected_alpha(24, 20))
-        {
+        // Mid-gray line art counts as ink everywhere, so nothing is restored.
+        assert_eq!(expected_fill(&flat(128)), fill());
+        for ((output, fill), alpha) in output.pixels().zip(fill().pixels()).zip(alpha().pixels()) {
             for channel in 0..3 {
                 let expected = (f64::from(fill[channel]) * 128. / 255.).round() as u8;
                 assert_eq!(output[channel], expected);
             }
-            assert_eq!(output[3], alpha);
+            assert_eq!(output[3], alpha[0]);
         }
         assert_eq!(
             multiply(
@@ -949,19 +679,16 @@ mod tests {
     }
 
     #[test]
-    fn the_sharpened_line_art_is_multiplied_without_resampling() {
-        let line_art = GrayImage::from_fn(24, 20, |x, y| {
+    fn the_sharpened_line_art_multiplies_the_cleaned_fill_at_every_strength() {
+        let line_art = GrayImage::from_fn(SIZE.0, SIZE.1, |x, y| {
             Luma([if x == 9 || y == 13 { 0 } else { 230 }])
         });
         let layers = layers(line_art.clone());
-        let composer = composer();
+        let fill = expected_fill(&line_art);
         for strength in [0, 40, 100].map(Strength::new) {
             let sharpened = layers.line_art(strength, &|| false).unwrap();
-            let output = composer.compose(&layers, strength, &|| false).unwrap();
-            for ((output, fill), line) in output
-                .pixels()
-                .zip(expected_fill(&line_art).pixels())
-                .zip(sharpened.pixels())
+            let output = layers.compose(strength, &|| false).unwrap();
+            for ((output, fill), line) in output.pixels().zip(fill.pixels()).zip(sharpened.pixels())
             {
                 for channel in 0..3 {
                     let expected =
@@ -979,76 +706,38 @@ mod tests {
     #[test]
     fn dimensions_are_validated() {
         let cancel = CancellationToken::default();
-        assert!(matches!(
-            LineArtLayers::new(GrayImage::new(24, 20), RgbImage::new(24, 19), &cancel),
-            Err(Error::InvalidDimensions)
-        ));
-        assert!(matches!(
-            LineArtLayers::new(GrayImage::new(0, 0), RgbImage::new(0, 0), &cancel),
-            Err(Error::InvalidDimensions)
-        ));
-        assert!(matches!(
-            LineArtComposer::new(Arc::new(RgbaImage::new(0, 0))),
-            Err(Error::InvalidDimensions)
-        ));
-        let composer = composer();
-        for (w, h) in [(49, 40), (48, 41)] {
+        let (w, h) = SIZE;
+        for (line_art, fill, alpha, reference) in [
+            ((w, h), (w, h - 1), (w, h), (w, h)),
+            ((w, h), (w, h), (w - 1, h), (w, h)),
+            ((w, h), (w, h), (w, h), (w, h + 1)),
+            ((0, 0), (0, 0), (0, 0), (0, 0)),
+        ] {
             assert!(matches!(
-                composer.compose(&layers(GrayImage::new(w, h)), Strength::default(), &cancel),
+                LineArtLayers::new(
+                    GrayImage::new(line_art.0, line_art.1),
+                    RgbImage::new(fill.0, fill.1),
+                    GrayImage::new(alpha.0, alpha.1),
+                    &RgbImage::new(reference.0, reference.1),
+                    &cancel,
+                ),
                 Err(Error::InvalidDimensions)
             ));
         }
-        // The foreground's own size is a valid target.
-        composer
-            .compose(
-                &layers(GrayImage::new(48, 40)),
-                Strength::default(),
-                &cancel,
-            )
-            .unwrap();
     }
 
     #[test]
-    fn cancellation_at_any_check_never_caches_cancelled_work() {
-        let layers = flat(90);
-        let expected = composer()
-            .compose(&layers, Strength::default(), &|| false)
-            .unwrap();
-        let mut cancelled_runs = 0;
-        for allowed_checks in 0.. {
-            let composer = composer();
-            let checks = std::sync::atomic::AtomicUsize::new(0);
-            let cancel =
-                || checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= allowed_checks;
-            match composer.compose(&layers, Strength::default(), &cancel) {
-                Ok(output) => {
-                    assert_eq!(output, expected);
-                    break;
-                }
-                Err(Error::Cancelled) => cancelled_runs += 1,
-                Err(error) => panic!("unexpected error: {error}"),
-            }
-            // Only work that completed before cancellation may be cached.
-            if let Some(target) = composer.target.lock().unwrap().as_ref() {
-                assert_eq!(
-                    (&target.alpha, &target.colours),
-                    (&expected_alpha(24, 20), &expected_target(24, 20).1)
-                );
-            }
-            if let Some(cleaned) = composer.cleaned.lock().unwrap().as_ref() {
-                assert_eq!(
-                    *cleaned.fill,
-                    expected_fill(&GrayImage::from_pixel(24, 20, Luma([90])))
-                );
-            }
-            assert_eq!(
-                composer
-                    .compose(&layers, Strength::default(), &|| false)
-                    .unwrap(),
-                expected
-            );
-        }
-        assert!(cancelled_runs > 10, "cancellation was checked throughout");
+    fn cancellation_stops_the_cleaning_and_the_composition() {
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            LineArtLayers::new(flat(255), fill(), alpha(), &reference(), &cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            layers(flat(255)).compose(Strength::default(), &cancelled),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]
@@ -1063,88 +752,6 @@ mod tests {
         assert_eq!(fill_background(&fill, &[0, 255, 255, 0, 0]), [90., 7., 30.]);
         // Without transparency the background is taken to be white.
         assert_eq!(fill_background(&fill, &[255; 5]), [255.; 3]);
-    }
-
-    /// A 24×24 sprite: an opaque red disc with a soft edge, on a fill whose
-    /// background is light blue-grey; the line art is all ink, so only the
-    /// bleeding changes the fill.
-    fn disc() -> (RgbImage, Vec<u8>) {
-        let (w, h) = (24_u32, 24_u32);
-        let distance = |x: u32, y: u32| (f64::from(x) - 11.5).hypot(f64::from(y) - 11.5);
-        let alpha = (0..w * h)
-            .map(|i| match distance(i % w, i / w) {
-                d if d < 6. => 255,
-                d if d < 8. => 120,
-                _ => 0,
-            })
-            .collect::<Vec<u8>>();
-        let fill = RgbImage::from_fn(w, h, |x, y| {
-            if distance(x, y) < 5. {
-                Rgb([200, 40, 30])
-            } else {
-                Rgb([124, 133, 145])
-            }
-        });
-        (fill, alpha)
-    }
-
-    #[test]
-    fn background_showing_through_takes_the_interior_colour() {
-        let (fill, alpha) = disc();
-        let ink = GrayImage::from_pixel(24, 24, Luma([0]));
-        let cleaned = clean(&fill, &ink, &alpha, &[[0; 3]; 24 * 24]);
-        for (i, (before, after)) in fill.pixels().zip(cleaned.pixels()).enumerate() {
-            let (x, y) = (i as u32 % 24, i as u32 / 24);
-            let distance = (f64::from(x) - 11.5).hypot(f64::from(y) - 11.5);
-            if distance < 5. {
-                assert_eq!(before, after, "valid pixel ({x}, {y}) changed");
-            } else if distance < 8. {
-                // Opaque but background-coloured (5 ≤ d < 6) and soft edge
-                // pixels both take the interior colour.
-                assert_eq!(after.0, [200, 40, 30], "({x}, {y}) alpha {}", alpha[i]);
-            }
-        }
-        // An opaque pixel that shows the background is invalid.
-        let ring = (0..24 * 24)
-            .find(|&i| {
-                let (x, y) = (i % 24, i / 24);
-                let d = (f64::from(x) - 11.5).hypot(f64::from(y) - 11.5);
-                (5. ..6.).contains(&d)
-            })
-            .unwrap();
-        assert_eq!(alpha[ring as usize], 255);
-        assert_eq!(fill.as_raw()[ring as usize * 3..][..3], [124, 133, 145]);
-    }
-
-    #[test]
-    fn a_thin_shape_without_valid_pixels_takes_colour_from_a_wider_radius() {
-        // A one-pixel line (a bow string) that is only soft-edged, 24 pixels
-        // from an opaque block: σ 1.5 and 4.5 (truncated at 6 and 18 pixels)
-        // do not reach it, 13.5 does.
-        let (w, h) = (40_u32, 12_u32);
-        let alpha = (0..w * h)
-            .map(|i| match i % w {
-                0..=5 => 255,
-                30 => 160,
-                _ => 0,
-            })
-            .collect::<Vec<u8>>();
-        let fill = RgbImage::from_fn(w, h, |x, _| {
-            if x <= 5 {
-                Rgb([90, 60, 20])
-            } else {
-                Rgb([255, 255, 255])
-            }
-        });
-        let ink = GrayImage::from_pixel(w, h, Luma([0]));
-        let cleaned = clean(&fill, &ink, &alpha, &vec![[0; 3]; (w * h) as usize]);
-        for y in 0..h {
-            assert_eq!(cleaned.get_pixel(30, y).0, [90, 60, 20], "row {y}");
-            assert_eq!(cleaned.get_pixel(3, y).0, [90, 60, 20]);
-        }
-        // Without any valid pixel, nothing reaches and the fill is kept.
-        let cleaned = clean(&fill, &ink, &[0; 480], &[[0; 3]; 480]);
-        assert_eq!(cleaned, fill);
     }
 
     #[test]
@@ -1404,53 +1011,5 @@ mod tests {
             ),
             Err(Error::InvalidDimensions)
         ));
-    }
-
-    #[test]
-    fn strength_change_reuses_the_cached_alpha_and_cleaned_fill() {
-        let composer = composer();
-        let layers = layers(GrayImage::from_fn(24, 20, |x, y| {
-            Luma([if (x + y) % 9 < 2 { 30 } else { 240 }])
-        }));
-        let cancel = CancellationToken::default();
-        composer
-            .compose(&layers, Strength::new(40), &cancel)
-            .unwrap();
-        let target = composer.target.lock().unwrap().clone().unwrap();
-        let cleaned = composer.cleaned.lock().unwrap().clone().unwrap();
-        let strong = composer
-            .compose(&layers, Strength::new(100), &cancel)
-            .unwrap();
-        composer
-            .compose(&layers, Strength::new(0), &cancel)
-            .unwrap();
-        assert!(Arc::ptr_eq(
-            composer.target.lock().unwrap().as_ref().unwrap(),
-            &target
-        ));
-        assert!(Arc::ptr_eq(
-            composer.cleaned.lock().unwrap().as_ref().unwrap(),
-            &cleaned
-        ));
-        let fresh = LineArtComposer::new(foreground())
-            .unwrap()
-            .compose(&layers, Strength::new(100), &cancel)
-            .unwrap();
-        assert_eq!(strong, fresh);
-
-        // Another size replaces the single alpha entry.
-        composer
-            .compose(
-                &Arc::new(
-                    LineArtLayers::new(GrayImage::new(12, 10), fill(12, 10), &cancel).unwrap(),
-                ),
-                Strength::new(100),
-                &cancel,
-            )
-            .unwrap();
-        assert_eq!(
-            composer.target.lock().unwrap().as_ref().unwrap().size,
-            (12, 10)
-        );
     }
 }

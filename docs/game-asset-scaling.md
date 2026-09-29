@@ -16,47 +16,44 @@ size returns the source unchanged.
    selected. See [local line-art
    generation](../README.md#local-line-art-generation) for setup, limits and
    caching.
-2. **Center crop and reduction.** Both images are cropped to the scaled
-   target at the same offset, `floor((generated − scaled) / 2)` per axis. A
-   target of 512 pixels per side or more is then complete and never
-   resampled; a smaller one is reduced to the target, the line art with
-   bicubic (Catmull-Rom) and the fill with Lanczos3.
-3. **Alpha.** BiRefNet removes the background. The extracted foreground is
-   reduced with Lanczos3 in premultiplied linear light; the result's alpha is
-   the foreground's silhouette coverage at the target size times its
-   intrinsic alpha, with a fixed 50% edge softness. Explicit source alpha
-   remains authoritative. The reduction's colour is not used.
-4. **Edge clean-up.** Where FLUX's shapes and the cutout disagree, the fill
-   shows its own background inside the silhouette, which would show as a
-   halo. The fill's background colour is the per-channel median of the fill
-   where alpha is 0 (white if there is none). A fill pixel is valid where
-   alpha ≥ 250 and its colour is at least 40 (Euclidean, 8-bit RGB) from that
-   background. Every other pixel takes colour bled from valid pixels by
-   normalized convolution, per channel `G_σ(fill · valid) / G_σ(valid)`,
-   with the first σ of 1.5, 4.5 and 13.5 target pixels whose `G_σ(valid)` is
-   at least 10⁻³ there; a pixel none reaches keeps its colour. Valid pixels
-   are unchanged.
+2. **Cutout.** BiRefNet cuts the generated fill out at the generation size,
+   so the alpha follows the shapes FLUX drew rather than the source's. The
+   source itself is never cut out. The mask is cached with the generated
+   pair; all three must be cached for a hit, and a cached pair whose mask is
+   missing only runs BiRefNet again. Targets that share a generation size
+   and reference share the mask.
+3. **Center crop and reduction.** The line art, the fill, the mask and the
+   white-composited source at the generation size (the reference) are
+   cropped to the scaled target at the same offset,
+   `floor((generated − scaled) / 2)` per axis. A target of 512 pixels per
+   side or more is then complete and never resampled; a smaller one is
+   reduced to the target, the line art with bicubic (Catmull-Rom) and the
+   others with Lanczos3.
+4. **Alpha.** The result's alpha is the reduced mask. If the source has any
+   alpha below 255, its alpha is resized, cropped and reduced the same way,
+   and caps the mask: `alpha = min(mask, source alpha)`.
 5. **Colour restoration.** The de-inked fill drifts brighter and more
-   saturated than the original, so it is pulled back to the reduced
-   foreground's straight colours from step 3 by an edge-aware (joint
-   bilateral) correction. The weight `w` is 1 on valid pixels whose
-   unsharpened line art stays above 200 throughout a 3×3 neighbourhood (away
-   from ink). For each pixel p, over the neighbours q within 3σ:
+   saturated than the original, so it is pulled back to the reference from
+   step 3 by an edge-aware (joint bilateral) correction. The fill's
+   background colour is the per-channel median of the fill where alpha is 0
+   (white if there is none), and a fill pixel is valid where alpha ≥ 250 and
+   its colour is at least 40 (Euclidean, 8-bit RGB) from that background.
+   The weight `w` is 1 on valid pixels whose unsharpened line art stays above
+   200 throughout a 3×3 neighbourhood (away from ink), else 0. For each
+   pixel p, over the neighbours q within 3σ:
    `k(p, q) = exp(−|q − p|² / 2σ²) · w(q) · exp(−‖fill(q) − fill(p)‖² / 2·25²)`,
-   the correction is `Σ k · (foreground(q) − fill(q)) / Σ k`, and it is
+   the correction is `Σ k · (reference(q) − fill(q)) / Σ k`, and it is
    scaled by `clamp(Σ k / (0.15 · Σ exp(−|q − p|² / 2σ²)), 0, 1)` over the
    full spatial window. So a pixel only takes the correction of similar
    colours around it, and a thin feature without similar samples, such as a
    strap across a tunic, is not tinted by its surroundings. The correction is
    measured on a working grid whose shorter side is at most 128 pixels (the
    target itself if smaller), with σ = 3 · (shorter grid side) / 128, at
-   least 1: the fill, foreground and weight are reduced to it with Lanczos,
-   and the correction is interpolated back bilinearly and added. The result
-   is clamped and rounded once.
-
-   Both steps mirror the image at its borders; the bleeding Gaussians are
-   truncated at 4σ (scipy's `gaussian_filter` default). They do not depend
-   on Strength and are cached with the layers.
+   least 1: the fill, reference and weight are reduced to it with Lanczos,
+   and the correction is interpolated back bilinearly and added to every
+   pixel. The image is mirrored at its borders. The result is clamped and
+   rounded once. The restoration does not depend on Strength and is cached
+   with the layers.
 6. **Unsharp mask.** The line art is sharpened like GIMP's Unsharp Mask with
    radius 1 and threshold 0:
    `clamp(x + amount · (x − blur(x)), 0, 255)`, rounded once, where `blur` is
@@ -66,12 +63,11 @@ size returns the source unchanged.
 7. **Multiply.** The sharpened line art multiplies the cleaned fill's
    encoded 8-bit sRGB channels like GIMP's Multiply mode:
    `rgb = round(fill_rgb · line / 255)`. The result is straight alpha with the
-   alpha from step 3, so the line art and fill never extend the silhouette.
+   alpha from step 4, so the line art and fill never extend the silhouette.
 
-The shared implementation is `asset_scaler::LineArtLayers`, which holds the
-target-sized line art, fill and the line art's blur, and
-`asset_scaler::LineArtComposer`, which caches the alpha and colours of the
-latest target size and the cleaned fill of the latest layers. Diorama keeps the layers of the latest target and the foreground per
+The shared implementation is `asset_scaler::LineArtLayers`, which takes the
+four target-sized layers, restores the fill once and keeps it with the alpha
+and the line art's blur. Diorama keeps the layers of the latest target per
 source, so a Strength change only re-sharpens and multiplies; another size
 generates again or reads the disk cache. Cancelled work never enters a cache.
 
@@ -93,11 +89,13 @@ first encoded on the CPU by a one-shot process of its own, so its memory is
 returned before generation.
 
 While a preview generates, a progress bar next to the spinner shows the
-fraction done and the estimated time left. The worker reports its load, its
-readiness and each image's denoising step. Before the first step, the
-estimate is fitted to measurements (`2.054 + 7.784·MP + 6.625·MP²` seconds per
-image, MP the generation megapixels), plus the worker's start-up and load
-unless it is loaded, a warm-up for a size it has not generated yet, and the
-prompt encoding if needed, scaled by a calibration factor that smooths
-measured ÷ predicted run times of this computer. After the first image's step
-it scales the model by the measured time.
+stage ("Generating line art…", then "Cutting out…"), the fraction done and
+the estimated time left. The worker reports its load, its readiness and each
+image's denoising step. Before the first step, the estimate is fitted to
+measurements (`2.054 + 7.784·MP + 6.625·MP²` seconds per image, MP the
+generation megapixels), plus the worker's start-up and load unless it is
+loaded, a warm-up for a size it has not generated yet, the prompt encoding if
+needed, and 2 s for the cutout, scaled by a calibration factor that smooths
+measured ÷ predicted run times of this computer, the cutout included. After
+the first image's step it scales the model by the measured time. A cached
+pair whose cutout is missing shows only the cutout stage.

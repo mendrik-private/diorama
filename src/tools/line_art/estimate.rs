@@ -17,7 +17,8 @@
 //! library imports) and the model load; a cold 512² job took 17.35 s in all
 //! against 17.1 s predicted. Prompts without cached embeddings are encoded
 //! before, in a process of its own: start-up, loading the text encoder on
-//! the CPU, and each prompt.
+//! the CPU, and each prompt. After the job, BiRefNet cuts the generated
+//! fill out.
 //!
 //! Machines differ, so the estimate is scaled by a persisted calibration
 //! factor: the smoothed ratio of measured to predicted run times.
@@ -38,6 +39,9 @@ pub(super) const WARMUP_SECONDS: f64 = 1.5;
 /// Loading the truncated text encoder on the CPU, and encoding one prompt.
 pub(super) const ENCODER_LOAD_SECONDS: f64 = 5.;
 pub(super) const ENCODE_SECONDS_PER_PROMPT: f64 = 1.;
+/// BiRefNet cutting out the generated fill, including its process start-up
+/// and model load.
+pub(super) const CUTOUT_SECONDS: f64 = 2.;
 
 const CALIBRATION_FILE: &str = "timing-calibration";
 const CALIBRATION_SCHEMA: &str = "diorama-line-art-timing-v1";
@@ -68,7 +72,8 @@ pub(super) fn cold_start_seconds() -> f64 {
     STARTUP_SECONDS + LOAD_SECONDS
 }
 
-/// Uncalibrated duration of a job generating both images at `size`, of
+/// Uncalibrated duration of a generation at `size`, both images and the
+/// fill's cutout, of
 /// which `prompts_to_encode` prompts have no cached embeddings, with the
 /// resident worker ready after `start_up` seconds (0 when it is warm,
 /// [`cold_start_seconds`] when it must be started). `warm_up` is whether the
@@ -89,7 +94,8 @@ pub(super) fn estimate(
         encoding
             + start_up.max(0.)
             + if warm_up { WARMUP_SECONDS } else { 0. }
-            + f64::from(IMAGES) * image_seconds(size),
+            + f64::from(IMAGES) * image_seconds(size)
+            + CUTOUT_SECONDS,
     )
 }
 
@@ -173,9 +179,9 @@ mod tests {
     }
 
     #[test]
-    fn a_job_adds_warm_up_start_up_and_an_optional_encoding_process() {
+    fn a_generation_adds_warm_up_start_up_the_cutout_and_an_optional_encoding_process() {
         for size in [(512, 512), (512, 2048), (1024, 1024)] {
-            let warm = WARMUP_SECONDS + 2. * image_seconds(size);
+            let warm = WARMUP_SECONDS + 2. * image_seconds(size) + CUTOUT_SECONDS;
             assert!((estimate(size, 0, 0., true).as_secs_f64() - warm).abs() < 1e-6);
             let cold = estimate(size, 0, cold_start_seconds(), true).as_secs_f64();
             assert!((cold - warm - STARTUP_SECONDS - LOAD_SECONDS).abs() < 1e-6);
@@ -197,16 +203,19 @@ mod tests {
         }
         // A worker that generated at this size already skips the warm-up.
         assert!(
-            (estimate((512, 512), 0, 0., false).as_secs_f64() - 2. * image_seconds((512, 512)))
+            (estimate((512, 512), 0, 0., false).as_secs_f64()
+                - 2. * image_seconds((512, 512))
+                - CUTOUT_SECONDS)
                 .abs()
                 < 1e-6
         );
         // 512²: a cold job measured 17.35 s, one at the same size in a
-        // warm worker 9.05 s.
-        assert!(
-            (estimate((512, 512), 0, cold_start_seconds(), true).as_secs_f64() - 17.1).abs() < 0.05
-        );
-        assert!((estimate((512, 512), 0, 0., false).as_secs_f64() - 9.1).abs() < 0.05);
+        // warm worker 9.05 s; the cutout comes after the job.
+        let job = |start_up, warm_up| {
+            estimate((512, 512), 0, start_up, warm_up).as_secs_f64() - CUTOUT_SECONDS
+        };
+        assert!((job(cold_start_seconds(), true) - 17.1).abs() < 0.05);
+        assert!((job(0., false) - 9.1).abs() < 0.05);
     }
 
     #[test]

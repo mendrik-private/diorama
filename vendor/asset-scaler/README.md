@@ -12,13 +12,13 @@ included.
 
 The original project license remains [GPL-3.0-only](LICENSE).
 
-`LineArtComposer` composes application-supplied, target-sized layers. It
-first cleans the fill: pixels outside the opaque silhouette or showing the
-fill's own background take colour bled from the valid pixels around, and the
-fill's local colour is restored towards the extracted foreground's, away from
-ink. Line art sharpened with an unsharp mask (radius 1, amount 0.5–3.0 from
-`Strength` 0–100) is then multiplied over the fill in 8-bit sRGB, without
-resampling either layer. Alpha is the foreground's silhouette alpha at the
-target size. Diorama's Game Asset mode uses it; see Diorama's
+`LineArtLayers` composes application-supplied, target-sized layers: line
+art, a fill, the result's alpha and the original's colours as a reference.
+It first restores the fill's local colour towards the reference by an
+edge-aware correction measured away from ink and outside the fill's own
+background. Line art sharpened with an unsharp mask (radius 1, amount
+0.5–3.0 from `Strength` 0–100) is then multiplied over the fill in 8-bit
+sRGB, without resampling any layer, and the alpha is attached unchanged.
+Diorama's Game Asset mode uses it; see Diorama's
 `docs/game-asset-scaling.md`. `Session` and the `resize*` functions keep the
 traced-contour reduction.

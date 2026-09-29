@@ -135,8 +135,8 @@ window responsive while larger edits render.
   at the output size, or at 512 pixels on the shorter side and then reduced,
   sharpens the line art with an unsharp mask whose **Strength** (0–100,
   default 40) sets its amount, multiplies it over the fill, and takes the
-  outline's transparency from a BiRefNet cutout. A progress bar estimates the remaining
-  generation time. See [Game Asset
+  transparency from a BiRefNet cutout of the generated fill. A progress bar
+  estimates the remaining generation time. See [Game Asset
   scaling](docs/game-asset-scaling.md).
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
@@ -378,16 +378,16 @@ aspect ratio up to 8:1 and a generation of at most 1024 × 1024 pixels; a
 narrow target whose 512-pixel scaling would exceed that is generated at a
 smaller scale.
 
-Two corrections clean the fill before the line art is multiplied over it.
-Where FLUX's shapes and the cutout disagree, the fill shows its own
-background (for example white or light grey) inside the silhouette, and it
-would show as a light halo; such pixels, and the cutout's soft edge, take
-colour bled from the neighbouring subject pixels, from further away where
-needed, as for a thin bow. The de-inked fill also tends to come out brighter
-and more saturated than the original, so its local colour is then pulled back
-to the original's, comparing only subject pixels away from the line art. The
-correction is edge-aware: a pixel only takes the correction measured on
-similar colours around it, and less of it where there are few, so a thin
+BiRefNet then cuts the generated fill out at the generation size, and the
+mask is cropped and reduced like the fill, so the result's transparency
+follows the shapes FLUX drew and no background of the fill shows as a halo
+around them. The source is not cut out; if it has transparency of its own,
+that caps the mask. The mask is cached with the generated pair (about 2 s
+when it has to be computed again). The de-inked fill tends to come out
+brighter and more saturated than the original, so its local colour is pulled
+back to the original's, comparing only subject pixels away from the line
+art. The correction is edge-aware: a pixel only takes the correction measured
+on similar colours around it, and less of it where there are few, so a thin
 strap or belt next to a tunic keeps its own colour.
 
 Each prompt is encoded once, and its embeddings are cached next to the model.
@@ -422,17 +422,20 @@ takes longer when the 5.9 GB GGUF is not in the page cache):
 |---|---|---|---|
 | Seconds per image | 4.5 | 9.0 | ~17.5 |
 
-While a preview generates, a progress bar shows the estimated time left. The
-estimate starts from these measurements and whether the worker is loaded,
-scaled by how long earlier runs took on this computer, and follows the model's
-progress once it runs. Changing the size cancels the running generation.
+While a preview generates, a progress bar shows the stage and the estimated
+time left. The estimate starts from these measurements, whether the worker is
+loaded, and about 2 s for the cutout, scaled by how long earlier runs took on
+this computer, and follows the model's progress once it runs. Changing the
+size cancels the running generation.
 
-Accepted pairs are cached in `$XDG_CACHE_HOME/diorama/line-art`, keyed by the
+Accepted pairs and their cutouts are cached in
+`$XDG_CACHE_HOME/diorama/line-art`, keyed by the
 generation size, the reference pixels, the pipeline revision and GGUF hash, the
 prompts, seeds and generation settings, and the worker, so a repeated size
 skips inference, and targets under 512 pixels of the same aspect share one
-generation; the 64 most recently used pairs are kept (about 330 KB per pair at
-512²). A Strength change reuses the pair. Diorama rejects solid line art and
+generation and one cutout; the 64 most recently used pairs are kept (about
+400 KB per pair and cutout at 512²). A Strength change reuses the pair and the
+cutout. Diorama rejects solid line art and
 line art that does not line up with the reference's colour edges; sparse or
 empty line art is accepted, so a flat source scales with the fill only.
 Rejected, failed, and cancelled runs are never cached.

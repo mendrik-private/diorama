@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.25" date="2026-09-29">
+      <description>
+        <p>Game Asset scaling now cuts out the generated fill instead of the original image, so the sprite edge follows the drawn outline and no background halo remains.</p>
+      </description>
+    </release>
     <release version="0.3.24" date="2026-09-29">
       <description>
         <p>Game Asset sprites no longer show a halo from the model's background, and their colours are restored locally towards the original without tinting thin details such as straps and belts.</p>

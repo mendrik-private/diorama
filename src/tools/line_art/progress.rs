@@ -9,12 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::estimate::{self, Calibration, IMAGES, LOAD_SECONDS, WARMUP_SECONDS};
+use super::estimate::{self, CUTOUT_SECONDS, Calibration, IMAGES, LOAD_SECONDS, WARMUP_SECONDS};
 
 /// Reference encoding and decoding of one image, relative to its denoising
 /// steps: about 2.4% for the 9B model at 512².
 const IMAGE_OVERHEAD_SHARE: f64 = 0.03;
-/// The bar stays short of complete until the worker reports completion.
+/// The bar stays short of complete until the generation finishes.
 const MAX_RUNNING_FRACTION: f64 = 0.99;
 /// Bounds of the correction the first measured step applies to the model.
 const FIRST_STEP_RATIO: (f64, f64) = (0.25, 4.);
@@ -24,8 +24,18 @@ const FIRST_STEP_RATIO: (f64, f64) = (0.25, 4.);
 pub struct Progress {
     /// 0–1, never decreasing within one run.
     pub fraction: f64,
-    /// Estimated time until the worker finishes.
+    /// Estimated time until the generation finishes.
     pub remaining: Duration,
+    pub stage: Stage,
+}
+
+/// What a running generation is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// FLUX generates the line art and the fill.
+    Generating,
+    /// BiRefNet cuts the generated fill out.
+    CuttingOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +276,7 @@ pub(super) struct Tracker {
     step_seconds: Option<f64>,
     prompts_encoded: u32,
     fraction: f64,
+    stage: Stage,
     done: bool,
 }
 
@@ -297,6 +308,7 @@ impl Tracker {
             step_seconds: None,
             prompts_encoded: prompts_to_encode,
             fraction: 0.,
+            stage: Stage::Generating,
             done: false,
         }
     }
@@ -312,10 +324,17 @@ impl Tracker {
         self.predicted
     }
 
-    /// Calibrated seconds from the worker being ready to the end of the job.
+    /// Calibrated seconds from the worker being ready to the end of the
+    /// generation: the job, then the cutout.
     fn predicted_job(&self) -> f64 {
         let warm_up = if self.warm_up { WARMUP_SECONDS } else { 0. };
-        self.calibration * (warm_up + f64::from(IMAGES) * estimate::image_seconds(self.size))
+        self.calibration
+            * (warm_up + f64::from(IMAGES) * estimate::image_seconds(self.size) + CUTOUT_SECONDS)
+    }
+
+    /// Calibrated seconds of the cutout.
+    fn predicted_cutout(&self) -> f64 {
+        self.calibration * CUTOUT_SECONDS
     }
 
     /// Calibrated seconds of one denoising step.
@@ -325,13 +344,14 @@ impl Tracker {
     }
 
     /// Seconds after `step` of `image` finished: its remaining steps and
-    /// decoding, then every later image.
+    /// decoding, every later image, then the cutout.
     fn remaining_after(&self, image: WorkerImage, step: u32, step_seconds: f64) -> f64 {
         let steps = f64::from(self.steps);
         let later_images = f64::from(IMAGES - 1 - image.index());
         f64::from(self.steps.saturating_sub(step)) * step_seconds
             + steps * step_seconds * IMAGE_OVERHEAD_SHARE
             + later_images * steps * step_seconds * (1. + IMAGE_OVERHEAD_SHARE)
+            + self.predicted_cutout()
     }
 
     pub(super) fn observe(&mut self, event: &WorkerEvent, now: Instant) {
@@ -377,15 +397,27 @@ impl Tracker {
                 let step_seconds = self.step_seconds.unwrap_or_else(|| self.predicted_step());
                 self.remaining_after(image, self.steps, step_seconds)
             }
-            WorkerEvent::Done { .. } => {
-                self.done = true;
-                0.
-            }
+            // The job is done; the cutout follows.
+            WorkerEvent::Done { .. } => self.predicted_cutout(),
             // The job ends with an error; the estimate no longer matters.
             WorkerEvent::Failed { .. } | WorkerEvent::Cancelled { .. } => 0.,
         };
         self.anchor = now;
         self.remaining_at_anchor = remaining.max(0.);
+    }
+
+    /// The job's images are saved and checked; BiRefNet cuts the fill out.
+    pub(super) fn cutting_out(&mut self, now: Instant) {
+        self.stage = Stage::CuttingOut;
+        self.anchor = now;
+        self.remaining_at_anchor = self.predicted_cutout();
+    }
+
+    /// The generation is complete.
+    pub(super) fn finish(&mut self, now: Instant) {
+        self.done = true;
+        self.anchor = now;
+        self.remaining_at_anchor = 0.;
     }
 
     pub(super) fn progress(&mut self, now: Instant) -> Progress {
@@ -403,6 +435,7 @@ impl Tracker {
         Progress {
             fraction: self.fraction,
             remaining: Duration::from_secs_f64(remaining),
+            stage: self.stage,
         }
     }
 }
@@ -506,7 +539,8 @@ mod tests {
     }
 
     /// A cold 512² job measured with the real 9B model and one step on the
-    /// reference machine: event times since the worker was started.
+    /// reference machine: event times since the worker was started, then
+    /// the cutout.
     #[test]
     fn the_estimate_refines_from_measured_steps_and_never_goes_backwards() {
         use WorkerImage::{Fill, LineArt};
@@ -527,7 +561,7 @@ mod tests {
             initial.remaining,
             estimate::estimate((512, 512), 0, cold, true)
         );
-        let end = 17.35;
+        let end = 17.35 + CUTOUT_SECONDS;
         let step = |image, elapsed| WorkerEvent::Step {
             job: 1,
             image,
@@ -571,8 +605,22 @@ mod tests {
                 error < 0.15 * actual + 1.,
                 "{event:?}: {progress:?}, actual {actual:.2} s"
             );
+            assert_eq!(progress.stage, Stage::Generating);
             previous = progress.fraction;
         }
+        // The job is done, but the bar is not until the cutout is.
+        tracker.cutting_out(at(17.35));
+        let cutting_out = tracker.progress(at(17.35));
+        assert_eq!(cutting_out.stage, Stage::CuttingOut);
+        assert_eq!(
+            cutting_out.remaining,
+            Duration::from_secs_f64(CUTOUT_SECONDS)
+        );
+        assert!((previous..MAX_RUNNING_FRACTION).contains(&cutting_out.fraction));
+        let late = tracker.progress(at(end + 5.));
+        assert_eq!(late.remaining, Duration::ZERO);
+        assert!(late.fraction < 1.);
+        tracker.finish(at(end));
         assert_eq!(tracker.progress(at(end)).fraction, 1.);
         assert_eq!(tracker.progress(at(end)).remaining, Duration::ZERO);
         assert_eq!(

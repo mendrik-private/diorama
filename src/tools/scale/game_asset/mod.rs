@@ -1,12 +1,12 @@
 //! Application boundary for Game Asset scaling: FLUX line art and a de-inked
-//! fill generated at the target size, sharpened and multiplied by the shared
-//! scaler, with the BiRefNet foreground's silhouette alpha.
+//! fill generated at the target size, cut out by BiRefNet from the generated
+//! fill, then sharpened and multiplied by the shared scaler.
 use crate::{
     document::{CancellationToken, GameAssetOptions},
     error::{AppError, Result},
-    tools::line_art::{LineArtPair, Progress},
+    tools::line_art::{GameAssetLayers, Progress},
 };
-use asset_scaler::{LineArtComposer, LineArtLayers};
+use asset_scaler::LineArtLayers;
 use image::{GrayImage, RgbaImage};
 use std::{
     sync::{Arc, Mutex, TryLockError},
@@ -14,11 +14,9 @@ use std::{
     time::Duration,
 };
 
-pub(crate) type BackgroundRemover =
-    dyn Fn(&RgbaImage, &CancellationToken) -> Result<RgbaImage> + Send + Sync;
 /// Generates the target-sized layers of the source; see
 /// [`crate::tools::line_art::generate`].
-pub(crate) type LineArtGenerator = dyn Fn(&RgbaImage, (u32, u32), &CancellationToken, &dyn Fn(Progress)) -> Result<LineArtPair>
+pub(crate) type LineArtGenerator = dyn Fn(&RgbaImage, (u32, u32), &CancellationToken, &dyn Fn(Progress)) -> Result<GameAssetLayers>
     + Send
     + Sync;
 
@@ -58,82 +56,40 @@ struct TargetLayers {
     layers: Arc<LineArtLayers>,
 }
 
-/// A preview session keeps the untouched source for generation, while the
-/// background-removed foreground supplies the alpha. The layers of the latest
-/// target size are kept, so a Strength change only re-sharpens and
-/// multiplies. Caches are published only by work that finished without
-/// cancellation.
+/// A preview session keeps the source and the layers of the latest target
+/// size, so a Strength change only re-sharpens and multiplies. The cache is
+/// published only by work that finished without cancellation.
 pub struct Session {
     source: Arc<RgbaImage>,
     layers: Mutex<Option<Arc<TargetLayers>>>,
     generation_gate: Mutex<()>,
-    composer: Mutex<Option<Arc<LineArtComposer>>>,
-    remove_background: Arc<BackgroundRemover>,
-    generate_line_art: Arc<LineArtGenerator>,
+    generate_layers: Arc<LineArtGenerator>,
 }
 
 impl Session {
     pub fn new(source: Arc<RgbaImage>) -> Self {
-        Self::with_workers(
-            source,
-            Arc::new(crate::tools::selection::birefnet_cutout),
-            Arc::new(crate::tools::line_art::generate),
-        )
+        Self::with_generator(source, Arc::new(crate::tools::line_art::generate))
     }
 
-    fn with_workers(
-        source: Arc<RgbaImage>,
-        remove_background: Arc<BackgroundRemover>,
-        generate_line_art: Arc<LineArtGenerator>,
-    ) -> Self {
+    fn with_generator(source: Arc<RgbaImage>, generate_layers: Arc<LineArtGenerator>) -> Self {
         Self {
             source,
             layers: Mutex::new(None),
             generation_gate: Mutex::new(()),
-            composer: Mutex::new(None),
-            remove_background,
-            generate_line_art,
+            generate_layers,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_test_workers(
+    pub(crate) fn with_test_generator(
         source: Arc<RgbaImage>,
-        remove_background: Arc<BackgroundRemover>,
-        generate_line_art: Arc<LineArtGenerator>,
+        generate_layers: Arc<LineArtGenerator>,
     ) -> Self {
-        Self::with_workers(source, remove_background, generate_line_art)
-    }
-
-    #[cfg(test)]
-    fn with_background_remover(
-        source: Arc<RgbaImage>,
-        remove_background: Arc<BackgroundRemover>,
-    ) -> Self {
-        Self::with_workers(source, remove_background, Arc::new(model_like_test_pair))
+        Self::with_generator(source, generate_layers)
     }
 
     fn validate_dimensions(&self, w: u32, h: u32) -> Result<()> {
         validate_dimensions(self.source.dimensions(), w, h)
-    }
-
-    fn composer(&self, cancel: &CancellationToken) -> Result<Arc<LineArtComposer>> {
-        if let Some(composer) = self
-            .composer
-            .lock()
-            .expect("foreground cache poisoned")
-            .clone()
-        {
-            return Ok(composer);
-        }
-        let foreground = (self.remove_background)(&self.source, cancel)?;
-        if foreground.dimensions() != self.source.dimensions() {
-            return Err(AppError::InvalidDimensions);
-        }
-        let composer = Arc::new(LineArtComposer::new(Arc::new(foreground)).map_err(map_error)?);
-        cancel.check()?;
-        let mut cache = self.composer.lock().expect("foreground cache poisoned");
-        Ok(cache.get_or_insert(composer).clone())
     }
 
     fn cached_layers(&self, size: (u32, u32)) -> Option<Arc<TargetLayers>> {
@@ -172,16 +128,21 @@ impl Session {
                 cancel.check()?;
                 return Ok(layers);
             }
-            // Check source dimensions and the working-memory guard ahead of
-            // the external model process.
-            LineArtComposer::preflight(&self.source).map_err(map_error)?;
+            // Check the working-memory guard ahead of the model processes.
+            LineArtLayers::preflight(size).map_err(map_error)?;
             cancel.check()?;
-            let pair = (self.generate_line_art)(&self.source, size, cancel, progress)?;
-            if pair.line_art.dimensions() != size {
+            let generated = (self.generate_layers)(&self.source, size, cancel, progress)?;
+            if generated.line_art.dimensions() != size {
                 return Err(AppError::InvalidDimensions);
             }
-            let layers = LineArtLayers::new(pair.line_art, pair.fill, &|| cancel.check().is_err())
-                .map_err(map_error)?;
+            let layers = LineArtLayers::new(
+                generated.line_art,
+                generated.fill,
+                generated.alpha,
+                &generated.reference,
+                &|| cancel.check().is_err(),
+            )
+            .map_err(map_error)?;
             let layers = Arc::new(TargetLayers {
                 size,
                 layers: Arc::new(layers),
@@ -196,8 +157,8 @@ impl Session {
     }
 
     /// Return the line art as the result multiplies it: generated at the
-    /// target size and sharpened at `options`'s strength. This never needs
-    /// the extracted foreground. `progress` reports a running generation.
+    /// target size and sharpened at `options`'s strength. `progress` reports
+    /// a running generation.
     pub fn line_art(
         &self,
         w: u32,
@@ -231,14 +192,10 @@ impl Session {
         if (w, h) == self.source.dimensions() {
             return Ok((*self.source).clone());
         }
-        // Generate from the untouched original before BiRefNet runs; no
-        // cache lock is held during model work.
-        let layers = self.layers((w, h), cancel, progress)?;
-        let composer = self.composer(cancel)?;
-        let resized = composer
-            .compose(&layers.layers, options.strength(), &|| {
-                cancel.check().is_err()
-            })
+        let resized = self
+            .layers((w, h), cancel, progress)?
+            .layers
+            .compose(options.strength(), &|| cancel.check().is_err())
             .map_err(map_error)?;
         cancel.check()?;
         Ok(resized)
@@ -252,39 +209,22 @@ pub fn resize(
     options: GameAssetOptions,
     cancel: &CancellationToken,
 ) -> Result<RgbaImage> {
-    resize_with_background_remover(
-        image,
-        w,
-        h,
-        options,
-        cancel,
-        Arc::new(crate::tools::selection::birefnet_cutout),
-    )
-}
-
-fn resize_with_background_remover(
-    image: &RgbaImage,
-    w: u32,
-    h: u32,
-    options: GameAssetOptions,
-    cancel: &CancellationToken,
-    remove_background: Arc<BackgroundRemover>,
-) -> Result<RgbaImage> {
     cancel.check()?;
     validate_dimensions(image.dimensions(), w, h)?;
     if image.dimensions() == (w, h) {
         return Ok(image.clone());
     }
     #[cfg(test)]
-    let generate_line_art: Arc<LineArtGenerator> = Arc::new(model_like_test_pair);
+    let generate_layers: Arc<LineArtGenerator> = Arc::new(model_like_test_layers);
     #[cfg(not(test))]
-    let generate_line_art: Arc<LineArtGenerator> = Arc::new(crate::tools::line_art::generate);
-    Session::with_workers(
-        Arc::new(image.clone()),
-        remove_background,
-        generate_line_art,
+    let generate_layers: Arc<LineArtGenerator> = Arc::new(crate::tools::line_art::generate);
+    Session::with_generator(Arc::new(image.clone()), generate_layers).resize(
+        w,
+        h,
+        options,
+        cancel,
+        &|_| {},
     )
-    .resize(w, h, options, cancel, &|_| {})
 }
 
 fn map_error(error: asset_scaler::Error) -> AppError {
@@ -298,34 +238,40 @@ fn map_error(error: asset_scaler::Error) -> AppError {
     }
 }
 
-/// A deterministic stand-in for the model in normal unit tests. The fill is
-/// the white-composited source reduced with Lanczos. The line art is drawn at
-/// the source size, where near-neutral dark ink becomes black or weak gray
-/// and saturated fill stays white, and reduced with Lanczos, so its edges
-/// are soft like the model's.
+/// A deterministic stand-in for the model and the cutout in normal unit
+/// tests. The fill and the reference are the white-composited source
+/// reduced with Lanczos. The line art is drawn at the source size, where
+/// near-neutral dark ink becomes black or weak gray and saturated fill stays
+/// white, and reduced with Lanczos, so its edges are soft like the model's.
+/// The cutout keys out the colour of the source's top-left pixel, capped by
+/// the source's alpha.
 #[cfg(test)]
-pub(crate) fn model_like_test_pair(
+pub(crate) fn model_like_test_layers(
     image: &RgbaImage,
     (w, h): (u32, u32),
     cancel: &CancellationToken,
     _progress: &dyn Fn(Progress),
-) -> Result<LineArtPair> {
+) -> Result<GameAssetLayers> {
     use image::imageops::{FilterType, resize};
     cancel.check()?;
+    let key = image.get_pixel(0, 0).0;
     let mut fill = image::RgbImage::new(image.width(), image.height());
     let mut line_art = GrayImage::new(image.width(), image.height());
-    for (index, ((source, fill), line)) in image
+    let mut alpha = GrayImage::new(image.width(), image.height());
+    for (index, (((source, fill), line), alpha)) in image
         .pixels()
         .zip(fill.pixels_mut())
         .zip(line_art.pixels_mut())
+        .zip(alpha.pixels_mut())
         .enumerate()
     {
         if index.is_multiple_of(4096) {
             cancel.check()?;
         }
-        let alpha = u16::from(source[3]);
-        let composite =
-            |channel: u8| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+        let opacity = u16::from(source[3]);
+        let composite = |channel: u8| {
+            ((u16::from(channel) * opacity + 255 * (255 - opacity) + 127) / 255) as u8
+        };
         fill.0 = [
             composite(source[0]),
             composite(source[1]),
@@ -344,17 +290,22 @@ pub(crate) fn model_like_test_pair(
         } else {
             255
         };
+        alpha[0] = if source.0 == key { 0 } else { source[3] };
     }
     cancel.check()?;
-    Ok(LineArtPair {
+    let fill = resize(&fill, w, h, FilterType::Lanczos3);
+    Ok(GameAssetLayers {
         line_art: resize(&line_art, w, h, FilterType::Lanczos3),
-        fill: resize(&fill, w, h, FilterType::Lanczos3),
+        reference: fill.clone(),
+        fill,
+        alpha: resize(&alpha, w, h, FilterType::Lanczos3),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::line_art::Stage;
     use std::{
         env, fs,
         path::PathBuf,
@@ -368,35 +319,18 @@ mod tests {
 
     fn no_progress(_: Progress) {}
 
-    fn remove_flat_background(image: &RgbaImage, cancel: &CancellationToken) -> Result<RgbaImage> {
-        cancel.check()?;
-        let mut foreground = image.clone();
-        for pixel in foreground.pixels_mut() {
-            if pixel.0 == [240, 230, 220, 255] {
-                pixel.0 = [0; 4];
-            }
-        }
-        Ok(foreground)
-    }
-
-    fn counting_remover(calls: Arc<AtomicUsize>) -> Arc<BackgroundRemover> {
-        Arc::new(move |image, cancel| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            remove_flat_background(image, cancel)
-        })
-    }
-
     fn counting_generator(calls: Arc<AtomicUsize>, delay: Duration) -> Arc<LineArtGenerator> {
         Arc::new(move |image, size, cancel, progress| {
             calls.fetch_add(1, Ordering::Relaxed);
             progress(Progress {
                 fraction: 0.5,
                 remaining: Duration::from_secs(3),
+                stage: Stage::Generating,
             });
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }
-            model_like_test_pair(image, size, cancel, progress)
+            model_like_test_layers(image, size, cancel, progress)
         })
     }
 
@@ -415,12 +349,17 @@ mod tests {
     /// The shared scaler's result for the stand-in model's layers.
     fn expected(source: &RgbaImage, (w, h): (u32, u32), strength: u8) -> (RgbaImage, RgbaImage) {
         let cancel = CancellationToken::default();
-        let pair = model_like_test_pair(source, (w, h), &cancel, &no_progress).unwrap();
-        let layers = Arc::new(LineArtLayers::new(pair.line_art, pair.fill, &|| false).unwrap());
-        let foreground = Arc::new(remove_flat_background(source, &cancel).unwrap());
-        let composed = LineArtComposer::new(foreground)
-            .unwrap()
-            .compose(&layers, options(strength).strength(), &|| false)
+        let generated = model_like_test_layers(source, (w, h), &cancel, &no_progress).unwrap();
+        let layers = LineArtLayers::new(
+            generated.line_art,
+            generated.fill,
+            generated.alpha,
+            &generated.reference,
+            &|| false,
+        )
+        .unwrap();
+        let composed = layers
+            .compose(options(strength).strength(), &|| false)
             .unwrap();
         let line_art = line_art_to_rgba(
             &layers
@@ -446,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_returns_the_original_without_background_or_line_art_work() {
+    fn identity_returns_the_original_without_generating() {
         let source = Arc::new(RgbaImage::from_fn(16, 12, |x, y| {
             image::Rgba([
                 x as u8,
@@ -455,11 +394,9 @@ mod tests {
                 if (x + y) % 3 == 0 { 90 } else { 255 },
             ])
         }));
-        let removals = Arc::new(AtomicUsize::new(0));
         let generations = Arc::new(AtomicUsize::new(0));
-        let session = Session::with_test_workers(
+        let session = Session::with_test_generator(
             source.clone(),
-            counting_remover(removals.clone()),
             counting_generator(generations.clone(), Duration::ZERO),
         );
         let output = session
@@ -468,17 +405,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(output, *source);
-        assert_eq!(removals.load(Ordering::Relaxed), 0);
         assert_eq!(generations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            resize(&source, 16, 12, options(40), &CancellationToken::default()).unwrap(),
+            *source
+        );
     }
 
     #[test]
     fn layers_are_generated_at_each_target_size_and_reused_across_strengths() {
         let source = outlined_fixture();
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = Arc::new(Session::with_test_workers(
+        let session = Arc::new(Session::with_test_generator(
             source,
-            Arc::new(remove_flat_background),
             counting_generator(calls.clone(), Duration::from_millis(30)),
         ));
         std::thread::scope(|scope| {
@@ -498,7 +437,8 @@ mod tests {
             1,
             "concurrent requests share one run"
         );
-        // A Strength change and the line-art preview reuse the pair.
+        // A Strength change and the line-art preview reuse the layers: no
+        // generation, no cutout and no progress.
         let progressed = AtomicUsize::new(0);
         let count = |_: Progress| {
             progressed.fetch_add(1, Ordering::Relaxed);
@@ -545,22 +485,21 @@ mod tests {
             let calls = calls.clone();
             Arc::new(move |image, size, cancel, progress| {
                 match calls.fetch_add(1, Ordering::Relaxed) {
-                    0 => model_like_test_pair(image, (size.0, size.1 - 1), cancel, progress),
+                    0 => model_like_test_layers(image, (size.0, size.1 - 1), cancel, progress),
                     1 => {
-                        let mut pair = model_like_test_pair(image, size, cancel, progress)?;
+                        let mut pair = model_like_test_layers(image, size, cancel, progress)?;
                         pair.fill = image::RgbImage::new(1, 1);
                         Ok(pair)
                     }
                     2 => {
                         cancel.cancel();
-                        model_like_test_pair(image, size, cancel, progress)
+                        model_like_test_layers(image, size, cancel, progress)
                     }
-                    _ => model_like_test_pair(image, size, cancel, progress),
+                    _ => model_like_test_layers(image, size, cancel, progress),
                 }
             })
         };
-        let session =
-            Session::with_test_workers(source, Arc::new(remove_flat_background), generator);
+        let session = Session::with_test_generator(source, generator);
         let cached = || {
             session
                 .layers
@@ -605,34 +544,39 @@ mod tests {
     }
 
     #[test]
-    fn the_cleaned_fill_is_multiplied_by_the_line_art_under_the_foreground_alpha() {
+    fn the_cleaned_fill_is_multiplied_by_the_line_art_under_the_generated_alpha() {
         // A flat subject but a striped generated fill on a white background:
-        // the colour restoration pulls the stripes back to the subject's
+        // the colour restoration pulls the stripes back to the reference's
         // colour away from the ink, the line art darkens it where it has
-        // ink, and alpha comes from the foreground only.
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if (4..60).contains(&x) && (4..60).contains(&y) {
-                image::Rgba([190, 95, 55, 255])
-            } else {
-                image::Rgba([0; 4])
-            }
-        }));
+        // ink, and alpha is the generated cutout.
+        let source = Arc::new(RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255])));
         let generator: Arc<LineArtGenerator> = Arc::new(|_, (w, h), cancel, _| {
             cancel.check()?;
-            let line_art = GrayImage::from_fn(w, h, |_, y| {
-                image::Luma([if (15..17).contains(&y) { 0 } else { 255 }])
-            });
-            let fill = image::RgbImage::from_fn(w, h, |x, y| {
-                if (2..30).contains(&x) && (2..30).contains(&y) {
-                    image::Rgb([x as u8 * 4, 50, 200])
-                } else {
-                    image::Rgb([255, 255, 255])
-                }
-            });
-            Ok(LineArtPair { line_art, fill })
+            let inside = |x, y| (2..30).contains(&x) && (2..30).contains(&y);
+            Ok(GameAssetLayers {
+                line_art: GrayImage::from_fn(w, h, |_, y| {
+                    image::Luma([if (15..17).contains(&y) { 0 } else { 255 }])
+                }),
+                fill: image::RgbImage::from_fn(w, h, |x, y| {
+                    if inside(x, y) {
+                        image::Rgb([x as u8 * 4, 50, 200])
+                    } else {
+                        image::Rgb([255, 255, 255])
+                    }
+                }),
+                alpha: GrayImage::from_fn(w, h, |x, y| {
+                    image::Luma([if inside(x, y) { 255 } else { 0 }])
+                }),
+                reference: image::RgbImage::from_fn(w, h, |x, y| {
+                    if inside(x, y) {
+                        image::Rgb([190, 95, 55])
+                    } else {
+                        image::Rgb([255, 255, 255])
+                    }
+                }),
+            })
         });
-        let session =
-            Session::with_test_workers(source, Arc::new(|image, _| Ok(image.clone())), generator);
+        let session = Session::with_test_generator(source, generator);
         let result = session
             .resize(
                 32,
@@ -645,14 +589,17 @@ mod tests {
         assert_eq!(result.get_pixel(10, 15).0, [0, 0, 0, 255]);
         assert_eq!(result.get_pixel(10, 8).0, [190, 95, 55, 255]);
         assert_eq!(result.get_pixel(0, 0)[3], 0);
+        assert_eq!(result.get_pixel(31, 31)[3], 0);
     }
 
     #[test]
-    fn resize_and_preview_use_the_shared_composer_at_every_strength() {
+    fn resize_and_preview_use_the_shared_layers_at_every_strength() {
         let source = outlined_fixture();
         let calls = Arc::new(AtomicUsize::new(0));
-        let remover = counting_remover(calls.clone());
-        let session = Session::with_background_remover(source.clone(), remover.clone());
+        let session = Session::with_test_generator(
+            source.clone(),
+            counting_generator(calls.clone(), Duration::ZERO),
+        );
         let cancel = CancellationToken::default();
         let mut outputs = Vec::new();
         for strength in [0, 100, 40, 0] {
@@ -662,15 +609,7 @@ mod tests {
                 .unwrap();
             assert_eq!(preview, composed);
             assert_eq!(
-                resize_with_background_remover(
-                    &source,
-                    32,
-                    27,
-                    options(strength),
-                    &cancel,
-                    remover.clone()
-                )
-                .unwrap(),
+                resize(&source, 32, 27, options(strength), &cancel).unwrap(),
                 preview
             );
             assert_eq!(
@@ -681,20 +620,18 @@ mod tests {
             );
             outputs.push(preview);
         }
-        // One cached foreground plus one per one-shot resize.
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_ne!(outputs[0], outputs[1]);
         assert_ne!(outputs[1], outputs[2]);
         assert_eq!(outputs[0], outputs[3]);
-        assert_eq!(outputs[0].get_pixel(0, 0)[3], 0, "the canvas is removed");
+        assert_eq!(outputs[0].get_pixel(0, 0)[3], 0, "the canvas is cut out");
     }
 
     #[test]
-    fn line_art_preview_never_extracts_the_foreground() {
+    fn line_art_preview_is_the_sharpened_line_art() {
         let source = outlined_fixture();
-        let calls = Arc::new(AtomicUsize::new(0));
         let session =
-            Session::with_background_remover(source.clone(), counting_remover(calls.clone()));
+            Session::with_test_generator(source.clone(), Arc::new(model_like_test_layers));
         let cancel = CancellationToken::default();
         // The source size is a target like any other for the preview.
         for size in [(64, 64), (32, 32)] {
@@ -718,15 +655,13 @@ mod tests {
                 .line_art(32, 32, options(0), &cancel, &no_progress)
                 .unwrap()
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn line_art_preview_validates_dimensions_and_cancellation() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = Session::with_test_workers(
+        let session = Session::with_test_generator(
             outlined_fixture(),
-            Arc::new(remove_flat_background),
             counting_generator(calls.clone(), Duration::ZERO),
         );
         let cancel = CancellationToken::default();
@@ -747,47 +682,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_alpha_stays_authoritative() {
-        let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
-            if (20..44).contains(&x) && (20..44).contains(&y) {
-                image::Rgba([120, 180, 90, 255])
-            } else {
-                image::Rgba([240, 0, 220, 0])
-            }
-        }));
-        let cancel = CancellationToken::default();
-        let remover = Arc::new(remove_flat_background);
-        let one_shot =
-            resize_with_background_remover(&source, 16, 16, options(20), &cancel, remover.clone())
-                .unwrap();
-        let cached = Session::with_background_remover(source, remover)
-            .resize(16, 16, options(20), &cancel, &no_progress)
-            .unwrap();
-        assert_eq!(cached, one_shot);
-        assert_eq!(one_shot.get_pixel(0, 0)[3], 0);
-        assert_eq!(one_shot.get_pixel(8, 8)[3], 255);
-    }
-
-    #[test]
     fn shared_scaler_errors_preserve_application_semantics() {
         let image = Arc::new(RgbaImage::new(16, 16));
         let calls = Arc::new(AtomicUsize::new(0));
-        let remover = counting_remover(calls.clone());
-        let session = Session::with_background_remover(image.clone(), remover.clone());
+        let session = Session::with_test_generator(
+            image.clone(),
+            counting_generator(calls.clone(), Duration::ZERO),
+        );
         let cancel = CancellationToken::default();
         assert!(matches!(
             session.resize(17, 16, Default::default(), &cancel, &no_progress),
             Err(AppError::InvalidDimensions)
         ));
         assert!(matches!(
-            resize_with_background_remover(
-                &image,
-                17,
-                16,
-                Default::default(),
-                &CancellationToken::default(),
-                remover.clone()
-            ),
+            resize(&image, 17, 16, Default::default(), &cancel),
             Err(AppError::InvalidDimensions)
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -800,9 +708,8 @@ mod tests {
             session.resize(8, 8, Default::default(), &cancel, &no_progress),
             Err(AppError::Cancelled)
         ));
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(matches!(
-            resize_with_background_remover(&image, 16, 16, Default::default(), &cancel, remover),
+            resize(&image, 16, 16, Default::default(), &cancel),
             Err(AppError::Cancelled)
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -810,44 +717,18 @@ mod tests {
             map_error(asset_scaler::Error::GameAssetMemoryLimit { limit_bytes: 42 }),
             AppError::GameAssetMemoryLimit { limit_bytes: 42 }
         ));
-    }
-
-    #[test]
-    fn cancelled_foreground_is_not_cached() {
-        let source = Arc::new(RgbaImage::from_pixel(
-            16,
-            16,
-            image::Rgba([120, 180, 90, 255]),
-        ));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let remover: Arc<BackgroundRemover> = {
-            let calls = calls.clone();
-            Arc::new(move |image, cancel| {
-                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                    cancel.cancel();
-                }
-                Ok(image.clone())
-            })
-        };
-        let session = Session::with_background_remover(source, remover);
-        let cancelled = CancellationToken::default();
-        assert!(matches!(
-            session.resize(8, 8, Default::default(), &cancelled, &no_progress),
-            Err(AppError::Cancelled)
-        ));
         assert!(
             session
-                .composer
-                .lock()
-                .expect("foreground cache poisoned")
-                .is_none(),
-            "a cancelled foreground must not be cached"
+                .resize(
+                    8,
+                    8,
+                    Default::default(),
+                    &CancellationToken::default(),
+                    &no_progress
+                )
+                .is_ok()
         );
-        let retry = CancellationToken::default();
-        session
-            .resize(8, 8, Default::default(), &retry, &no_progress)
-            .unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     /// Runs the production FLUX and BiRefNet workers through `Session::new`
@@ -861,12 +742,14 @@ mod tests {
     /// `DIORAMA_LINE_ART_APP_OUT` to a fresh artifact directory:
     ///
     /// `cargo test --lib line_art_app_wizard_capture -- --ignored --nocapture`
-    /// Renders each image in `DIORAMA_LINE_ART_WARM_INPUTS` (paths, one per
-    /// line) at 128² and Strength 40 through `Session::new`, with the
-    /// resident worker kept loaded between them, and prints each time
-    /// against its initial estimate. Writes `<stem>.png` (the result),
-    /// `<stem>-fill.png` and `<stem>-line-art.png` (the sharpened line art)
-    /// to `DIORAMA_LINE_ART_APP_OUT`:
+    /// Renders each image in `DIORAMA_LINE_ART_WARM_INPUTS` (one per line: a
+    /// path, optionally followed by a tab and the target's shorter side,
+    /// 128 by default, the longer one keeping the source's aspect ratio) at
+    /// Strength 40 through `Session::new`, with the resident worker kept
+    /// loaded between them, and prints each time against its initial
+    /// estimate and the time of its cutout stage. Writes `<stem>.png` (the
+    /// result), `<stem>-fill.png`, `<stem>-alpha.png` and `<stem>-line-art.png`
+    /// (the sharpened line art) to `DIORAMA_LINE_ART_APP_OUT`:
     ///
     /// `cargo test --lib line_art_app_warm_session -- --ignored --nocapture`
     #[test]
@@ -884,37 +767,59 @@ mod tests {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .try_for_each(|input| -> Result<()> {
+            .try_for_each(|line| -> Result<()> {
+                let (input, side) = line.split_once('\t').map_or((line, 128), |(input, side)| {
+                    (input, side.trim().parse().expect("the side is an integer"))
+                });
                 let input = PathBuf::from(input);
                 let name = input.file_stem().unwrap().to_string_lossy().into_owned();
                 let source = Arc::new(image::open(&input)?.into_rgba8());
+                let (width, height) = source.dimensions();
+                let scale = f64::from(side) / f64::from(width.min(height));
+                let size = (
+                    ((f64::from(width) * scale).round() as u32).min(width),
+                    ((f64::from(height) * scale).round() as u32).min(height),
+                );
                 let session = Session::new(source.clone());
                 let started = Instant::now();
                 let estimate = Mutex::new(None);
-                let generated = Mutex::new(None);
+                let cutting_out = Mutex::new(None);
                 let record = |progress: Progress| {
                     estimate.lock().unwrap().get_or_insert(progress.remaining);
-                    *generated.lock().unwrap() = Some(started.elapsed());
+                    if progress.stage == Stage::CuttingOut {
+                        cutting_out.lock().unwrap().get_or_insert(started.elapsed());
+                    }
                 };
-                let resized = session.resize(128, 128, options(40), &cancel, &record)?;
+                let resized = session.resize(size.0, size.1, options(40), &cancel, &record)?;
+                let total = started.elapsed().as_secs_f64();
+                let cutting_out = cutting_out.into_inner().unwrap();
                 eprintln!(
-                    "{name}: generated in {:.2} s ({:.2} s including the cutout), initial estimate {}",
-                    generated
+                    "{name} at {}×{}: {total:.2} s, initial estimate {}, cutout stage {}",
+                    size.0,
+                    size.1,
+                    estimate
                         .into_inner()
                         .unwrap()
-                        .map_or(0., |generated| generated.as_secs_f64()),
-                    started.elapsed().as_secs_f64(),
-                    estimate.into_inner().unwrap().map_or("none (cache hit)".into(), |estimate| {
-                        format!("{:.2} s", estimate.as_secs_f64())
-                    })
+                        .map_or("none (cache hit)".into(), |estimate| {
+                            format!("{:.2} s", estimate.as_secs_f64())
+                        }),
+                    cutting_out.map_or("none".into(), |at| format!(
+                        "from {:.2} s: {:.2} s",
+                        at.as_secs_f64(),
+                        total - at.as_secs_f64()
+                    ))
                 );
                 resized.save(output.join(format!("{name}.png")))?;
                 session
-                    .line_art(128, 128, options(40), &cancel, &|_| {})?
+                    .line_art(size.0, size.1, options(40), &cancel, &|_| {})?
                     .save(output.join(format!("{name}-line-art.png")))?;
-                crate::tools::line_art::generate(&source, (128, 128), &cancel, &|_| {})?
-                    .fill
-                    .save(output.join(format!("{name}-fill.png")))?;
+                let layers = crate::tools::line_art::generate(&source, size, &cancel, &|_| {
+                    panic!("the layers are cached")
+                })?;
+                layers.fill.save(output.join(format!("{name}-fill.png")))?;
+                layers
+                    .alpha
+                    .save(output.join(format!("{name}-alpha.png")))?;
                 Ok(())
             });
         crate::tools::line_art::keep_real_worker_warm(false);
@@ -977,12 +882,16 @@ mod tests {
                 );
             }
             line_art.save(output.join(format!("line-art-{side}-strength40.png")))?;
-            let pair = crate::tools::line_art::generate(&source, (side, side), &cancel, &|_| {
-                panic!("the pair is cached")
+            let layers = crate::tools::line_art::generate(&source, (side, side), &cancel, &|_| {
+                panic!("the layers are cached")
             })?;
-            pair.line_art
+            layers
+                .line_art
                 .save(output.join(format!("raw-line-art-{side}.png")))?;
-            pair.fill.save(output.join(format!("fill-{side}.png")))?;
+            layers.fill.save(output.join(format!("fill-{side}.png")))?;
+            layers
+                .alpha
+                .save(output.join(format!("alpha-{side}.png")))?;
             for strength in [0, 40, 100] {
                 let options = options(strength);
                 session
