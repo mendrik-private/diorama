@@ -9,9 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::estimate::{
-    self, Calibration, EXIT_SECONDS, IMAGES, LOAD_SECONDS, STARTUP_SECONDS, WARMUP_SECONDS,
-};
+use super::estimate::{self, Calibration, IMAGES, LOAD_SECONDS, WARMUP_SECONDS};
 
 /// Reference encoding and decoding of one image, relative to its denoising
 /// steps: about 2.4% for the 9B model at 512².
@@ -51,19 +49,48 @@ pub(super) enum WorkerEvent {
     Encode {
         prompts: u32,
     },
+    /// The resident worker loads the model, then is ready for jobs.
     Load,
-    /// Denoising step `step` of `steps` finished `elapsed` seconds after
-    /// `image`'s generation started.
+    Ready,
+    /// Denoising step `step` of `steps` of `job` finished `elapsed` seconds
+    /// after `image`'s generation started.
     Step {
+        job: u32,
         image: WorkerImage,
         step: u32,
         steps: u32,
         elapsed: f64,
     },
     Decode {
+        job: u32,
         image: WorkerImage,
     },
-    Done,
+    /// The end of `job`: its outputs are saved, it failed, or it stopped
+    /// because it was cancelled.
+    Done {
+        job: u32,
+    },
+    Failed {
+        job: u32,
+        message: String,
+    },
+    Cancelled {
+        job: u32,
+    },
+}
+
+impl WorkerEvent {
+    /// The job this event belongs to, if any.
+    pub(super) fn job(&self) -> Option<u32> {
+        match self {
+            Self::Encode { .. } | Self::Load | Self::Ready => None,
+            Self::Step { job, .. }
+            | Self::Decode { job, .. }
+            | Self::Done { job }
+            | Self::Failed { job, .. }
+            | Self::Cancelled { job } => Some(*job),
+        }
+    }
 }
 
 impl WorkerEvent {
@@ -98,21 +125,31 @@ impl WorkerEvent {
                     prompts: count("prompts")?,
                 }),
                 "load" => Some(Self::Load),
-                "decode" => Some(Self::Decode { image: image()? }),
+                "decode" => Some(Self::Decode {
+                    job: count("job")?,
+                    image: image()?,
+                }),
                 _ => None,
             },
+            "ready" => Some(Self::Ready),
             "step" => {
                 let (step, steps, elapsed) = (count("step")?, count("steps")?, number("elapsed")?);
                 (1..=steps).contains(&step).then_some(())?;
                 (elapsed >= 0.).then_some(())?;
                 Some(Self::Step {
+                    job: count("job")?,
                     image: image()?,
                     step,
                     steps,
                     elapsed,
                 })
             }
-            "done" => Some(Self::Done),
+            "done" => Some(Self::Done { job: count("job")? }),
+            "error" => Some(Self::Failed {
+                job: count("job")?,
+                message: text("message")?.to_owned(),
+            }),
+            "cancelled" => Some(Self::Cancelled { job: count("job")? }),
             _ => None,
         }
     }
@@ -214,6 +251,12 @@ pub(super) struct Tracker {
     size: (u32, u32),
     steps: u32,
     calibration: f64,
+    /// Seconds until the resident worker is ready, as predicted at the start.
+    start_up: f64,
+    /// Whether the worker has not generated at this size yet.
+    warm_up: bool,
+    /// The uncalibrated prediction of the whole run.
+    predicted: Duration,
     started: Instant,
     /// Remaining seconds as estimated at `anchor`, the latest event.
     anchor: Instant,
@@ -227,23 +270,29 @@ pub(super) struct Tracker {
 }
 
 impl Tracker {
-    /// `prompts_to_encode` prompts have no cached embeddings yet.
+    /// `prompts_to_encode` prompts have no cached embeddings yet, the
+    /// resident worker needs `start_up` seconds until it is ready, and
+    /// `warm_up` if it has not generated at this size yet.
     pub(super) fn new(
         size: (u32, u32),
         steps: u32,
         prompts_to_encode: u32,
+        (start_up, warm_up): (f64, bool),
         calibration: Calibration,
         started: Instant,
     ) -> Self {
         let calibration = calibration.factor();
+        let predicted = estimate::estimate(size, prompts_to_encode, start_up, warm_up);
         Self {
             size,
             steps: steps.max(1),
             calibration,
+            start_up,
+            warm_up,
+            predicted,
             started,
             anchor: started,
-            remaining_at_anchor: calibration
-                * estimate::estimate(size, prompts_to_encode).as_secs_f64(),
+            remaining_at_anchor: calibration * predicted.as_secs_f64(),
             first_step: [None; IMAGES as usize],
             step_seconds: None,
             prompts_encoded: prompts_to_encode,
@@ -252,19 +301,21 @@ impl Tracker {
         }
     }
 
-    /// Prompts encoded in this run; part of the prediction a finished run is
-    /// compared against.
+    /// Prompts encoded in this run.
+    #[cfg(test)]
     pub(super) fn prompts_encoded(&self) -> u32 {
         self.prompts_encoded
     }
 
-    /// Calibrated seconds from the model load to the end of the run.
-    fn predicted_after_load(&self) -> f64 {
-        self.calibration
-            * (LOAD_SECONDS
-                + WARMUP_SECONDS
-                + f64::from(IMAGES) * estimate::image_seconds(self.size)
-                + EXIT_SECONDS)
+    /// The uncalibrated prediction a finished run is compared against.
+    pub(super) fn predicted(&self) -> Duration {
+        self.predicted
+    }
+
+    /// Calibrated seconds from the worker being ready to the end of the job.
+    fn predicted_job(&self) -> f64 {
+        let warm_up = if self.warm_up { WARMUP_SECONDS } else { 0. };
+        self.calibration * (warm_up + f64::from(IMAGES) * estimate::image_seconds(self.size))
     }
 
     /// Calibrated seconds of one denoising step.
@@ -281,23 +332,24 @@ impl Tracker {
         f64::from(self.steps.saturating_sub(step)) * step_seconds
             + steps * step_seconds * IMAGE_OVERHEAD_SHARE
             + later_images * steps * step_seconds * (1. + IMAGE_OVERHEAD_SHARE)
-            + self.calibration * EXIT_SECONDS
     }
 
     pub(super) fn observe(&mut self, event: &WorkerEvent, now: Instant) {
         let remaining = match *event {
             WorkerEvent::Encode { prompts } => {
                 self.prompts_encoded = prompts;
-                // The generation process starts after the encoding one.
-                self.calibration * (estimate::encode_seconds(prompts) + STARTUP_SECONDS)
-                    + self.predicted_after_load()
+                // The resident worker starts after the encoding process.
+                self.calibration * (estimate::encode_seconds(prompts) + self.start_up)
+                    + self.predicted_job()
             }
-            WorkerEvent::Load => self.predicted_after_load(),
+            WorkerEvent::Load => self.calibration * LOAD_SECONDS + self.predicted_job(),
+            WorkerEvent::Ready => self.predicted_job(),
             WorkerEvent::Step {
                 image,
                 step,
                 steps,
                 elapsed,
+                ..
             } => {
                 self.steps = steps;
                 let slot = &mut self.first_step[image.index() as usize];
@@ -307,7 +359,7 @@ impl Tracker {
                         *slot = Some(elapsed);
                         // The first step also encodes the reference and, in
                         // the first image, warms up; scale the model by it.
-                        let warmup = if image.index() == 0 {
+                        let warmup = if image.index() == 0 && self.warm_up {
                             self.calibration * WARMUP_SECONDS
                         } else {
                             0.
@@ -321,14 +373,16 @@ impl Tracker {
                 self.step_seconds = Some(step_seconds);
                 self.remaining_after(image, step, step_seconds)
             }
-            WorkerEvent::Decode { image } => {
+            WorkerEvent::Decode { image, .. } => {
                 let step_seconds = self.step_seconds.unwrap_or_else(|| self.predicted_step());
                 self.remaining_after(image, self.steps, step_seconds)
             }
-            WorkerEvent::Done => {
+            WorkerEvent::Done { .. } => {
                 self.done = true;
                 0.
             }
+            // The job ends with an error; the estimate no longer matters.
+            WorkerEvent::Failed { .. } | WorkerEvent::Cancelled { .. } => 0.,
         };
         self.anchor = now;
         self.remaining_at_anchor = remaining.max(0.);
@@ -356,9 +410,11 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::line_art::estimate::STARTUP_SECONDS;
 
     fn step(image: WorkerImage, step: u32, elapsed: f64) -> WorkerEvent {
         WorkerEvent::Step {
+            job: 1,
             image,
             step,
             steps: 4,
@@ -375,25 +431,42 @@ mod tests {
                 WorkerEvent::Encode { prompts: 2 },
             ),
             (r#"{"event":"stage","stage":"load"}"#, WorkerEvent::Load),
+            (r#"{"event": "ready"}"#, WorkerEvent::Ready),
             (
-                r#" {"event": "step", "image": "line_art", "step": 2, "steps": 4, "elapsed": 2.864} "#,
+                r#" {"event": "step", "job": 1, "image": "line_art", "step": 2, "steps": 4, "elapsed": 2.864} "#,
                 step(LineArt, 2, 2.864),
             ),
             (
-                r#"{"elapsed": 1e-3, "steps": 4, "step": 1, "image": "fill", "event": "step"}"#,
+                r#"{"elapsed": 1e-3, "steps": 4, "step": 1, "image": "fill", "job": 1, "event": "step"}"#,
                 step(Fill, 1, 0.001),
             ),
             (
-                r#"{"event": "stage", "stage": "decode", "image": "fill"}"#,
-                WorkerEvent::Decode { image: Fill },
+                r#"{"event": "stage", "stage": "decode", "job": 3, "image": "fill"}"#,
+                WorkerEvent::Decode {
+                    job: 3,
+                    image: Fill,
+                },
             ),
             (
-                r#"{"event": "done", "note": "café \"ok\""}"#,
-                WorkerEvent::Done,
+                r#"{"event": "done", "job": 7, "note": "caf\u00e9 \"ok\""}"#,
+                WorkerEvent::Done { job: 7 },
+            ),
+            (
+                r#"{"event": "error", "job": 2, "message": "ValueError: bad \"size\""}"#,
+                WorkerEvent::Failed {
+                    job: 2,
+                    message: "ValueError: bad \"size\"".into(),
+                },
+            ),
+            (
+                r#"{"event": "cancelled", "job": 4}"#,
+                WorkerEvent::Cancelled { job: 4 },
             ),
         ] {
             assert_eq!(WorkerEvent::parse(line), Some(event), "{line}");
         }
+        assert_eq!(WorkerEvent::Ready.job(), None);
+        assert_eq!(step(Fill, 1, 0.).job(), Some(1));
     }
 
     #[test]
@@ -412,48 +485,76 @@ mod tests {
             r#"{"event": "stage", "stage": "encode"}"#,
             r#"{"event": "stage", "stage": "encode", "prompts": 1.5}"#,
             r#"{"event": "stage", "stage": "encode", "prompts": -1}"#,
-            r#"{"event": "stage", "stage": "decode", "image": "sketch"}"#,
-            r#"{"event": "step", "image": "fill", "step": 5, "steps": 4, "elapsed": 1}"#,
-            r#"{"event": "step", "image": "fill", "step": 0, "steps": 4, "elapsed": 1}"#,
-            r#"{"event": "step", "image": "fill", "step": 1, "steps": 4, "elapsed": -1}"#,
-            r#"{"event": "step", "image": "fill", "step": 1, "steps": 4, "elapsed": "1"}"#,
-            r#"{"event": "step", "image": "fill", "step": 1, "steps": 4, "elapsed": 1e999}"#,
-            r#"{"event": "step", "image": "fill", "step": 1, "steps": 4}"#,
+            r#"{"event": "stage", "stage": "decode", "job": 1, "image": "sketch"}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 5, "steps": 4, "elapsed": 1}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 0, "steps": 4, "elapsed": 1}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 1, "steps": 4, "elapsed": -1}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 1, "steps": 4, "elapsed": "1"}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 1, "steps": 4, "elapsed": 1e999}"#,
+            r#"{"event": "step", "job": 1, "image": "fill", "step": 1, "steps": 4}"#,
             r#"{"event": ["step"]}"#,
             r#"{"event": "stage", "stage": {"name": "load"}}"#,
             r#"{"event": "bad\escape"}"#,
             "[\"done\"]",
+            r#"{"event": "done"}"#,
+            r#"{"event": "error", "job": 1}"#,
+            r#"{"event": "cancelled"}"#,
+            r#"{"event": "step", "image": "fill", "step": 1, "steps": 1, "elapsed": 1}"#,
         ] {
             assert_eq!(WorkerEvent::parse(line), None, "{line}");
         }
     }
 
-    /// A 512² generation measured with the real 9B model on the reference
-    /// machine: event times since launch, then the process exit. The third
-    /// steps are interpolated.
+    /// A cold 512² job measured with the real 9B model and one step on the
+    /// reference machine: event times since the worker was started.
     #[test]
     fn the_estimate_refines_from_measured_steps_and_never_goes_backwards() {
         use WorkerImage::{Fill, LineArt};
         let started = Instant::now();
         let at = |seconds: f64| started + Duration::from_secs_f64(seconds);
-        let mut tracker = Tracker::new((512, 512), 4, 0, Calibration::default(), started);
+        let cold = estimate::cold_start_seconds();
+        let mut tracker = Tracker::new(
+            (512, 512),
+            1,
+            0,
+            (cold, true),
+            Calibration::default(),
+            started,
+        );
         let initial = tracker.progress(started);
         assert_eq!(initial.fraction, 0.);
-        assert_eq!(initial.remaining, estimate::estimate((512, 512), 0));
-        let exit = 47.07;
+        assert_eq!(
+            initial.remaining,
+            estimate::estimate((512, 512), 0, cold, true)
+        );
+        let end = 17.35;
+        let step = |image, elapsed| WorkerEvent::Step {
+            job: 1,
+            image,
+            step: 1,
+            steps: 1,
+            elapsed,
+        };
         let timeline = [
-            (4.16, WorkerEvent::Load),
-            (12.18, step(LineArt, 1, 6.126)),
-            (17.02, step(LineArt, 2, 10.966)),
-            (21.73, step(LineArt, 3, 15.677)),
-            (26.44, step(LineArt, 4, 20.388)),
-            (26.44, WorkerEvent::Decode { image: LineArt }),
-            (32.21, step(Fill, 1, 4.983)),
-            (36.95, step(Fill, 2, 9.715)),
-            (41.70, step(Fill, 3, 14.467)),
-            (46.45, step(Fill, 4, 19.219)),
-            (46.45, WorkerEvent::Decode { image: Fill }),
-            (46.92, WorkerEvent::Done),
+            (4.03, WorkerEvent::Load),
+            (6.52, WorkerEvent::Ready),
+            (12.24, step(LineArt, 5.705)),
+            (
+                12.24,
+                WorkerEvent::Decode {
+                    job: 1,
+                    image: LineArt,
+                },
+            ),
+            (16.99, step(Fill, 4.268)),
+            (
+                16.99,
+                WorkerEvent::Decode {
+                    job: 1,
+                    image: Fill,
+                },
+            ),
+            (17.35, WorkerEvent::Done { job: 1 }),
         ];
         let mut previous = initial.fraction;
         for (seconds, event) in &timeline {
@@ -463,37 +564,45 @@ mod tests {
             tracker.observe(event, at(*seconds));
             let progress = tracker.progress(at(*seconds));
             assert!(progress.fraction >= before.fraction, "{event:?}");
-            let actual = exit - seconds;
+            let actual = end - seconds;
             let error = (progress.remaining.as_secs_f64() - actual).abs();
-            if matches!(event, WorkerEvent::Step { step: 2.., .. }) {
-                assert!(error < 1.5, "{event:?}: {progress:?}, actual {actual:.2} s");
-            }
-            // The model and the first-step correction stay within 10%.
+            // With one step, the first step's time scales the model.
             assert!(
-                error < 0.1 * actual + 1.,
+                error < 0.15 * actual + 1.,
                 "{event:?}: {progress:?}, actual {actual:.2} s"
             );
             previous = progress.fraction;
         }
-        assert_eq!(tracker.progress(at(exit)).fraction, 1.);
-        assert_eq!(tracker.progress(at(exit)).remaining, Duration::ZERO);
+        assert_eq!(tracker.progress(at(end)).fraction, 1.);
+        assert_eq!(tracker.progress(at(end)).remaining, Duration::ZERO);
+        assert_eq!(
+            tracker.predicted(),
+            estimate::estimate((512, 512), 0, cold, true)
+        );
     }
 
     #[test]
     fn a_needed_encoding_is_in_the_first_estimate_and_its_stage() {
         let started = Instant::now();
-        let mut tracker = Tracker::new((512, 512), 4, 2, Calibration::default(), started);
+        let mut tracker = Tracker::new(
+            (512, 512),
+            1,
+            2,
+            (0., true),
+            Calibration::default(),
+            started,
+        );
         assert_eq!(tracker.prompts_encoded(), 2);
         assert_eq!(
             tracker.progress(started).remaining,
-            estimate::estimate((512, 512), 2)
+            estimate::estimate((512, 512), 2, 0., true)
         );
         // The encoding process reports its stage after its own start-up;
-        // what remains includes the generation process's start-up.
+        // a warm worker then only needs the job.
         let at = started + Duration::from_secs_f64(STARTUP_SECONDS);
         tracker.observe(&WorkerEvent::Encode { prompts: 2 }, at);
         let remaining = tracker.progress(at).remaining.as_secs_f64();
-        let expected = estimate::estimate((512, 512), 2).as_secs_f64() - STARTUP_SECONDS;
+        let expected = estimate::estimate((512, 512), 2, 0., true).as_secs_f64() - STARTUP_SECONDS;
         assert!(
             (remaining - expected).abs() < 1e-6,
             "{remaining} vs {expected}"
@@ -503,7 +612,14 @@ mod tests {
     #[test]
     fn running_progress_stays_below_complete_and_counts_down_to_zero() {
         let started = Instant::now();
-        let mut tracker = Tracker::new((160, 160), 4, 0, Calibration::default(), started);
+        let mut tracker = Tracker::new(
+            (160, 160),
+            1,
+            0,
+            (0., true),
+            Calibration::default(),
+            started,
+        );
         let late = tracker.progress(started + Duration::from_secs(600));
         assert_eq!(late.remaining, Duration::ZERO);
         assert_eq!(late.fraction, MAX_RUNNING_FRACTION);
@@ -522,8 +638,8 @@ mod tests {
     fn a_calibrated_machine_scales_the_prediction_until_steps_are_measured() {
         let started = Instant::now();
         let slow = Calibration::default().updated(Duration::from_secs(20), Duration::from_secs(10));
-        let mut tracker = Tracker::new((512, 512), 4, 0, slow, started);
-        let expected = slow.factor() * estimate::estimate((512, 512), 0).as_secs_f64();
+        let mut tracker = Tracker::new((512, 512), 2, 0, (0., true), slow, started);
+        let expected = slow.factor() * estimate::estimate((512, 512), 0, 0., true).as_secs_f64();
         assert!((tracker.progress(started).remaining.as_secs_f64() - expected).abs() < 1e-6);
         // Measured steps replace the calibrated model.
         let at = |seconds: f64| started + Duration::from_secs_f64(seconds);

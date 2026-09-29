@@ -2,8 +2,11 @@
 //!
 //! The application supplies two target-sized layers: grayscale line art
 //! (white is no ink) and an opaque fill without ink contours. Neither layer is
-//! resampled here. The line art is sharpened with an unsharp mask of radius 1
-//! and multiplies the fill in 8-bit sRGB, like GIMP's Multiply layer mode. Alpha comes from the foreground
+//! resampled here. Where the foreground is not opaque, the fill's colour is
+//! replaced by colour bled outward from opaque pixels, so a light background
+//! in the fill cannot show as a halo along the silhouette's soft edge. The
+//! line art is sharpened with an unsharp mask of radius 1 and multiplies the
+//! fill in 8-bit sRGB, like GIMP's Multiply layer mode. Alpha comes from the foreground
 //! alone: its Lanczos reduction's silhouette alpha at the target size, with a
 //! fixed edge softness.
 use crate::{
@@ -18,13 +21,27 @@ use std::sync::{Arc, Mutex};
 /// vertical pass (2 × 16 B), silhouette support, flood fill and projections.
 const SOURCE_BYTES: u64 = 160;
 /// Target-sized working set: the line art, its blur and horizontal pass, the
-/// sharpened copy, the fill, the linear Lanczos reduction, silhouette
+/// sharpened copy, the fill and its defringed copy, the bleeding's weight,
+/// colour and blur planes (8 × 8 B), the linear Lanczos reduction, silhouette
 /// coverage/opacity, the cached alpha and the output.
-const TARGET_BYTES: u64 = 96;
+const TARGET_BYTES: u64 = 176;
 /// Gaussian standard deviation of the unsharp mask, in target pixels.
 const SHARPEN_RADIUS: f32 = 1.;
 /// Kernel half-width: the Gaussian is truncated at three standard deviations.
 const KERNEL_RADIUS: usize = 3;
+/// Pixels at least this opaque keep the fill's colour; the others take
+/// colour bled outward from them.
+const OPAQUE_ALPHA: u8 = 250;
+/// Standard deviation, in target pixels, of the Gaussian that bleeds opaque
+/// colour outward.
+const BLEED_SIGMA: f64 = 1.5;
+/// Where the opaque weight in reach is below this, colour is bled with
+/// `BLEED_FALLBACK_SCALE` times the standard deviation instead.
+const MIN_BLEED_WEIGHT: f64 = 1e-3;
+const BLEED_FALLBACK_SCALE: f64 = 3.;
+/// The bleeding Gaussian is truncated at this many standard deviations, like
+/// scipy's `gaussian_filter` default.
+const BLEED_TRUNCATE: f64 = 4.;
 /// The silhouette's edge softness; this is the traced API's default AA.
 const ALPHA_EDGE: GameAssetAa = GameAssetAa::new(50);
 
@@ -93,12 +110,21 @@ struct TargetAlpha {
     alpha: Vec<u8>,
 }
 
+/// One set of layers' fill after defringing.
+struct DefringedFill {
+    layers: Arc<LineArtLayers>,
+    fill: Arc<RgbImage>,
+}
+
 /// Composes target-sized layers over an extracted foreground's silhouette
-/// alpha. The alpha of the latest target size is cached; heavy work stays
-/// outside the lock and a cancelled request never populates it.
+/// alpha. The alpha of the latest target size and the defringed fill of the
+/// latest layers are cached, so a strength change only re-sharpens and
+/// multiplies; heavy work stays outside the locks and a cancelled request
+/// never populates them.
 pub struct LineArtComposer {
     foreground: Arc<RgbaImage>,
     alpha: Mutex<Option<Arc<TargetAlpha>>>,
+    defringed: Mutex<Option<Arc<DefringedFill>>>,
 }
 
 impl LineArtComposer {
@@ -119,15 +145,16 @@ impl LineArtComposer {
         Ok(Self {
             foreground,
             alpha: Mutex::new(None),
+            defringed: Mutex::new(None),
         })
     }
 
-    /// `rgb = round(fill · sharpened line art / 255)` with the foreground's
-    /// silhouette alpha at the layers' size, in straight alpha. The layers
-    /// must be no larger than the foreground.
+    /// `rgb = round(defringed fill · sharpened line art / 255)` with the
+    /// foreground's silhouette alpha at the layers' size, in straight alpha.
+    /// The layers must be no larger than the foreground.
     pub fn compose(
         &self,
-        layers: &LineArtLayers,
+        layers: &Arc<LineArtLayers>,
         strength: Strength,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
@@ -139,8 +166,34 @@ impl LineArtComposer {
         }
         check_budget((sw, sh), (w, h))?;
         let alpha = self.alpha(w, h, cancel)?;
+        let fill = self.defringed_fill(layers, &alpha, cancel)?;
         let line_art = layers.line_art(strength, cancel)?;
-        multiply(&layers.fill, &line_art, &alpha.alpha, cancel)
+        multiply(&fill, &line_art, &alpha.alpha, cancel)
+    }
+
+    fn defringed_fill(
+        &self,
+        layers: &Arc<LineArtLayers>,
+        alpha: &TargetAlpha,
+        cancel: &dyn Cancellation,
+    ) -> Result<Arc<RgbImage>> {
+        if let Some(cached) = self
+            .defringed
+            .lock()
+            .expect("line-art fill cache poisoned")
+            .as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.layers, layers))
+        {
+            return Ok(cached.fill.clone());
+        }
+        let fill = Arc::new(defringe(&layers.fill, &alpha.alpha, cancel)?);
+        let mut cache = self.defringed.lock().expect("line-art fill cache poisoned");
+        cancel.check()?;
+        *cache = Some(Arc::new(DefringedFill {
+            layers: layers.clone(),
+            fill: fill.clone(),
+        }));
+        Ok(fill)
     }
 
     fn alpha(&self, w: u32, h: u32, cancel: &dyn Cancellation) -> Result<Arc<TargetAlpha>> {
@@ -210,6 +263,123 @@ fn foreground_fill(
         Some(silhouette) => silhouette.target_alpha(base, fill_source, ALPHA_EDGE, cancel),
         None => Ok(base),
     }
+}
+
+/// Replace the fill's colour wherever `alpha` is below `OPAQUE_ALPHA` by
+/// colour bled outward from the opaque pixels, by normalized convolution:
+/// `G_σ(fill · w) / G_σ(w)` with `w` = 1 on opaque pixels, σ =
+/// `BLEED_SIGMA`, and `BLEED_FALLBACK_SCALE` · σ where the weight in reach is
+/// below `MIN_BLEED_WEIGHT`. Rounded once. Opaque pixels are unchanged, and
+/// so is a pixel no opaque pixel reaches.
+fn defringe(fill: &RgbImage, alpha: &[u8], cancel: &dyn Cancellation) -> Result<RgbImage> {
+    let (w, h) = (fill.width() as usize, fill.height() as usize);
+    if alpha.len() != w * h {
+        return Err(Error::InvalidDimensions);
+    }
+    let weight = alpha
+        .iter()
+        .map(|&alpha| f64::from(u8::from(alpha >= OPAQUE_ALPHA)))
+        .collect::<Vec<_>>();
+    if weight.iter().all(|&weight| weight == 1.) {
+        return Ok(fill.clone());
+    }
+    let values = fill.as_raw();
+    let bleed = |sigma: f64| -> Result<(Vec<f64>, [Vec<f64>; 3])> {
+        let kernel = bleed_kernel(sigma);
+        let reach = reflect_blur(&weight, w, h, &kernel, cancel)?;
+        let mut colours: [Vec<f64>; 3] = Default::default();
+        for (channel, colour) in colours.iter_mut().enumerate() {
+            let weighted = (0..w * h)
+                .map(|i| f64::from(values[i * 3 + channel]) * weight[i])
+                .collect::<Vec<_>>();
+            *colour = reflect_blur(&weighted, w, h, &kernel, cancel)?;
+        }
+        Ok((reach, colours))
+    };
+    let (reach, colours) = bleed(BLEED_SIGMA)?;
+    let wide = if reach
+        .iter()
+        .zip(&weight)
+        .any(|(&reach, &weight)| weight == 0. && reach < MIN_BLEED_WEIGHT)
+    {
+        Some(bleed(BLEED_SIGMA * BLEED_FALLBACK_SCALE)?)
+    } else {
+        None
+    };
+    let mut defringed = fill.clone();
+    for (i, pixel) in defringed.pixels_mut().enumerate() {
+        if weight[i] == 1. {
+            continue;
+        }
+        let (reach, colours) = match &wide {
+            Some(wide) if reach[i] < MIN_BLEED_WEIGHT => (&wide.0, &wide.1),
+            _ => (&reach, &colours),
+        };
+        if reach[i] <= 0. {
+            continue;
+        }
+        for channel in 0..3 {
+            pixel[channel] = (colours[channel][i] / reach[i]).clamp(0., 255.).round() as u8;
+        }
+    }
+    cancel.check()?;
+    Ok(defringed)
+}
+
+/// A normalized Gaussian of radius `round(BLEED_TRUNCATE · σ)`.
+fn bleed_kernel(sigma: f64) -> Vec<f64> {
+    let radius = (BLEED_TRUNCATE * sigma).round() as i64;
+    let kernel = (-radius..=radius)
+        .map(|offset| (-(offset * offset) as f64 / (2. * sigma * sigma)).exp())
+        .collect::<Vec<_>>();
+    let sum: f64 = kernel.iter().sum();
+    kernel.into_iter().map(|weight| weight / sum).collect()
+}
+
+/// Separable convolution with symmetric reflection at the borders
+/// (`d c b a | a b c d | d c b a`), scipy's "reflect" mode.
+fn reflect_blur(
+    plane: &[f64],
+    w: usize,
+    h: usize,
+    kernel: &[f64],
+    cancel: &dyn Cancellation,
+) -> Result<Vec<f64>> {
+    let radius = (kernel.len() / 2) as i64;
+    let reflect = |index: i64, len: usize| {
+        let period = 2 * len as i64;
+        let index = index.rem_euclid(period);
+        (if index < len as i64 {
+            index
+        } else {
+            period - 1 - index
+        }) as usize
+    };
+    let mut horizontal = vec![0f64; w * h];
+    for y in 0..h {
+        cancel.check()?;
+        for x in 0..w {
+            horizontal[y * w + x] = kernel
+                .iter()
+                .enumerate()
+                .map(|(k, weight)| weight * plane[y * w + reflect(x as i64 + k as i64 - radius, w)])
+                .sum();
+        }
+    }
+    let mut blurred = vec![0f64; w * h];
+    for y in 0..h {
+        cancel.check()?;
+        for x in 0..w {
+            blurred[y * w + x] = kernel
+                .iter()
+                .enumerate()
+                .map(|(k, weight)| {
+                    weight * horizontal[reflect(y as i64 + k as i64 - radius, h) * w + x]
+                })
+                .sum();
+        }
+    }
+    Ok(blurred)
 }
 
 fn gaussian_kernel() -> [f32; 2 * KERNEL_RADIUS + 1] {
@@ -339,12 +509,12 @@ mod tests {
         })
     }
 
-    fn layers(line_art: GrayImage) -> LineArtLayers {
+    fn layers(line_art: GrayImage) -> Arc<LineArtLayers> {
         let (w, h) = line_art.dimensions();
-        LineArtLayers::new(line_art, fill(w, h), &|| false).unwrap()
+        Arc::new(LineArtLayers::new(line_art, fill(w, h), &|| false).unwrap())
     }
 
-    fn flat(value: u8) -> LineArtLayers {
+    fn flat(value: u8) -> Arc<LineArtLayers> {
         layers(GrayImage::from_pixel(24, 20, Luma([value])))
     }
 
@@ -362,6 +532,16 @@ mod tests {
             .iter()
             .map(|pixel| color::rgba(*pixel)[3])
             .collect()
+    }
+
+    /// The fill as it is multiplied: defringed with the expected alpha.
+    fn expected_fill(w: u32, h: u32) -> RgbImage {
+        defringe(
+            &fill(w, h),
+            &expected_alpha(w, h),
+            &CancellationToken::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -411,7 +591,11 @@ mod tests {
         let alpha = expected_alpha(24, 20);
         assert!(alpha.iter().any(|alpha| (1..255).contains(alpha)));
         assert!(alpha.contains(&0) && alpha.contains(&255));
-        for ((output, fill), alpha) in output.pixels().zip(fill(24, 20).pixels()).zip(alpha) {
+        for ((output, fill), alpha) in output
+            .pixels()
+            .zip(expected_fill(24, 20).pixels())
+            .zip(alpha)
+        {
             assert_eq!(output.0, [fill[0], fill[1], fill[2], alpha]);
         }
     }
@@ -433,7 +617,7 @@ mod tests {
             .unwrap();
         for ((output, fill), alpha) in output
             .pixels()
-            .zip(fill(24, 20).pixels())
+            .zip(expected_fill(24, 20).pixels())
             .zip(expected_alpha(24, 20))
         {
             for channel in 0..3 {
@@ -468,7 +652,7 @@ mod tests {
             let output = composer.compose(&layers, strength, &|| false).unwrap();
             for ((output, fill), line) in output
                 .pixels()
-                .zip(fill(24, 20).pixels())
+                .zip(expected_fill(24, 20).pixels())
                 .zip(sharpened.pixels())
             {
                 for channel in 0..3 {
@@ -551,6 +735,78 @@ mod tests {
     }
 
     #[test]
+    fn defringing_keeps_opaque_pixels_and_bleeds_their_colour_outward() {
+        let cancel = CancellationToken::default();
+        // An opaque red disc on a white fill, with a soft alpha edge around
+        // it and full transparency further out.
+        let (w, h) = (24_u32, 24_u32);
+        let distance = |x: u32, y: u32| (f64::from(x) - 11.5).hypot(f64::from(y) - 11.5);
+        let alpha = (0..w * h)
+            .map(|i| match distance(i % w, i / w) {
+                d if d < 6. => 255,
+                d if d < 8. => 120,
+                _ => 0,
+            })
+            .collect::<Vec<u8>>();
+        let fill = RgbImage::from_fn(w, h, |x, y| {
+            if distance(x, y) < 6.5 {
+                Rgb([200, 40, 30])
+            } else {
+                Rgb([255, 255, 255])
+            }
+        });
+        let defringed = defringe(&fill, &alpha, &cancel).unwrap();
+        for (i, (before, after)) in fill.pixels().zip(defringed.pixels()).enumerate() {
+            if alpha[i] >= OPAQUE_ALPHA {
+                assert_eq!(before, after, "opaque pixel {i} changed");
+            }
+        }
+        // A soft edge pixel over the white background takes the interior
+        // colour, and so does a transparent pixel beyond.
+        for (x, y) in [(11, 4), (4, 11), (11, 2)] {
+            assert!(alpha[(y * w + x) as usize] < OPAQUE_ALPHA);
+            assert_eq!(fill.get_pixel(x, y).0, [255, 255, 255]);
+            assert_eq!(defringed.get_pixel(x, y).0, [200, 40, 30], "({x}, {y})");
+        }
+        // Far corners only the wider fallback reaches keep bled colour too.
+        assert_eq!(defringed.get_pixel(0, 0).0, [200, 40, 30]);
+    }
+
+    #[test]
+    fn defringing_without_opaque_pixels_keeps_the_fill() {
+        let cancel = CancellationToken::default();
+        let fill = RgbImage::from_fn(9, 7, |x, y| Rgb([x as u8 * 20, y as u8 * 30, 255]));
+        for alpha in [0, 128, 249] {
+            assert_eq!(defringe(&fill, &[alpha; 63], &cancel).unwrap(), fill);
+        }
+        // Opaque everywhere is kept as well.
+        assert_eq!(defringe(&fill, &[255; 63], &cancel).unwrap(), fill);
+        // A pixel no opaque pixel reaches, even with the wider Gaussian,
+        // keeps its colour instead of becoming NaN.
+        let wide = RgbImage::from_pixel(80, 1, Rgb([9, 9, 9]));
+        let mut alpha = [0; 80];
+        alpha[0] = 255;
+        let defringed = defringe(
+            &RgbImage::from_fn(80, 1, |x, _| {
+                if x == 0 {
+                    Rgb([200, 0, 0])
+                } else {
+                    *wide.get_pixel(x, 0)
+                }
+            }),
+            &alpha,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(defringed.get_pixel(1, 0).0, [200, 0, 0]);
+        assert_eq!(defringed.get_pixel(79, 0).0, [9, 9, 9]);
+        assert!(matches!(
+            defringe(&fill, &[255; 62], &cancel),
+            Err(Error::InvalidDimensions)
+        ));
+    }
+
+    #[test]
     fn strength_change_reuses_the_cached_alpha() {
         let composer = composer();
         let layers = layers(GrayImage::from_fn(24, 20, |x, y| {
@@ -568,6 +824,14 @@ mod tests {
             composer.alpha.lock().unwrap().as_ref().unwrap(),
             &alpha
         ));
+        let defringed = composer.defringed.lock().unwrap().clone().unwrap();
+        composer
+            .compose(&layers, Strength::new(0), &cancel)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            composer.defringed.lock().unwrap().as_ref().unwrap(),
+            &defringed
+        ));
         let fresh = LineArtComposer::new(foreground())
             .unwrap()
             .compose(&layers, Strength::new(100), &cancel)
@@ -577,7 +841,9 @@ mod tests {
         // Another size replaces the single alpha entry.
         composer
             .compose(
-                &LineArtLayers::new(GrayImage::new(12, 10), fill(12, 10), &cancel).unwrap(),
+                &Arc::new(
+                    LineArtLayers::new(GrayImage::new(12, 10), fill(12, 10), &cancel).unwrap(),
+                ),
                 Strength::new(100),
                 &cancel,
             )

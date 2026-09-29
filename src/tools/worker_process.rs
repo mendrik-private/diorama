@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Mutex, MutexGuard, TryLockError,
+        Arc, LazyLock, Mutex, MutexGuard, TryLockError,
         mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
@@ -17,8 +17,18 @@ use std::{
 
 use crate::{document::CancellationToken, error::AppError};
 
-/// Model workers share one permit because inference can exceed several GiB.
-static INFERENCE: Mutex<()> = Mutex::new(());
+/// Serializes model inference: runs that take a permit from the same gate
+/// never overlap. Runtimes carry their gate, so tests can use their own.
+#[derive(Debug, Default)]
+pub(super) struct InferenceGate(Mutex<()>);
+
+/// Model workers share one gate because inference can exceed several GiB.
+static INFERENCE: LazyLock<Arc<InferenceGate>> = LazyLock::new(Arc::default);
+
+/// The gate every real model worker shares.
+pub(super) fn shared_inference_gate() -> Arc<InferenceGate> {
+    INFERENCE.clone()
+}
 
 const LOG_TAIL_BYTES: u64 = 8 * 1024;
 
@@ -170,18 +180,21 @@ impl WaitError {
     }
 }
 
-/// Serialize model inference across windows and tools. Another model may run
-/// for minutes, so the wait has no deadline; only cancellation ends it. A
-/// worker's own timeout starts once it holds the permit.
-pub(super) fn inference_permit(
-    cancellation: &CancellationToken,
-) -> crate::error::Result<MutexGuard<'static, ()>> {
-    loop {
-        cancellation.check()?;
-        match INFERENCE.try_lock() {
-            Ok(permit) => return Ok(permit),
-            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
-            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
+impl InferenceGate {
+    /// Serialize model inference across windows and tools. Another model may
+    /// run for minutes, so the wait has no deadline; only cancellation ends
+    /// it. A worker's own timeout starts once it holds the permit.
+    pub(super) fn permit(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> crate::error::Result<MutexGuard<'_, ()>> {
+        loop {
+            cancellation.check()?;
+            match self.0.try_lock() {
+                Ok(permit) => return Ok(permit),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
+            }
         }
     }
 }
@@ -213,11 +226,12 @@ pub(super) fn spawn_logged(command: &mut Command, log: &Path) -> io::Result<Chil
         .spawn()
 }
 
-/// Spawn with stdin closed, stdout piped for [`StdoutLines`], and stderr
-/// appended to `log`.
+/// Spawn with stdin piped for requests, stdout piped for [`StdoutLines`],
+/// and stderr appended to `log`. A worker that reads no requests sees end of
+/// file once the caller drops the child's stdin.
 pub(super) fn spawn_streaming(command: &mut Command, log: &Path) -> io::Result<Child> {
     command
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(File::create(log)?)
         .spawn()
@@ -455,16 +469,17 @@ mod tests {
 
     #[test]
     fn a_held_inference_permit_blocks_without_a_deadline_until_cancelled_or_released() {
-        let held = inference_permit(&CancellationToken::default()).unwrap();
+        let gate = InferenceGate::default();
+        let held = gate.permit(&CancellationToken::default()).unwrap();
         let cancelled = CancellationToken::default();
         thread::scope(|scope| {
-            let waiter = scope.spawn(|| inference_permit(&cancelled).map(drop));
+            let waiter = scope.spawn(|| gate.permit(&cancelled).map(drop));
             thread::sleep(Duration::from_millis(150));
             assert!(!waiter.is_finished(), "a held permit has no wait deadline");
             cancelled.cancel();
             assert!(matches!(waiter.join().unwrap(), Err(AppError::Cancelled)));
 
-            let waiter = scope.spawn(|| inference_permit(&CancellationToken::default()).map(drop));
+            let waiter = scope.spawn(|| gate.permit(&CancellationToken::default()).map(drop));
             thread::sleep(Duration::from_millis(50));
             assert!(!waiter.is_finished());
             drop(held);

@@ -3240,8 +3240,15 @@ impl ViewerWindow {
             self.refresh_scale_controls();
             self.0.scale_controls.set_visible(true);
             self.0.zoom_controls.set_visible(false);
+            // Load the generation model in the background while Game Asset
+            // is the method, so previews skip its start-up.
+            crate::tools::line_art::set_warm(matches!(
+                self.0.scale_resampling.get(),
+                Resampling::GameAsset(_)
+            ));
             return;
         }
+        crate::tools::line_art::set_warm(false);
         self.0.pending_scale_activation.set(false);
         let was_updating = self.0.scale_updating_controls.replace(true);
         self.0.scale_show_line_art.set_active(false);
@@ -3422,6 +3429,9 @@ impl ViewerWindow {
 
     fn refresh_scale_method(&self) {
         let game_asset = matches!(self.0.scale_resampling.get(), Resampling::GameAsset(_));
+        if self.0.scale_source.borrow().is_some() {
+            crate::tools::line_art::set_warm(game_asset);
+        }
         self.0.scale_strength_controls.set_visible(game_asset);
         self.0.scale_show_line_art.set_visible(game_asset);
         if !game_asset {

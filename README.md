@@ -368,22 +368,33 @@ kept.
 For a target size, Diorama scales the target up until its shorter side is 512
 pixels (never down), rounds each side up to a multiple of 16, resizes the
 white-composited original to that size with Lanczos, and generates two images
-from it, one after the other on one model load: line art ("convert this to
-line-art, remove thin lines") and a fill ("remove the black outlines, change
-nothing else"). Both are cropped around the center to the scaled target. A
+from it, one after the other with one denoising step each: line art ("convert
+this to line-art, remove thin lines") and a fill ("remove the black outlines,
+change nothing else"). Both are cropped around the center to the scaled target. A
 target of at least 512 pixels per side is therefore generated at its own size
 and never resampled; a smaller one is reduced afterwards, the line art with
 bicubic and the fill with Lanczos. Any target from 1 pixel works, with an
 aspect ratio up to 8:1 and a generation of at most 1024 × 1024 pixels; a
 narrow target whose 512-pixel scaling would exceed that is generated at a
-smaller scale.
+smaller scale. Along the cutout's soft edge, the fill takes colour bled
+outward from the opaque interior, since the fill's background is white and
+would otherwise show as a light halo.
 
 Each prompt is encoded once, and its embeddings are cached next to the model.
 Encoding loads the text encoder (Qwen3-8B, only the 28 layers FLUX reads, in
 bf16) on the CPU, in a process of its own that exits before generation starts;
 it needs about 13 GB of RAM and takes about 10 s for both prompts. Generation
-loads the transformer and VAE straight onto the GPU and peaks at about 7.3 GB
-of GPU memory at 512². Diorama refuses CPU generation unless
+runs in a resident worker that loads the transformer and VAE straight onto the
+GPU once and then takes one job at a time; it peaks at about 7.3 GB of GPU
+memory at 512², and more at larger sizes. The worker starts in the background
+when the Scale tool opens with Game Asset selected, or when Game Asset is
+chosen in it, so a new image or size skips its start-up and model load (about
+7 s). It unloads when the Scale tool closes or another method is chosen, after
+10 minutes without a job, and when Diorama exits; a render outside the tool,
+such as an export, starts it and unloads it afterwards. Changing the size
+stops a running job at its next step, or replaces the worker if it does not
+stop within 20 s; a worker that crashes or runs out of memory reports the
+error and is replaced by the next job. Diorama refuses CPU generation unless
 `DIORAMA_LINE_ART_DEVICE=cpu` is set. `DIORAMA_LINE_ART_PYTHON`,
 `DIORAMA_LINE_ART_MODEL`, and `DIORAMA_LINE_ART_GGUF` override the
 interpreter, pipeline directory, and GGUF file. The pipeline must carry setup's
@@ -391,20 +402,20 @@ revision marker and the GGUF its size and verified hash; the worker never
 downloads anything. Flatpak uses the host runtime and an app-cache or
 host-cache model through its host-launch permission.
 
-Measured on an AMD Radeon 8060S (ROCm), per image with the model loaded. A
-generation runs both images and adds about 8 s of start-up, model load and
-warm-up (more when the 5.9 GB GGUF is not in the page cache). Every square
-target up to 512² is generated at 512², which takes about 35–40 s for both
-images and 45–50 s in all:
+Measured on an AMD Radeon 8060S (ROCm), per image in a loaded worker. Every
+square target up to 512² is generated at 512², which takes about 9 s for both
+images in a warm worker, 1.5 s more at a size it has not generated yet, and
+about 17–19 s from a cold start (Python start-up, and the model load, which
+takes longer when the 5.9 GB GGUF is not in the page cache):
 
-| Generation | 512² | 640² | 768² | 1024² |
-|---|---|---|---|---|
-| Seconds per image | 16.5–19.7 | 27.3 | 43–51 | 87 |
+| Generation | 512² | 768² | 1024² |
+|---|---|---|---|
+| Seconds per image | 4.5 | 9.0 | ~17.5 |
 
 While a preview generates, a progress bar shows the estimated time left. The
-estimate starts from these measurements, scaled by how long earlier runs took
-on this computer, and follows the model's denoising steps once they run.
-Changing the size cancels the running generation.
+estimate starts from these measurements and whether the worker is loaded,
+scaled by how long earlier runs took on this computer, and follows the model's
+progress once it runs. Changing the size cancels the running generation.
 
 Accepted pairs are cached in `$XDG_CACHE_HOME/diorama/line-art`, keyed by the
 generation size, the reference pixels, the pipeline revision and GGUF hash, the

@@ -55,7 +55,7 @@ fn line_art_to_rgba(line_art: &GrayImage, cancel: &CancellationToken) -> Result<
 /// The generated layers of one target size.
 struct TargetLayers {
     size: (u32, u32),
-    layers: LineArtLayers,
+    layers: Arc<LineArtLayers>,
 }
 
 /// A preview session keeps the untouched source for generation, while the
@@ -182,7 +182,10 @@ impl Session {
             }
             let layers = LineArtLayers::new(pair.line_art, pair.fill, &|| cancel.check().is_err())
                 .map_err(map_error)?;
-            let layers = Arc::new(TargetLayers { size, layers });
+            let layers = Arc::new(TargetLayers {
+                size,
+                layers: Arc::new(layers),
+            });
             let mut cache = self.layers.lock().expect("line-art layer cache poisoned");
             cancel.check()?;
             *cache = Some(layers.clone());
@@ -413,7 +416,7 @@ mod tests {
     fn expected(source: &RgbaImage, (w, h): (u32, u32), strength: u8) -> (RgbaImage, RgbaImage) {
         let cancel = CancellationToken::default();
         let pair = model_like_test_pair(source, (w, h), &cancel, &no_progress).unwrap();
-        let layers = LineArtLayers::new(pair.line_art, pair.fill, &|| false).unwrap();
+        let layers = Arc::new(LineArtLayers::new(pair.line_art, pair.fill, &|| false).unwrap());
         let foreground = Arc::new(remove_flat_background(source, &cancel).unwrap());
         let composed = LineArtComposer::new(foreground)
             .unwrap()
@@ -850,6 +853,66 @@ mod tests {
     /// `DIORAMA_LINE_ART_APP_OUT` to a fresh artifact directory:
     ///
     /// `cargo test --lib line_art_app_wizard_capture -- --ignored --nocapture`
+    /// Renders each image in `DIORAMA_LINE_ART_WARM_INPUTS` (paths, one per
+    /// line) at 128² and Strength 40 through `Session::new`, with the
+    /// resident worker kept loaded between them, and prints each time
+    /// against its initial estimate. Writes `<stem>.png` (the result),
+    /// `<stem>-fill.png` and `<stem>-line-art.png` (the sharpened line art)
+    /// to `DIORAMA_LINE_ART_APP_OUT`:
+    ///
+    /// `cargo test --lib line_art_app_warm_session -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local line-art and BiRefNet inference models"]
+    fn line_art_app_warm_session() -> Result<()> {
+        let inputs = env::var("DIORAMA_LINE_ART_WARM_INPUTS")
+            .expect("set DIORAMA_LINE_ART_WARM_INPUTS to image paths, one per line");
+        let output = env::var_os("DIORAMA_LINE_ART_APP_OUT")
+            .map(PathBuf::from)
+            .expect("set DIORAMA_LINE_ART_APP_OUT");
+        fs::create_dir_all(&output)?;
+        crate::tools::line_art::keep_real_worker_warm(true);
+        let cancel = CancellationToken::default();
+        let result = inputs
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .try_for_each(|input| -> Result<()> {
+                let input = PathBuf::from(input);
+                let name = input.file_stem().unwrap().to_string_lossy().into_owned();
+                let source = Arc::new(image::open(&input)?.into_rgba8());
+                let session = Session::new(source.clone());
+                let started = Instant::now();
+                let estimate = Mutex::new(None);
+                let generated = Mutex::new(None);
+                let record = |progress: Progress| {
+                    estimate.lock().unwrap().get_or_insert(progress.remaining);
+                    *generated.lock().unwrap() = Some(started.elapsed());
+                };
+                let resized = session.resize(128, 128, options(40), &cancel, &record)?;
+                eprintln!(
+                    "{name}: generated in {:.2} s ({:.2} s including the cutout), initial estimate {}",
+                    generated
+                        .into_inner()
+                        .unwrap()
+                        .map_or(0., |generated| generated.as_secs_f64()),
+                    started.elapsed().as_secs_f64(),
+                    estimate.into_inner().unwrap().map_or("none (cache hit)".into(), |estimate| {
+                        format!("{:.2} s", estimate.as_secs_f64())
+                    })
+                );
+                resized.save(output.join(format!("{name}.png")))?;
+                session
+                    .line_art(128, 128, options(40), &cancel, &|_| {})?
+                    .save(output.join(format!("{name}-line-art.png")))?;
+                crate::tools::line_art::generate(&source, (128, 128), &cancel, &|_| {})?
+                    .fill
+                    .save(output.join(format!("{name}-fill.png")))?;
+                Ok(())
+            });
+        crate::tools::line_art::keep_real_worker_warm(false);
+        result
+    }
+
     #[test]
     #[ignore = "requires local line-art and BiRefNet inference models"]
     fn line_art_app_wizard_capture() -> Result<()> {

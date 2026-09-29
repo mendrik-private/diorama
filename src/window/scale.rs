@@ -490,6 +490,87 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
+    fn game_asset_keeps_the_generation_worker_loaded_only_while_selected() {
+        adw::init().expect("GTK initialization");
+        let root = tempfile::tempdir().unwrap();
+        crate::tools::line_art::fake_worker::install(
+            root.path(),
+            r#"#!/bin/bash
+dir="$(dirname "$0")"
+echo serve >> "$dir/launches"
+echo '{"event": "stage", "stage": "load"}'
+echo '{"event": "ready"}'
+while IFS= read -r request; do :; done
+echo stopped >> "$dir/launches"
+"#,
+        );
+        let launches = || fs_read(&root.path().join("launches"));
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ScaleWorkerTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let source = Arc::new(image::RgbaImage::from_pixel(
+            96,
+            80,
+            image::Rgba([130, 170, 90, 255]),
+        ));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: source.clone(),
+                path: None,
+                metadata: Default::default(),
+            })));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&source).unwrap()));
+        window.0.rendered.replace(Some((*source).clone()));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        window.present();
+        let context = glib::MainContext::default();
+        let wait_for = |expected: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while launches() != expected && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(launches(), expected);
+        };
+
+        // Another method in the Scale tool loads nothing.
+        window.0.scale_method.set_selected(0);
+        window.0.scale_button.set_active(true);
+        std::thread::sleep(Duration::from_millis(200));
+        wait_for("");
+        // Choosing Game Asset starts the worker, leaving it stops it.
+        window.0.scale_method.set_selected(2);
+        wait_for("serve\n");
+        window.0.scale_method.set_selected(1);
+        wait_for("serve\nstopped\n");
+        window.0.scale_method.set_selected(2);
+        wait_for("serve\nstopped\nserve\n");
+        // Closing the Scale tool stops it too.
+        window.0.scale_button.set_active(false);
+        wait_for("serve\nstopped\nserve\nstopped\n");
+        // Opening the tool with Game Asset selected starts it again.
+        window.0.scale_button.set_active(true);
+        wait_for("serve\nstopped\nserve\nstopped\nserve\n");
+        window.0.scale_button.set_active(false);
+        wait_for("serve\nstopped\nserve\nstopped\nserve\nstopped\n");
+        window.0.window.close();
+    }
+
+    fn fs_read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
     fn game_asset_line_art_toggle_uses_the_preview_worker_without_committing_it() {
         adw::init().expect("GTK initialization");
         let application = adw::Application::builder()

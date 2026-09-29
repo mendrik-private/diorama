@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,7 +14,7 @@ use crate::error::{AppError, Result};
 use crate::tools::{
     crop::CropBounds,
     python_runtime, selection,
-    worker_process::{self, Launch, RuntimeConfiguration},
+    worker_process::{self, InferenceGate, Launch, RuntimeConfiguration},
 };
 
 const WORKER: &str = include_str!("lama_worker.py");
@@ -27,6 +28,7 @@ struct Runtime {
     temporary_root: PathBuf,
     host_library_path: Option<String>,
     bundled: bool,
+    inference: Arc<InferenceGate>,
 }
 
 impl Runtime {
@@ -56,6 +58,7 @@ impl Runtime {
             temporary_root: cache.join("diorama/inpainting"),
             host_library_path: configuration.library_path,
             bundled,
+            inference: worker_process::shared_inference_gate(),
         })
     }
 }
@@ -207,7 +210,7 @@ fn run_lama(
     runtime: &Runtime,
 ) -> Result<RgbaImage> {
     // Bound concurrent model memory even when several windows prepare cutouts.
-    let _permit = worker_process::inference_permit(cancellation)?;
+    let _permit = runtime.inference.permit(cancellation)?;
     if !runtime.model.is_file() {
         return Err(AppError::Inpainting(
             "LaMa model is missing. Run python3 build-aux/setup-lama.py or set DIORAMA_LAMA_MODEL"
@@ -338,6 +341,8 @@ mod tests {
             temporary_root: root.join("cache with spaces"),
             host_library_path: None,
             bundled: false,
+            // Each test serializes only its own runs.
+            inference: Arc::default(),
         }
     }
 
@@ -401,6 +406,7 @@ mod tests {
             temporary_root: PathBuf::from("/host/cache/diorama/inpainting"),
             host_library_path: Some("/host/lib with spaces:/host/rocm/lib".into()),
             bundled: false,
+            inference: Arc::default(),
         };
         let command = lama_command(
             &runtime,
@@ -604,7 +610,10 @@ mod tests {
         let mut runtime = fake_runtime(root.path(), "exec sleep 60");
         runtime.timeout = Duration::from_millis(50);
         let image = RgbaImage::from_pixel(10, 8, Rgba([90, 80, 70, 255]));
-        let held = worker_process::inference_permit(&CancellationToken::default()).unwrap();
+        let held = runtime
+            .inference
+            .permit(&CancellationToken::default())
+            .unwrap();
         thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 let started = Instant::now();
@@ -632,7 +641,10 @@ mod tests {
             assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
         });
         let cancelled = CancellationToken::default();
-        let held = worker_process::inference_permit(&CancellationToken::default()).unwrap();
+        let held = runtime
+            .inference
+            .permit(&CancellationToken::default())
+            .unwrap();
         thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 clean_background_with_runtime(&image, bounds(), &mask(), &cancelled, Some(&runtime))

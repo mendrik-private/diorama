@@ -13,6 +13,7 @@
 //! runtime estimate.
 mod estimate;
 mod progress;
+mod resident;
 
 use std::{
     fs::{self, File},
@@ -27,11 +28,12 @@ use sha2::{Digest, Sha256};
 use crate::{
     document::CancellationToken,
     error::{AppError, Result},
-    tools::worker_process::{self, Launch, RuntimeConfiguration, StdoutLines},
+    tools::worker_process::{self, InferenceGate, Launch, RuntimeConfiguration, StdoutLines},
 };
 use estimate::Calibration;
 pub use progress::Progress;
 use progress::{Tracker, WorkerEvent};
+use resident::{Job, RESIDENCY, Residency};
 
 const WORKER: &str = include_str!("line_art_worker.py");
 const MODEL_DIRECTORY: &str = "diorama/flux2-klein-9b";
@@ -112,7 +114,7 @@ const RECIPE: Recipe = Recipe {
     fill_seed: 0,
     text_encoder_layers: "9,18,27",
     max_sequence_length: 512,
-    steps: 4,
+    steps: 1,
     guidance: "1.0",
 };
 
@@ -132,6 +134,9 @@ struct Runtime {
     launch: Launch,
     host_library_path: Option<String>,
     timeout: Duration,
+    cancel_grace: Duration,
+    idle_timeout: Duration,
+    inference: std::sync::Arc<InferenceGate>,
 }
 
 /// Generate the line art and fill for `target` (at most the source size).
@@ -148,21 +153,100 @@ pub fn generate(
     progress: &dyn Fn(Progress),
 ) -> Result<LineArtPair> {
     cancellation.check()?;
-    let cache = worker_process::cache_home()
+    generate_in(
+        source,
+        target,
+        cancellation,
+        &cache_directory()?,
+        Runtime::from_environment,
+        &RESIDENCY,
+        progress,
+    )
+}
+
+/// Keep the generation worker loaded (`true`) while Game Asset work is
+/// expected, or unload it (`false`). Returns at once: starting and stopping
+/// happen in the background, and a worker that cannot start only logs,
+/// since the error surfaces when generating.
+pub fn set_warm(warm: bool) {
+    #[cfg(not(test))]
+    let start = || Ok((Runtime::from_environment()?, cache_directory()?));
+    // Tests never load the real model in the background; one that wants a
+    // resident worker installs a fake one.
+    #[cfg(test)]
+    let start = fake_worker::runtime;
+    RESIDENCY.set_warm(warm, start);
+}
+
+/// Keep the real worker loaded between jobs (`true`), or stop it; for the
+/// opt-in tests with the real model, since [`set_warm`] never starts it in
+/// tests.
+#[cfg(test)]
+pub(crate) fn keep_real_worker_warm(warm: bool) {
+    RESIDENCY.set_keep_warm(warm);
+    if !warm {
+        RESIDENCY.reconcile(|| unreachable!("stopping resolves no runtime"));
+    }
+}
+
+/// A fake worker installation for tests of the resident worker's
+/// lifecycle.
+#[cfg(test)]
+pub(crate) mod fake_worker {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// Install `script` as the interpreter, with a verified fake model, in
+    /// `root`, and make [`set_warm`] start it.
+    pub(crate) fn install(root: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let python = root.join("python");
+        fs::write(&python, script).unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+        let model = root.join("model");
+        fs::create_dir_all(&model).unwrap();
+        fs::write(model.join("model_index.json"), "{}").unwrap();
+        fs::write(model.join(REVISION_MARKER), RECIPE.revision).unwrap();
+        let gguf = root.join(GGUF_FILE);
+        File::create(&gguf).unwrap().set_len(GGUF_SIZE).unwrap();
+        fs::write(gguf.with_file_name(GGUF_MARKER), RECIPE.gguf_sha256).unwrap();
+        *ROOT.lock().unwrap() = Some(root.to_owned());
+    }
+
+    pub(super) fn runtime() -> Result<(Runtime, PathBuf)> {
+        let root = ROOT
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| AppError::SketchGeneration("no fake worker installed".into()))?;
+        Ok((
+            Runtime {
+                python: root.join("python"),
+                model: root.join("model"),
+                gguf: root.join(GGUF_FILE),
+                device: None,
+                launch: Launch::Direct,
+                host_library_path: None,
+                timeout: TIMEOUT,
+                cancel_grace: resident::CANCEL_GRACE,
+                idle_timeout: resident::IDLE_TIMEOUT,
+                inference: std::sync::Arc::default(),
+            },
+            root.join("cache"),
+        ))
+    }
+}
+
+fn cache_directory() -> Result<PathBuf> {
+    Ok(worker_process::cache_home()
         .ok_or_else(|| {
             AppError::SketchGeneration(
                 "HOME is unavailable; cannot locate the line-art cache".into(),
             )
         })?
-        .join("diorama/line-art");
-    generate_in(
-        source,
-        target,
-        cancellation,
-        &cache,
-        Runtime::from_environment,
-        progress,
-    )
+        .join("diorama/line-art"))
 }
 
 impl Runtime {
@@ -217,6 +301,9 @@ impl Runtime {
             launch,
             host_library_path: configuration.library_path,
             timeout: TIMEOUT,
+            cancel_grace: resident::CANCEL_GRACE,
+            idle_timeout: resident::IDLE_TIMEOUT,
+            inference: worker_process::shared_inference_gate(),
         })
     }
 }
@@ -230,6 +317,7 @@ fn generate_in(
     cancellation: &CancellationToken,
     cache: &Path,
     runtime: impl FnOnce() -> Result<Runtime>,
+    residency: &Residency,
     progress: &dyn Fn(Progress),
 ) -> Result<LineArtPair> {
     let plan = plan(target)?;
@@ -251,7 +339,14 @@ fn generate_in(
         touch_cached(cache, &key);
         cached
     } else {
-        let generated = run_worker(&reference, cancellation, &runtime()?, cache, progress)?;
+        let generated = run_worker(
+            &reference,
+            cancellation,
+            &runtime()?,
+            cache,
+            residency,
+            progress,
+        )?;
         check_line_art(&generated.line_art, &reference, cancellation)?;
         cancellation.check()?;
         match store_cached(cache, &key, &generated) {
@@ -586,81 +681,84 @@ fn run_worker(
     cancellation: &CancellationToken,
     runtime: &Runtime,
     cache: &Path,
+    residency: &Residency,
     progress: &dyn Fn(Progress),
 ) -> Result<LineArtPair> {
     verify_model(&runtime.model)?;
     verify_gguf(&runtime.gguf)?;
     // Another window may be running a model that takes minutes; only
     // cancellation ends the wait.
-    let _permit = worker_process::inference_permit(cancellation)?;
+    let _permit = runtime.inference.permit(cancellation)?;
     fs::create_dir_all(cache)?;
     // The app cache is host-visible for Flatpak workers while private /tmp is
-    // not. TempDir removes the input, worker, logs, and outputs together.
+    // not. TempDir removes the input, the encoder's files and the outputs.
     let directory = tempfile::Builder::new().prefix(".run-").tempdir_in(cache)?;
     let input = directory.path().join("reference.png");
-    let worker = directory.path().join("line_art_worker.py");
-    let outputs = WorkerOutputs {
-        line_art: directory.path().join("line-art.png"),
-        fill: directory.path().join("fill.png"),
-        line_art_embeds: prompt_embeds_path(&runtime.model, &RECIPE, RECIPE.line_art_prompt),
-        fill_embeds: prompt_embeds_path(&runtime.model, &RECIPE, RECIPE.fill_prompt),
-    };
+    let (line_art, fill) = (
+        directory.path().join("line-art.png"),
+        directory.path().join("fill.png"),
+    );
+    let line_art_embeds = prompt_embeds_path(&runtime.model, &RECIPE, RECIPE.line_art_prompt);
+    let fill_embeds = prompt_embeds_path(&runtime.model, &RECIPE, RECIPE.fill_prompt);
     reference.save(&input)?;
-    fs::write(&worker, WORKER)?;
     cancellation.check()?;
 
     let size = reference.dimensions();
-    let missing = [
-        (RECIPE.line_art_prompt, &outputs.line_art_embeds),
-        (RECIPE.fill_prompt, &outputs.fill_embeds),
-    ]
-    .into_iter()
-    .filter(|(_, path)| !path.is_file())
-    .collect::<Vec<_>>();
     let calibration = Calibration::load(cache);
     let started = Instant::now();
-    let mut tracker = Tracker::new(
+    let job = Job {
+        reference: &input,
         size,
-        RECIPE.steps,
-        missing.len() as u32,
-        calibration,
-        started,
-    );
-    progress(tracker.progress(started));
-    // The text encoder's memory must be returned before the transformer
-    // loads, so encoding is a process of its own.
-    if !missing.is_empty() {
-        let log = directory.path().join("encode.log");
-        run_process(
-            &mut encode_command(runtime, &worker, &missing),
-            &log,
-            runtime,
-            cancellation,
-            &mut tracker,
-            progress,
-        )?;
-        if let Some((_, path)) = missing.iter().find(|(_, path)| !path.is_file()) {
-            return Err(AppError::SketchGeneration(format!(
-                "The prompt encoder wrote no embeddings to {}: {}",
-                path.display(),
-                worker_process::log_tail(&log)
-            )));
+        line_art: &line_art,
+        fill: &fill,
+        line_art_embeds: &line_art_embeds,
+        fill_embeds: &fill_embeds,
+    };
+    let tracker = residency.run(runtime, cache, &job, cancellation, progress, |start| {
+        let missing = [
+            (RECIPE.line_art_prompt, &line_art_embeds),
+            (RECIPE.fill_prompt, &fill_embeds),
+        ]
+        .into_iter()
+        .filter(|(_, path)| !path.is_file())
+        .collect::<Vec<_>>();
+        let mut tracker = Tracker::new(
+            size,
+            RECIPE.steps,
+            missing.len() as u32,
+            start,
+            calibration,
+            started,
+        );
+        progress(tracker.progress(started));
+        // The text encoder's memory must be returned before a worker loads
+        // the transformer, so encoding is a one-shot process of its own.
+        if !missing.is_empty() {
+            let worker = directory.path().join("line_art_worker.py");
+            fs::write(&worker, WORKER)?;
+            let log = directory.path().join("encode.log");
+            run_process(
+                &mut encode_command(runtime, &worker, &missing),
+                &log,
+                runtime,
+                cancellation,
+                &mut tracker,
+                progress,
+            )?;
+            if let Some((_, path)) = missing.iter().find(|(_, path)| !path.is_file()) {
+                return Err(AppError::SketchGeneration(format!(
+                    "The prompt encoder wrote no embeddings to {}: {}",
+                    path.display(),
+                    worker_process::log_tail(&log)
+                )));
+            }
         }
-    }
-    let log = directory.path().join("line-art.log");
-    run_process(
-        &mut worker_command(runtime, &worker, &input, size, &outputs),
-        &log,
-        runtime,
-        cancellation,
-        &mut tracker,
-        progress,
-    )?;
+        Ok(tracker)
+    })?;
     let read = |path: &Path| {
         let image = image::open(path).map_err(|error| {
             AppError::SketchGeneration(format!(
-                "The line-art worker wrote no readable image ({error}): {}",
-                worker_process::log_tail(&log)
+                "The line-art worker wrote no readable image: {error}"
             ))
         })?;
         if image.width() != size.0 || image.height() != size.1 {
@@ -675,14 +773,12 @@ fn run_worker(
         Ok(image)
     };
     let pair = LineArtPair {
-        line_art: read(&outputs.line_art)?.into_luma8(),
-        fill: read(&outputs.fill)?.into_rgb8(),
+        line_art: read(&line_art)?.into_luma8(),
+        fill: read(&fill)?.into_rgb8(),
     };
+    let mut tracker = tracker;
     calibration
-        .updated(
-            started.elapsed(),
-            estimate::estimate(size, tracker.prompts_encoded()),
-        )
+        .updated(started.elapsed(), tracker.predicted())
         .store(cache);
     progress(tracker.progress(Instant::now()));
     Ok(pair)
@@ -704,6 +800,8 @@ fn run_process(
             runtime.python.display()
         ))
     })?;
+    // The encoder reads no requests.
+    drop(child.stdin.take());
     let lines = StdoutLines::take(&mut child).expect("the worker's stdout is piped");
     let mut reported = Instant::now();
     let status = worker_process::wait_with(
@@ -759,14 +857,6 @@ fn observe(tracker: &mut Tracker, line: &str, now: Instant) -> bool {
     }
 }
 
-/// The generation's output images and the prompts' cached embeddings.
-struct WorkerOutputs {
-    line_art: PathBuf,
-    fill: PathBuf,
-    line_art_embeds: PathBuf,
-    fill_embeds: PathBuf,
-}
-
 /// Encode `prompts` into their embedding files, on the CPU.
 fn encode_command(runtime: &Runtime, worker: &Path, prompts: &[(&str, &PathBuf)]) -> Command {
     let mut command = runtime
@@ -783,50 +873,6 @@ fn encode_command(runtime: &Runtime, worker: &Path, prompts: &[(&str, &PathBuf)]
         .arg(RECIPE.max_sequence_length.to_string());
     for (prompt, path) in prompts {
         command.arg("--prompt-embeds").arg(prompt).arg(path);
-    }
-    command
-}
-
-fn worker_command(
-    runtime: &Runtime,
-    worker: &Path,
-    input: &Path,
-    (width, height): (u32, u32),
-    outputs: &WorkerOutputs,
-) -> Command {
-    let mut command = runtime
-        .launch
-        .command(&runtime.python, runtime.host_library_path.as_deref());
-    command
-        .arg(worker)
-        .arg("--model")
-        .arg(&runtime.model)
-        .arg("--gguf")
-        .arg(&runtime.gguf)
-        .arg("--image")
-        .arg(input)
-        .arg("--width")
-        .arg(width.to_string())
-        .arg("--height")
-        .arg(height.to_string())
-        .arg("--line-art-embeds")
-        .arg(&outputs.line_art_embeds)
-        .arg("--line-art-seed")
-        .arg(RECIPE.line_art_seed.to_string())
-        .arg("--line-art-output")
-        .arg(&outputs.line_art)
-        .arg("--fill-embeds")
-        .arg(&outputs.fill_embeds)
-        .arg("--fill-seed")
-        .arg(RECIPE.fill_seed.to_string())
-        .arg("--fill-output")
-        .arg(&outputs.fill)
-        .arg("--steps")
-        .arg(RECIPE.steps.to_string())
-        .arg("--guidance")
-        .arg(RECIPE.guidance);
-    if let Some(device) = &runtime.device {
-        command.arg("--device").arg(device);
     }
     command
 }
@@ -1071,6 +1117,27 @@ mod tests {
     }
 
     fn no_progress(_: Progress) {}
+
+    /// Generate with a resident worker of its own that is not kept warm, so
+    /// every run starts and stops a worker.
+    fn generate_in(
+        source: &RgbaImage,
+        target: (u32, u32),
+        cancellation: &CancellationToken,
+        cache: &Path,
+        runtime: impl FnOnce() -> Result<Runtime>,
+        progress: &dyn Fn(Progress),
+    ) -> Result<LineArtPair> {
+        super::generate_in(
+            source,
+            target,
+            cancellation,
+            cache,
+            runtime,
+            &Residency::default(),
+            progress,
+        )
+    }
 
     /// A white canvas with an off-centre filled disc and a rotated square,
     /// so displaced or mirrored outlines cannot coincide with the shapes.
@@ -1385,6 +1452,9 @@ mod tests {
             },
             host_library_path: Some("/opt/rocm/lib:/host/lib with spaces".into()),
             timeout: TIMEOUT,
+            cancel_grace: resident::CANCEL_GRACE,
+            idle_timeout: resident::IDLE_TIMEOUT,
+            inference: std::sync::Arc::default(),
         };
         let arguments = |command: &Command| {
             command
@@ -1392,19 +1462,7 @@ mod tests {
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
         };
-        let outputs = WorkerOutputs {
-            line_art: PathBuf::from("/cache/run/line art.png"),
-            fill: PathBuf::from("/cache/run/fill.png"),
-            line_art_embeds: PathBuf::from("/host/cache/diorama/flux2 klein/.l.safetensors"),
-            fill_embeds: PathBuf::from("/host/cache/diorama/flux2 klein/.f.safetensors"),
-        };
-        let command = worker_command(
-            &runtime,
-            Path::new("/cache/run/line_art_worker.py"),
-            Path::new("/cache/run/reference image.png"),
-            (176, 256),
-            &outputs,
-        );
+        let command = resident::serve_command(&runtime, Path::new("/cache/run/line_art_worker.py"));
         assert_eq!(
             command.get_program(),
             Path::new("/sandbox/bin/flatpak-spawn")
@@ -1419,32 +1477,13 @@ mod tests {
                 "--env=LD_LIBRARY_PATH=/opt/rocm/lib:/host/lib with spaces",
                 "/host/line art/venv/bin/python",
                 "/cache/run/line_art_worker.py",
+                "--serve",
                 "--model",
                 "/host/cache/diorama/flux2 klein",
                 "--gguf",
                 "/host/cache/diorama/gguf/q4 k m.gguf",
-                "--image",
-                "/cache/run/reference image.png",
-                "--width",
-                "176",
-                "--height",
-                "256",
-                "--line-art-embeds",
-                "/host/cache/diorama/flux2 klein/.l.safetensors",
-                "--line-art-seed",
-                "0",
-                "--line-art-output",
-                "/cache/run/line art.png",
-                "--fill-embeds",
-                "/host/cache/diorama/flux2 klein/.f.safetensors",
-                "--fill-seed",
-                "0",
-                "--fill-output",
-                "/cache/run/fill.png",
-                "--steps",
-                "4",
-                "--guidance",
-                "1.0",
+                "--idle-timeout",
+                "600",
             ]
         );
         let runtime = Runtime {
@@ -1452,13 +1491,7 @@ mod tests {
             launch: Launch::Direct,
             ..runtime
         };
-        let command = worker_command(
-            &runtime,
-            Path::new("/w.py"),
-            Path::new("/i.png"),
-            (64, 64),
-            &outputs,
-        );
+        let command = resident::serve_command(&runtime, Path::new("/w.py"));
         assert_eq!(command.get_program(), runtime.python.as_os_str());
         assert_eq!(arguments(&command).last().map(String::as_str), Some("cpu"));
         // Encoding passes each prompt with its embedding file, and the
@@ -1535,33 +1568,44 @@ mod tests {
     mod worker {
         use super::*;
 
-        /// Emitted by the fake worker between library noise, as the real
-        /// worker does for one run.
-        const EVENTS: &str = r#"echo 'Loading pipeline components...: 100%'
-echo '{"event": "stage", "stage": "load"}'
+        /// The real worker's start: loading, then ready for jobs.
+        const READY: &str = r#"echo '{"event": "stage", "stage": "load"}'
+echo '{"event": "ready"}'"#;
+        /// One job's events between library noise, as the real worker
+        /// writes them.
+        const JOB_EVENTS: &str = r#"echo 'Loading pipeline components...: 100%'
 for image in line_art fill; do
-  for step in 1 2 3 4; do
-    echo "{\"event\": \"step\", \"image\": \"$image\", \"step\": $step, \"steps\": 4, \"elapsed\": 0.0$step}"
-    echo 'not json {'
-  done
-  echo "{\"event\": \"stage\", \"stage\": \"decode\", \"image\": \"$image\"}"
+  echo "{\"event\": \"step\", \"job\": $job, \"image\": \"$image\", \"step\": 1, \"steps\": 1, \"elapsed\": 0.01}"
+  echo 'not json {'
+  echo "{\"event\": \"stage\", \"stage\": \"decode\", \"job\": $job, \"image\": \"$image\"}"
 done"#;
-        const COPY_RESULTS: &str = r#"cp "$dir/line-art.png" "$line_art" && cp "$dir/fill.png" "$fill" || exit 1
-echo '{"event": "done"}'"#;
+        const COPY_RESULTS: &str = r#"if cp "$dir/line-art.png" "$line_art" && cp "$dir/fill.png" "$fill"; then
+  echo "{\"event\": \"done\", \"job\": $job}"
+else
+  echo "{\"event\": \"error\", \"job\": $job, \"message\": \"no results\"}"
+fi"#;
 
-        /// A fake interpreter that records each launch's mode, parses the
-        /// output arguments, then runs `body` to generate. In encode mode it
-        /// records each prompt, writes its embedding file if
-        /// `writes_embeddings`, and reports the stage.
-        fn fake_runtime_with(root: &Path, writes_embeddings: bool, body: &str) -> Runtime {
+        /// A fake interpreter. It records each launch's mode in `launches`
+        /// and, in encode mode, each prompt in `encoded`, writing its
+        /// embedding file if `writes_embeddings`. In serve mode it runs
+        /// `start`, then `job` for each job line on stdin with `$job`,
+        /// `$line_art` and `$fill` set, recording job ids in `jobs` and
+        /// cancel requests in `cancels`, and records `stopped` when stdin
+        /// closes.
+        fn fake_runtime_with(
+            root: &Path,
+            writes_embeddings: bool,
+            start: &str,
+            job: &str,
+        ) -> Runtime {
             let python = root.join("python");
             let write = u8::from(writes_embeddings);
             worker_process::write_test_executable(
                 &python,
                 &format!(
-                    r#"#!/bin/sh
+                    r#"#!/bin/bash
 dir="$(dirname "$0")"
-mode=generate
+mode=serve
 prompts=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1571,8 +1615,6 @@ while [ $# -gt 0 ]; do
       prompts=$((prompts + 1))
       if [ {write} = 1 ]; then echo embeddings > "$3"; fi
       shift 2 ;;
-    --line-art-output) line_art="$2" ;;
-    --fill-output) fill="$2" ;;
   esac
   shift
 done
@@ -1581,7 +1623,18 @@ if [ "$mode" = encode ]; then
   echo "{{\"event\": \"stage\", \"stage\": \"encode\", \"prompts\": $prompts}}"
   exit 0
 fi
-{body}
+{start}
+while IFS= read -r request; do
+  case "$request" in
+    *'"cancel"'*) echo "$request" >> "$dir/cancels"; continue ;;
+  esac
+  job=$(sed -n 's/.*"job": \([0-9]*\),.*/\1/p' <<< "$request")
+  line_art=$(sed -n 's/.*"line_art_output": "\([^"]*\)".*/\1/p' <<< "$request")
+  fill=$(sed -n 's/.*"fill_output": "\([^"]*\)".*/\1/p' <<< "$request")
+  echo "$job" >> "$dir/jobs"
+  {job}
+done
+echo stopped >> "$dir/launches"
 "#
                 ),
             );
@@ -1601,12 +1654,16 @@ fi
                 launch: Launch::Direct,
                 host_library_path: None,
                 timeout: Duration::from_secs(10),
+                cancel_grace: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(60),
+                // Each test serializes only its own runs.
+                inference: std::sync::Arc::default(),
             }
         }
 
         /// A fake runtime whose prompts are already encoded.
-        fn fake_runtime(root: &Path, body: &str) -> Runtime {
-            let runtime = fake_runtime_with(root, true, body);
+        fn fake_runtime(root: &Path, start: &str, job: &str) -> Runtime {
+            let runtime = fake_runtime_with(root, true, start, job);
             for prompt in [RECIPE.line_art_prompt, RECIPE.fill_prompt] {
                 fs::write(
                     prompt_embeds_path(&runtime.model, &RECIPE, prompt),
@@ -1618,7 +1675,7 @@ fi
         }
 
         fn succeeding(root: &Path) -> Runtime {
-            fake_runtime(root, &format!("{EVENTS}\n{COPY_RESULTS}"))
+            fake_runtime(root, READY, &format!("{JOB_EVENTS}\n{COPY_RESULTS}"))
         }
 
         /// The fake worker's results for `target`: line art tracing
@@ -1640,9 +1697,10 @@ fi
             cache_key(&RECIPE, &reference(source, size, &token()).unwrap())
         }
 
+        /// Worker processes started so far.
         fn launches(root: &Path) -> usize {
             fs::read_to_string(root.join("launches"))
-                .map(|log| log.lines().count())
+                .map(|log| log.lines().filter(|line| *line != "stopped").count())
                 .unwrap_or(0)
         }
 
@@ -1772,7 +1830,8 @@ fi
                 Ok(fake_runtime_with(
                     root.path(),
                     true,
-                    &format!("{EVENTS}\n{COPY_RESULTS}"),
+                    READY,
+                    &format!("{JOB_EVENTS}\n{COPY_RESULTS}"),
                 ))
             };
             let reported = RefCell::new(Vec::new());
@@ -1786,7 +1845,7 @@ fi
             )
             .unwrap();
             let read = |name| fs::read_to_string(root.path().join(name)).unwrap();
-            assert_eq!(read("launches"), "encode\ngenerate\n");
+            assert_eq!(read("launches"), "encode\nserve\nstopped\n");
             assert_eq!(
                 read("encoded"),
                 format!("{}\n{}\n", RECIPE.line_art_prompt, RECIPE.fill_prompt)
@@ -1797,7 +1856,10 @@ fi
             }
             // The first estimate includes the encoding process.
             let reported = reported.into_inner();
-            assert_eq!(reported[0].remaining, estimate::estimate((512, 512), 2));
+            assert_eq!(
+                reported[0].remaining,
+                estimate::estimate((512, 512), 2, estimate::cold_start_seconds(), true)
+            );
             assert_eq!(reported.last().unwrap().fraction, 1.);
 
             // Cached embeddings are not encoded again; only a missing one is.
@@ -1814,7 +1876,7 @@ fi
                 &no_progress,
             )
             .unwrap();
-            assert_eq!(read("launches"), "encode\ngenerate\ngenerate\n");
+            assert_eq!(read("launches"), "encode\nserve\nstopped\nserve\nstopped\n");
             fs::remove_file(prompt_embeds_path(&model, &RECIPE, RECIPE.fill_prompt)).unwrap();
             changed.put_pixel(300, 300, Rgba([0, 0, 0, 255]));
             for (x, y) in (100..140).flat_map(|x| (100..140).map(move |y| (x, y))) {
@@ -1831,7 +1893,7 @@ fi
             .unwrap();
             assert_eq!(
                 read("launches"),
-                "encode\ngenerate\ngenerate\nencode\ngenerate\n"
+                "encode\nserve\nstopped\nserve\nstopped\nencode\nserve\nstopped\n"
             );
             assert!(read("encoded").ends_with(&format!("{}\n", RECIPE.fill_prompt)));
             assert_eq!(read("encoded").lines().count(), 3);
@@ -1845,7 +1907,7 @@ fi
                 (64, 64),
                 &token(),
                 &root.path().join("cache"),
-                || Ok(fake_runtime_with(root.path(), false, "exit 9")),
+                || Ok(fake_runtime_with(root.path(), false, READY, "")),
                 &no_progress,
             )
             .unwrap_err();
@@ -2074,6 +2136,7 @@ fi
                     Ok(fake_runtime(
                         root.path(),
                         "echo 'RuntimeError: HIP out of memory' >&2; exit 7",
+                        "",
                     ))
                 },
                 &no_progress,
@@ -2129,7 +2192,10 @@ fi
                 || {
                     Ok(fake_runtime(
                         root.path(),
-                        &format!("{EVENTS}\necho failure >&2"),
+                        READY,
+                        &format!(
+                            "{JOB_EVENTS}\necho \"{{\\\"event\\\": \\\"done\\\", \\\"job\\\": $job}}\""
+                        ),
                     ))
                 },
                 &no_progress,
@@ -2168,50 +2234,72 @@ fi
             assert!(run(runtime).contains("Could not start"));
         }
 
-        #[test]
-        fn cancellation_mid_stream_kills_the_worker_and_leaves_no_files() {
-            let root = tempfile::tempdir().unwrap();
-            let cache = root.path().join("cache");
-            let runtime = fake_runtime(
-                root.path(),
-                r#"echo '{"event": "stage", "stage": "load"}'
-echo '{"event": "step", "image": "line_art", "step": 1, "steps": 4, "elapsed": 0.5}'
-exec sleep 60"#,
-            );
-            let source = shapes(64);
+        /// A job that reports its first step, then ignores stdin.
+        const STALLING_JOB: &str = r#"echo "{\"event\": \"step\", \"job\": $job, \"image\": \"line_art\", \"step\": 1, \"steps\": 1, \"elapsed\": 0.5}"
+sleep 60"#;
+        /// A job that reports its first step, then stops when its cancel
+        /// request arrives.
+        const CANCELLABLE_JOB: &str = r#"echo "{\"event\": \"step\", \"job\": $job, \"image\": \"line_art\", \"step\": 1, \"steps\": 1, \"elapsed\": 0.5}"
+IFS= read -r request
+echo "$request" >> "$dir/cancels"
+echo "{\"event\": \"cancelled\", \"job\": $job}""#;
+
+        /// Generate in a thread and cancel once the first step arrived.
+        fn cancel_after_first_step(
+            source: &RgbaImage,
+            cache: &Path,
+            runtime: Runtime,
+            residency: &Residency,
+        ) -> Result<LineArtPair> {
             let cancellation = token();
-            let steps = std::sync::atomic::AtomicUsize::new(0);
-            let begun = Instant::now();
+            let stepped = std::sync::atomic::AtomicBool::new(false);
             thread::scope(|scope| {
                 let worker = scope.spawn(|| {
-                    generate_in(
-                        &source,
-                        (64, 64),
+                    super::super::generate_in(
+                        source,
+                        (512, 512),
                         &cancellation,
-                        &cache,
+                        cache,
                         || Ok(runtime),
+                        residency,
                         &|progress| {
                             // The first step's estimate replaces the initial one.
                             if progress.fraction > 0. {
-                                steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                stepped.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         },
                     )
                 });
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while steps.load(std::sync::atomic::Ordering::Relaxed) == 0
+                while !stepped.load(std::sync::atomic::Ordering::Relaxed)
                     && Instant::now() < deadline
                 {
                     thread::sleep(Duration::from_millis(5));
                 }
                 assert!(
-                    steps.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                    stepped.load(std::sync::atomic::Ordering::Relaxed),
                     "progress streamed"
                 );
                 cancellation.cancel();
-                assert!(matches!(worker.join().unwrap(), Err(AppError::Cancelled)));
-            });
-            assert!(begun.elapsed() < Duration::from_secs(30));
+                let begun = Instant::now();
+                let result = worker.join().unwrap();
+                assert!(
+                    begun.elapsed() < Duration::from_secs(2),
+                    "cancel returns at once"
+                );
+                result
+            })
+        }
+
+        #[test]
+        fn cancellation_returns_at_once_and_stops_a_worker_that_is_not_kept_warm() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            let runtime = fake_runtime(root.path(), READY, STALLING_JOB);
+            let result = cancel_after_first_step(&shapes(600), &cache, runtime, &residency);
+            assert!(matches!(result, Err(AppError::Cancelled)));
+            assert!(!residency.is_running());
             assert!(
                 cache_entries(&cache).is_empty(),
                 "{:?}",
@@ -2219,10 +2307,276 @@ exec sleep 60"#,
             );
         }
 
+        fn warm(residency: &Residency) {
+            residency.set_keep_warm(true);
+        }
+
+        #[test]
+        fn a_warm_worker_runs_later_jobs_without_starting_again() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            warm(&residency);
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (512, 512));
+            let run = |source: &RgbaImage| {
+                let reported = RefCell::new(Vec::new());
+                super::super::generate_in(
+                    source,
+                    (512, 512),
+                    &token(),
+                    &cache,
+                    || Ok(succeeding(root.path())),
+                    &residency,
+                    &|progress| reported.borrow_mut().push(progress),
+                )
+                .unwrap();
+                reported.into_inner()
+            };
+            let cold = run(&source);
+            assert_eq!(
+                cold[0].remaining,
+                estimate::estimate((512, 512), 0, estimate::cold_start_seconds(), true)
+            );
+            let mut changed = source.clone();
+            for (x, y) in (0..40).flat_map(|x| (0..40).map(move |y| (x, y))) {
+                changed.put_pixel(x, y, Rgba([200, 30, 30, 255]));
+            }
+            // The worker is ready: no start-up in the estimate, which the
+            // fast first run calibrated.
+            let factor = Calibration::load(&cache).factor();
+            let warm = run(&changed);
+            // Same size as before: no warm-up either.
+            let expected = factor * estimate::estimate((512, 512), 0, 0., false).as_secs_f64();
+            assert!((warm[0].remaining.as_secs_f64() - expected).abs() < 1e-6);
+            let read = |name| fs::read_to_string(root.path().join(name)).unwrap();
+            assert_eq!(read("launches"), "serve\n");
+            assert_eq!(read("jobs"), "1\n2\n");
+            assert!(residency.is_running());
+            // No longer kept warm: the worker stops.
+            residency.set_keep_warm(false);
+            residency.reconcile(|| panic!("stopping resolves no runtime"));
+            assert_eq!(read("launches"), "serve\nstopped\n");
+            assert!(!residency.is_running());
+        }
+
+        #[test]
+        fn a_reported_failure_keeps_the_worker_and_a_crash_restarts_it() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            warm(&residency);
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (512, 512));
+            // Job 1 fails, job 2 crashes the worker, job 3 succeeds.
+            let job = format!(
+                r#"case "$job" in
+  1) echo "{{\"event\": \"error\", \"job\": $job, \"message\": \"ValueError: bad input\"}}" ;;
+  2) echo 'Segmentation fault' >&2; exit 139 ;;
+  *) {JOB_EVENTS}
+     {COPY_RESULTS} ;;
+esac"#
+            );
+            let runtime = || Ok(fake_runtime(root.path(), READY, &job));
+            let run = |source: &RgbaImage| {
+                super::super::generate_in(
+                    source,
+                    (512, 512),
+                    &token(),
+                    &cache,
+                    runtime,
+                    &residency,
+                    &no_progress,
+                )
+            };
+            let error = run(&source).unwrap_err().to_string();
+            assert!(error.contains("ValueError: bad input"), "{error}");
+            assert!(
+                residency.is_running(),
+                "a reported failure keeps the worker"
+            );
+            let error = run(&source).unwrap_err().to_string();
+            assert!(
+                error.contains("stopped") && error.contains("Segmentation fault"),
+                "{error}"
+            );
+            assert!(!residency.is_running());
+            // The next job starts a fresh worker, whose first job is job 1
+            // again: make it succeed by changing the pixels' job numbering.
+            fs::write(root.path().join("jobs"), "").unwrap();
+            let succeeding_job = format!("{JOB_EVENTS}\n{COPY_RESULTS}");
+            let runtime = || Ok(fake_runtime(root.path(), READY, &succeeding_job));
+            super::super::generate_in(
+                &source,
+                (512, 512),
+                &token(),
+                &cache,
+                runtime,
+                &residency,
+                &no_progress,
+            )
+            .unwrap();
+            assert_eq!(launches(root.path()), 2);
+        }
+
+        #[test]
+        fn a_cancelled_job_is_awaited_before_the_next_on_the_same_worker() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            warm(&residency);
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (512, 512));
+            let job = format!(
+                r#"if [ "$job" = 1 ]; then
+  {CANCELLABLE_JOB}
+else
+  {JOB_EVENTS}
+  {COPY_RESULTS}
+fi"#
+            );
+            let result = cancel_after_first_step(
+                &source,
+                &cache,
+                fake_runtime(root.path(), READY, &job),
+                &residency,
+            );
+            assert!(matches!(result, Err(AppError::Cancelled)));
+            assert!(residency.is_running(), "a warm worker survives a cancel");
+            let mut changed = source.clone();
+            changed.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
+            for (x, y) in (0..40).flat_map(|x| (0..40).map(move |y| (x, y))) {
+                changed.put_pixel(x, y, Rgba([200, 30, 30, 255]));
+            }
+            super::super::generate_in(
+                &changed,
+                (512, 512),
+                &token(),
+                &cache,
+                || Ok(fake_runtime(root.path(), READY, &job)),
+                &residency,
+                &no_progress,
+            )
+            .unwrap();
+            let read = |name| fs::read_to_string(root.path().join(name)).unwrap();
+            assert_eq!(read("cancels"), "{\"cancel\": 1}\n");
+            assert_eq!(read("jobs"), "1\n2\n");
+            assert_eq!(launches(root.path()), 1);
+        }
+
+        #[test]
+        fn an_unresponsive_cancelled_worker_is_replaced() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            warm(&residency);
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (512, 512));
+            let job = format!(
+                r#"if [ "$job" = 1 ] && [ ! -e "$dir/stalled" ]; then
+  touch "$dir/stalled"
+  {STALLING_JOB}
+else
+  {JOB_EVENTS}
+  {COPY_RESULTS}
+fi"#
+            );
+            let mut runtime = fake_runtime(root.path(), READY, &job);
+            runtime.cancel_grace = Duration::from_millis(200);
+            assert!(matches!(
+                cancel_after_first_step(&source, &cache, runtime, &residency),
+                Err(AppError::Cancelled)
+            ));
+            let begun = Instant::now();
+            super::super::generate_in(
+                &source,
+                (512, 512),
+                &token(),
+                &cache,
+                || Ok(fake_runtime(root.path(), READY, &job)),
+                &residency,
+                &no_progress,
+            )
+            .unwrap();
+            assert!(begun.elapsed() < Duration::from_secs(10));
+            assert_eq!(launches(root.path()), 2);
+        }
+
+        #[test]
+        fn a_worker_that_exited_while_idle_is_restarted_silently() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = Residency::default();
+            warm(&residency);
+            let source = shapes(600);
+            prepare_results(root.path(), &source, (512, 512));
+            // Each worker exits after one job, as on its idle timeout.
+            let job = format!("{JOB_EVENTS}\n{COPY_RESULTS}\nexit 0");
+            let run = |source: &RgbaImage| {
+                super::super::generate_in(
+                    source,
+                    (512, 512),
+                    &token(),
+                    &cache,
+                    || Ok(fake_runtime(root.path(), READY, &job)),
+                    &residency,
+                    &no_progress,
+                )
+            };
+            run(&source).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while residency.is_running() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!residency.is_running(), "the worker exited while idle");
+            let mut changed = source.clone();
+            for (x, y) in (0..40).flat_map(|x| (0..40).map(move |y| (x, y))) {
+                changed.put_pixel(x, y, Rgba([200, 30, 30, 255]));
+            }
+            run(&changed).unwrap();
+            assert_eq!(launches(root.path()), 2);
+        }
+
+        #[test]
+        fn warming_starts_a_worker_in_the_background_and_cooling_stops_it() {
+            let root = tempfile::tempdir().unwrap();
+            let cache = root.path().join("cache");
+            let residency = std::sync::Arc::new(Residency::default());
+            let path = root.path().to_owned();
+            let started = {
+                let cache = cache.clone();
+                move || Ok((succeeding(&path), cache))
+            };
+            residency.set_warm(true, started);
+            let read = || fs::read_to_string(root.path().join("launches")).unwrap_or_default();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read() != "serve\n" && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(read(), "serve\n");
+            assert!(residency.is_running());
+            residency.set_warm(false, || panic!("stopping resolves no runtime"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read() != "serve\nstopped\n" && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(read(), "serve\nstopped\n");
+            // A worker that cannot start only logs.
+            let broken = std::sync::Arc::new(Residency::default());
+            let model = root.path().join("no model");
+            broken.set_warm(true, move || {
+                let mut runtime = succeeding(&model);
+                runtime.model = model.join("missing");
+                Ok((runtime, PathBuf::from("/nonexistent")))
+            });
+            thread::sleep(Duration::from_millis(200));
+            assert!(!broken.is_running());
+        }
+
         #[test]
         fn timeout_kills_the_worker() {
             let root = tempfile::tempdir().unwrap();
-            let mut runtime = fake_runtime(root.path(), "exec sleep 60");
+            let mut runtime = fake_runtime(root.path(), "exec sleep 60", "");
             runtime.timeout = Duration::from_millis(100);
             let begun = Instant::now();
             let error = generate_in(

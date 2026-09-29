@@ -1,40 +1,41 @@
-//! Runtime estimate of one FLUX.2 [klein] 9B generation.
+//! Runtime estimate of one FLUX.2 [klein] 9B generation job.
 //!
-//! Measured on an AMD Radeon 8060S (ROCm) with the Q4_K_M transformer,
-//! 4 steps, guidance 1, the reference at the output size, per image in a warm
-//! process (the second image of a run):
+//! Measured on an AMD Radeon 8060S (ROCm) with the Q4_K_M transformer, one
+//! denoising step, guidance 1, the reference at the output size, per image
+//! in a warm resident worker:
 //!
-//! | output   | 512² | 640² | 768² | 1024² |
-//! |----------|------|------|------|-------|
-//! | s/image  | 19.6 | 27.3 | 47.4 | 86.6  |
+//! | output   | 512² | 768² | 1024²  |
+//! |----------|------|------|--------|
+//! | s/image  | 4.55 | 8.95 | ~17.5  |
 //!
-//! 512² and 768² are the means of two runs (19.5/19.7 and 51.4/43.5). The
-//! least-squares fit `68.182·MP + 14.031·MP²` (MP = megapixels of the output,
-//! no constant term, so it stays positive) has an RMS error of 1.9 s and at
-//! most 10.9% relative error (640²). A generation process adds start-up
-//! (Python and library imports), the model load, a one-time warm-up in the
-//! first image and process exit. Prompts without cached embeddings are
-//! encoded before, in a process of its own: start-up, loading the text
-//! encoder on the CPU, and each prompt.
+//! 512² and 768² are the second jobs at that size (4.5 and 4.55 s per image
+//! in two runs at 512²); 1024² is from a run the memory watchdog stopped
+//! during its last decode, with that decode estimated. The quadratic
+//! `2.054 + 7.784·MP + 6.625·MP²` (MP = megapixels of the output) passes
+//! through all three points. A job's first image at a new size also warms
+//! up. A worker that is not running yet adds its start-up (Python and
+//! library imports) and the model load; a cold 512² job took 17.35 s in all
+//! against 17.1 s predicted. Prompts without cached embeddings are encoded
+//! before, in a process of its own: start-up, loading the text encoder on
+//! the CPU, and each prompt.
 //!
 //! Machines differ, so the estimate is scaled by a persisted calibration
 //! factor: the smoothed ratio of measured to predicted run times.
 use std::{fs, path::Path, time::Duration};
 
 /// Seconds per image: `a + b·MP + c·MP²`.
-const IMAGE_SECONDS: [f64; 3] = [0., 68.182, 14.031];
-/// Images per run: line art, then the fill.
+const IMAGE_SECONDS: [f64; 3] = [2.054, 7.784, 6.625];
+/// Images per job: line art, then the fill.
 pub(super) const IMAGES: u32 = 2;
 /// Python, PyTorch and diffusers imports until a worker's first event.
 pub(super) const STARTUP_SECONDS: f64 = 4.2;
-/// GGUF transformer and VAE load, with the GGUF in the page cache.
-pub(super) const LOAD_SECONDS: f64 = 2.;
-/// Extra time of the first image: kernel selection for the new shapes.
-pub(super) const WARMUP_SECONDS: f64 = 1.7;
-/// From the worker's last event until the process has exited.
-pub(super) const EXIT_SECONDS: f64 = 0.2;
+/// GGUF transformer and VAE load, with the GGUF in the page cache (2.3–2.5
+/// s; 6.8 s when it was not).
+pub(super) const LOAD_SECONDS: f64 = 2.3;
+/// Extra time of a job's first image at a new size: kernel selection for
+/// its shapes (0.9–1.9 s).
+pub(super) const WARMUP_SECONDS: f64 = 1.5;
 /// Loading the truncated text encoder on the CPU, and encoding one prompt.
-/// Two prompts took 6.0–10.0 s after start-up, one prompt 7.2 s.
 pub(super) const ENCODER_LOAD_SECONDS: f64 = 5.;
 pub(super) const ENCODE_SECONDS_PER_PROMPT: f64 = 1.;
 
@@ -62,9 +63,22 @@ pub(super) fn encode_seconds(prompts: u32) -> f64 {
     }
 }
 
-/// Uncalibrated duration of a whole worker run generating both images at
-/// `size`, of which `prompts_to_encode` prompts have no cached embeddings.
-pub(super) fn estimate(size: (u32, u32), prompts_to_encode: u32) -> Duration {
+/// Seconds until a resident worker started now is ready for jobs.
+pub(super) fn cold_start_seconds() -> f64 {
+    STARTUP_SECONDS + LOAD_SECONDS
+}
+
+/// Uncalibrated duration of a job generating both images at `size`, of
+/// which `prompts_to_encode` prompts have no cached embeddings, with the
+/// resident worker ready after `start_up` seconds (0 when it is warm,
+/// [`cold_start_seconds`] when it must be started). `warm_up` is whether the
+/// worker has not generated at this size yet.
+pub(super) fn estimate(
+    size: (u32, u32),
+    prompts_to_encode: u32,
+    start_up: f64,
+    warm_up: bool,
+) -> Duration {
     // Encoding is a process of its own, with its own start-up.
     let encoding = if prompts_to_encode == 0 {
         0.
@@ -73,11 +87,9 @@ pub(super) fn estimate(size: (u32, u32), prompts_to_encode: u32) -> Duration {
     };
     Duration::from_secs_f64(
         encoding
-            + STARTUP_SECONDS
-            + LOAD_SECONDS
-            + WARMUP_SECONDS
-            + f64::from(IMAGES) * image_seconds(size)
-            + EXIT_SECONDS,
+            + start_up.max(0.)
+            + if warm_up { WARMUP_SECONDS } else { 0. }
+            + f64::from(IMAGES) * image_seconds(size),
     )
 }
 
@@ -147,34 +159,34 @@ impl Calibration {
 mod tests {
     use super::*;
 
-    const MEASURED: [(u32, f64); 4] = [(512, 19.6), (640, 27.3), (768, 47.4), (1024, 86.6)];
+    const MEASURED: [(u32, f64); 3] = [(512, 4.55), (768, 8.95), (1024, 17.5)];
 
     #[test]
     fn the_image_fit_matches_the_measurements() {
-        let mut squared_error = 0.;
         for (side, seconds) in MEASURED {
             let fitted = image_seconds((side, side));
             assert!(
-                (fitted - seconds).abs() / seconds < 0.11,
-                "{side}²: fitted {fitted:.2} s, measured {seconds} s"
+                (fitted - seconds).abs() < 0.01,
+                "{side}²: fitted {fitted:.3} s, measured {seconds} s"
             );
-            squared_error += (fitted - seconds).powi(2);
         }
-        let rms = (squared_error / MEASURED.len() as f64).sqrt();
-        assert!(rms < 2., "RMS error {rms:.3} s");
     }
 
     #[test]
-    fn a_run_adds_overhead_two_images_and_an_optional_encoding_process() {
-        let overhead = STARTUP_SECONDS + LOAD_SECONDS + WARMUP_SECONDS + EXIT_SECONDS;
+    fn a_job_adds_warm_up_start_up_and_an_optional_encoding_process() {
         for size in [(512, 512), (512, 2048), (1024, 1024)] {
-            let expected = overhead + 2. * image_seconds(size);
-            assert!((estimate(size, 0).as_secs_f64() - expected).abs() < 1e-6);
+            let warm = WARMUP_SECONDS + 2. * image_seconds(size);
+            assert!((estimate(size, 0, 0., true).as_secs_f64() - warm).abs() < 1e-6);
+            let cold = estimate(size, 0, cold_start_seconds(), true).as_secs_f64();
+            assert!((cold - warm - STARTUP_SECONDS - LOAD_SECONDS).abs() < 1e-6);
+            // A worker already loading only adds the rest of its start-up.
+            assert!((estimate(size, 0, 1.5, true).as_secs_f64() - warm - 1.5).abs() < 1e-6);
+            assert_eq!(estimate(size, 0, -3., true), estimate(size, 0, 0., true));
             let encoding = STARTUP_SECONDS + ENCODER_LOAD_SECONDS;
             for prompts in [1, 2] {
                 assert!(
-                    (estimate(size, prompts).as_secs_f64()
-                        - expected
+                    (estimate(size, prompts, 0., true).as_secs_f64()
+                        - warm
                         - encoding
                         - f64::from(prompts) * ENCODE_SECONDS_PER_PROMPT)
                         .abs()
@@ -183,21 +195,31 @@ mod tests {
                 );
             }
         }
-        // 512²: 8.1 s of overhead and 2 × 18.84 s.
-        assert!((estimate((512, 512), 0).as_secs_f64() - 45.78).abs() < 0.01);
+        // A worker that generated at this size already skips the warm-up.
+        assert!(
+            (estimate((512, 512), 0, 0., false).as_secs_f64() - 2. * image_seconds((512, 512)))
+                .abs()
+                < 1e-6
+        );
+        // 512²: a cold job measured 17.35 s, one at the same size in a
+        // warm worker 9.05 s.
+        assert!(
+            (estimate((512, 512), 0, cold_start_seconds(), true).as_secs_f64() - 17.1).abs() < 0.05
+        );
+        assert!((estimate((512, 512), 0, 0., false).as_secs_f64() - 9.1).abs() < 0.05);
     }
 
     #[test]
     fn the_estimate_grows_with_the_area_and_the_prompts_to_encode() {
         let mut previous = Duration::ZERO;
         for side in (16..=1024).step_by(16) {
-            let current = estimate((side, side), 0);
+            let current = estimate((side, side), 0, 0., true);
             assert!(current > previous, "{side}");
             previous = current;
         }
-        assert!(estimate((1024, 512), 0) > estimate((512, 512), 0));
-        assert!(estimate((512, 512), 1) > estimate((512, 512), 0));
-        assert!(estimate((512, 512), 2) > estimate((512, 512), 1));
+        assert!(estimate((1024, 512), 0, 0., true) > estimate((512, 512), 0, 0., true));
+        assert!(estimate((512, 512), 1, 0., true) > estimate((512, 512), 0, 0., true));
+        assert!(estimate((512, 512), 2, 0., true) > estimate((512, 512), 1, 0., true));
     }
 
     #[test]

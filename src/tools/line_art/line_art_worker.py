@@ -4,14 +4,23 @@ Two modes, run as separate processes so that the memory of one is returned
 to the system before the other starts:
 
 ``--encode`` loads the text encoder (Qwen3-8B, truncated to the layers FLUX
-reads) on the CPU in bf16, encodes each given prompt and saves its embeddings
-to the given file. Encoding runs on the CPU because loading the encoder onto
-the GPU stages its weights through system memory twice.
+reads) on the CPU in bf16, encodes each given prompt, saves its embeddings to
+the given file and exits. Encoding runs on the CPU because loading the
+encoder onto the GPU stages its weights through system memory twice.
 
-The default mode loads the Q4_K_M GGUF transformer and the VAE straight onto
-the GPU and generates, one after the other on that load, line art and a
-de-inked fill at the requested size from one reference image and the
-prompts' saved embeddings.
+``--serve`` loads the Q4_K_M GGUF transformer and the VAE straight onto the
+GPU once and then stays resident, running one job at a time. Each job is one
+JSON object per line on stdin; it generates, one after the other, line art
+and a de-inked fill at the requested size from one reference image and the
+prompts' saved embeddings:
+
+    {"job": 1, "image": "...", "width": 512, "height": 512, "steps": 2,
+     "guidance": 1.0, "line_art_embeds": "...", "line_art_seed": 0,
+     "line_art_output": "...", "fill_embeds": "...", "fill_seed": 0,
+     "fill_output": "..."}
+
+``{"cancel": 1}`` stops that job at its next denoising step. The worker exits
+when stdin closes or after ``--idle-timeout`` seconds without a job.
 
 Everything comes from files the user installed with
 build-aux/setup-line-art.py; the worker never touches the network: the
@@ -23,9 +32,12 @@ including library output, goes to stderr (Diorama's worker log):
 
     {"event": "stage", "stage": "encode", "prompts": 2}
     {"event": "stage", "stage": "load"}
-    {"event": "step", "image": "line_art", "step": 1, "steps": 4, "elapsed": 1.9}
-    {"event": "stage", "stage": "decode", "image": "line_art"}
-    {"event": "done"}
+    {"event": "ready"}
+    {"event": "step", "job": 1, "image": "line_art", "step": 1, "steps": 2, "elapsed": 4.3}
+    {"event": "stage", "stage": "decode", "job": 1, "image": "line_art"}
+    {"event": "done", "job": 1}
+    {"event": "error", "job": 1, "message": "..."}
+    {"event": "cancelled", "job": 1}
 
 ``elapsed`` is the time in seconds since that image's generation started.
 """
@@ -33,8 +45,11 @@ including library output, goes to stderr (Diorama's worker log):
 import argparse
 import json
 import os
+import queue
 import sys
+import threading
 import time
+import traceback
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -81,35 +96,24 @@ def fail(message):
 def arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--encode", action="store_true", help="only encode prompts, on the CPU")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--encode", action="store_true", help="only encode prompts, on the CPU")
+    mode.add_argument("--serve", action="store_true", help="run jobs from stdin on the GPU")
     # Encode mode.
     parser.add_argument(
         "--prompt-embeds", nargs=2, action="append", metavar=("PROMPT", "PATH"), default=[]
     )
     parser.add_argument("--text-encoder-layers")
     parser.add_argument("--max-sequence-length", type=int)
-    # Generate mode.
+    # Serve mode.
     parser.add_argument("--gguf")
-    parser.add_argument("--image")
-    parser.add_argument("--width", type=int)
-    parser.add_argument("--height", type=int)
-    parser.add_argument("--line-art-embeds")
-    parser.add_argument("--line-art-seed", type=int)
-    parser.add_argument("--line-art-output")
-    parser.add_argument("--fill-embeds")
-    parser.add_argument("--fill-seed", type=int)
-    parser.add_argument("--fill-output")
-    parser.add_argument("--steps", type=int)
-    parser.add_argument("--guidance", type=float)
+    parser.add_argument("--idle-timeout", type=float)
     parser.add_argument("--device", choices=("cuda", "cpu"))
     args = parser.parse_args()
     required = (
         ("prompt_embeds", "text_encoder_layers", "max_sequence_length")
         if args.encode
-        else (
-            "gguf", "image", "width", "height", "line_art_embeds", "line_art_seed",
-            "line_art_output", "fill_embeds", "fill_seed", "fill_output", "steps", "guidance",
-        )
+        else ("gguf", "idle_timeout")
     )
     missing = [name for name in required if getattr(args, name) in (None, [])]
     if missing:
@@ -216,8 +220,13 @@ def load_pipeline(torch, Flux2KleinPipeline, args, device):
     return pipeline
 
 
-def generate_image(torch, pipeline, name, reference, embeds, seed, args, device):
+class JobCancelled(Exception):
+    pass
+
+
+def generate_image(torch, pipeline, job, name, reference, embeds, seed, device, cancelled):
     started = time.monotonic()
+    steps = job["steps"]
 
     def step_end(_pipeline, index, _timestep, callback_kwargs):
         step = index + 1
@@ -225,13 +234,16 @@ def generate_image(torch, pipeline, name, reference, embeds, seed, args, device)
             torch.cuda.synchronize()
         emit(
             "step",
+            job=job["job"],
             image=name,
             step=step,
-            steps=args.steps,
+            steps=steps,
             elapsed=round(time.monotonic() - started, 3),
         )
-        if step == args.steps:
-            emit("stage", stage="decode", image=name)
+        if job["job"] in cancelled:
+            raise JobCancelled()
+        if step == steps:
+            emit("stage", stage="decode", job=job["job"], image=name)
         return callback_kwargs
 
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -239,45 +251,91 @@ def generate_image(torch, pipeline, name, reference, embeds, seed, args, device)
         return pipeline(
             image=reference,
             prompt_embeds=embeds.to(device),
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance,
+            height=job["height"],
+            width=job["width"],
+            num_inference_steps=steps,
+            guidance_scale=job["guidance"],
             generator=generator,
             callback_on_step_end=step_end,
         ).images[0]
 
 
-def generate(args):
-    if args.width <= 0 or args.height <= 0 or args.width % 16 or args.height % 16:
-        fail(f"output {args.width}x{args.height} is not a positive multiple of 16")
-    if not os.path.isfile(args.gguf):
-        fail(f"no FLUX.2 [klein] GGUF transformer at {args.gguf}; run {SETUP}")
-    torch, Flux2KleinPipeline = imports()
+def run_job(torch, pipeline, job, device, cancelled):
     from PIL import Image
     from safetensors.torch import load_file
 
-    reference = Image.open(args.image).convert("RGB")
+    width, height = job["width"], job["height"]
+    if width <= 0 or height <= 0 or width % 16 or height % 16:
+        raise ValueError(f"output {width}x{height} is not a positive multiple of 16")
+    reference = Image.open(job["image"]).convert("RGB")
+    for name, mode in (("line_art", "L"), ("fill", "RGB")):
+        if job["job"] in cancelled:
+            raise JobCancelled()
+        embeds = load_file(job[f"{name}_embeds"])["prompt_embeds"]
+        result = generate_image(
+            torch, pipeline, job, name, reference, embeds, job[f"{name}_seed"], device, cancelled
+        )
+        if result.size != (width, height):
+            raise ValueError(f"the pipeline returned {result.size[0]}x{result.size[1]} for {width}x{height}")
+        result.convert(mode).save(job[f"{name}_output"], format="PNG")
+
+
+def read_messages(jobs, cancelled):
+    """Queue jobs and record cancellations as they arrive; None marks the end
+    of stdin."""
+    for line in sys.stdin:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            print(f"line-art worker: ignoring malformed input: {line!r}", file=sys.stderr, flush=True)
+            continue
+        if "cancel" in message:
+            cancelled.add(message["cancel"])
+        else:
+            jobs.put(message)
+    jobs.put(None)
+
+
+def shut_down(status=0):
+    # Skip the interpreter teardown, which takes about a second with ROCm.
+    sys.stderr.flush()
+    os._exit(status)
+
+
+def serve(args):
+    if not os.path.isfile(args.gguf):
+        fail(f"no FLUX.2 [klein] GGUF transformer at {args.gguf}; run {SETUP}")
+    torch, Flux2KleinPipeline = imports()
     device = device_for(torch, args.device)
-    images = (
-        ("line_art", args.line_art_embeds, args.line_art_seed, args.line_art_output, "L"),
-        ("fill", args.fill_embeds, args.fill_seed, args.fill_output, "RGB"),
-    )
-    embeds = {name: load_file(path)["prompt_embeds"] for name, path, *_ in images}
     try:
         pipeline = load_pipeline(torch, Flux2KleinPipeline, args, device)
-        for name, _path, seed, output, mode in images:
-            result = generate_image(
-                torch, pipeline, name, reference, embeds[name], seed, args, device
-            )
-            if result.size != (args.width, args.height):
-                fail(
-                    f"the pipeline returned {result.size[0]}x{result.size[1]} "
-                    f"for {args.width}x{args.height}"
-                )
-            result.convert(mode).save(output, format="PNG")
     except torch.OutOfMemoryError:
         fail(OUT_OF_MEMORY)
+    emit("ready")
+    jobs, cancelled = queue.Queue(), set()
+    threading.Thread(target=read_messages, args=(jobs, cancelled), daemon=True).start()
+    while True:
+        try:
+            job = jobs.get(timeout=args.idle_timeout)
+        except queue.Empty:
+            print("line-art worker: idle, exiting", file=sys.stderr, flush=True)
+            shut_down()
+        if job is None:
+            shut_down()
+        try:
+            run_job(torch, pipeline, job, device, cancelled)
+        except JobCancelled:
+            emit("cancelled", job=job["job"])
+        except torch.OutOfMemoryError:
+            # A fragmented allocator is best recovered by a fresh process.
+            emit("error", job=job["job"], message=OUT_OF_MEMORY)
+            shut_down(3)
+        except Exception as error:  # noqa: BLE001 - reported to Diorama per job
+            traceback.print_exc(file=sys.stderr)
+            emit("error", job=job["job"], message=f"{type(error).__name__}: {error}")
+        else:
+            emit("done", job=job["job"])
+        cancelled.discard(job["job"])
 
 
 def main():
@@ -286,13 +344,8 @@ def main():
         fail(f"no FLUX.2 [klein] pipeline at {args.model}; run {SETUP}")
     if args.encode:
         encode(args)
-    else:
-        generate(args)
-        emit("done")
-    # The outputs are saved and the streams flushed; skip the interpreter
-    # teardown, which takes about a second with ROCm.
-    sys.stderr.flush()
-    os._exit(0)
+        shut_down()
+    serve(args)
 
 
 if __name__ == "__main__":
