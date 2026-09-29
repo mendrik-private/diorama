@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.24" date="2026-09-29">
+      <description>
+        <p>Game Asset sprites no longer show a halo from the model's background, and their colours are restored locally towards the original without tinting thin details such as straps and belts.</p>
+      </description>
+    </release>
     <release version="0.3.23" date="2026-09-29">
       <description>
         <p>Game Asset scaling is about four times faster: line art is generated in a single step, and the model stays loaded while the Scale tool is open. Sprite edges no longer show a light halo from the removed background.</p>

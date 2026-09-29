@@ -605,9 +605,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fill_rgb_is_multiplied_by_the_line_art_under_the_foreground_alpha() {
-        // A flat subject but a striped generated fill: the result's RGB can
-        // only come from the fill and its alpha only from the foreground.
+    fn the_cleaned_fill_is_multiplied_by_the_line_art_under_the_foreground_alpha() {
+        // A flat subject but a striped generated fill on a white background:
+        // the colour restoration pulls the stripes back to the subject's
+        // colour away from the ink, the line art darkens it where it has
+        // ink, and alpha comes from the foreground only.
         let source = Arc::new(RgbaImage::from_fn(64, 64, |x, y| {
             if (4..60).contains(&x) && (4..60).contains(&y) {
                 image::Rgba([190, 95, 55, 255])
@@ -620,7 +622,13 @@ mod tests {
             let line_art = GrayImage::from_fn(w, h, |_, y| {
                 image::Luma([if (15..17).contains(&y) { 0 } else { 255 }])
             });
-            let fill = image::RgbImage::from_fn(w, h, |x, _| image::Rgb([x as u8 * 4, 50, 200]));
+            let fill = image::RgbImage::from_fn(w, h, |x, y| {
+                if (2..30).contains(&x) && (2..30).contains(&y) {
+                    image::Rgb([x as u8 * 4, 50, 200])
+                } else {
+                    image::Rgb([255, 255, 255])
+                }
+            });
             Ok(LineArtPair { line_art, fill })
         });
         let session =
@@ -635,7 +643,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.get_pixel(10, 15).0, [0, 0, 0, 255]);
-        assert_eq!(result.get_pixel(10, 8).0, [40, 50, 200, 255]);
+        assert_eq!(result.get_pixel(10, 8).0, [190, 95, 55, 255]);
         assert_eq!(result.get_pixel(0, 0)[3], 0);
     }
 

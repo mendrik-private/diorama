@@ -376,9 +376,19 @@ and never resampled; a smaller one is reduced afterwards, the line art with
 bicubic and the fill with Lanczos. Any target from 1 pixel works, with an
 aspect ratio up to 8:1 and a generation of at most 1024 × 1024 pixels; a
 narrow target whose 512-pixel scaling would exceed that is generated at a
-smaller scale. Along the cutout's soft edge, the fill takes colour bled
-outward from the opaque interior, since the fill's background is white and
-would otherwise show as a light halo.
+smaller scale.
+
+Two corrections clean the fill before the line art is multiplied over it.
+Where FLUX's shapes and the cutout disagree, the fill shows its own
+background (for example white or light grey) inside the silhouette, and it
+would show as a light halo; such pixels, and the cutout's soft edge, take
+colour bled from the neighbouring subject pixels, from further away where
+needed, as for a thin bow. The de-inked fill also tends to come out brighter
+and more saturated than the original, so its local colour is then pulled back
+to the original's, comparing only subject pixels away from the line art. The
+correction is edge-aware: a pixel only takes the correction measured on
+similar colours around it, and less of it where there are few, so a thin
+strap or belt next to a tunic keeps its own colour.
 
 Each prompt is encoded once, and its embeddings are cached next to the model.
 Encoding loads the text encoder (Qwen3-8B, only the 28 layers FLUX reads, in
