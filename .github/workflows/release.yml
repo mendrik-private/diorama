@@ -9,6 +9,10 @@ permissions:
   contents: read
 
 jobs:
+  docs:
+    name: Validate release documentation
+    uses: ./.github/workflows/docs-build.yml
+
   build:
     name: Build release Flatpak
     runs-on: ubuntu-24.04
@@ -88,7 +92,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, docs]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

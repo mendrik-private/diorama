@@ -17,3 +17,6 @@ Use Astra as the lead agent for planning\, coordination\, and independent correc
   Delegate execution, not responsibility for correctness. Astra owns the final acceptance decision and must distinguish verified behavior from assumptions or remaining uncertainty.
 
   Report the outcome concisely: what changed, what Astra independently checked, what verification passed, and any remaining limitations.
+
+For release preparation or finalization, read and complete
+`docs/release-checklist.md` before creating or pushing a release tag.

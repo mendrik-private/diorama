@@ -29,6 +29,9 @@ export.
 
 ## See Diorama in action
 
+For task-by-task instructions with full-size feature captures, read the
+[Diorama User Guide](https://mendrik-private.github.io/diorama/).
+
 Compare related images with synchronized views and magnified pixel details.
 
 ![Side-by-side image comparison with inspection lenses](data/screenshots/compare-lenses.png)
