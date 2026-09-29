@@ -12,7 +12,11 @@ and editing actions close by. Select the image to view it at full size.*
 
 Use this guide by task. Start with [opening and browsing images](getting-started.md),
 then choose [inspection](inspect.md), [comparison](compare.md),
-[editing and annotation](edit-and-annotate.md), or [export](save-and-export.md).
+[cropping](cropping.md), [transforms](transformations.md), [background
+removal](background-removal.md), [drawing](drawing-and-annotations.md),
+[scaling](scaling.md), [preferences](preferences.md), or
+[export](save-and-export.md).
 
 The screenshots use a small fantasy-character sample set. They demonstrate the
-app's tools; the sample artwork is not included with Diorama or this guide.
+app's tools; the original sample files are not distributed as downloadable
+fixtures with Diorama or this guide.

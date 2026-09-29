@@ -5,7 +5,7 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 book_root="$repo_root/docs/user-guide"
 screenshot_root="$repo_root/data/screenshots/guide"
 output_root="$repo_root/target/docs-site"
-required_screenshots='overview.png inspect-pixel-lens.png compare-lenses.png edit-selection.png annotate-character.png export-options.png'
+required_screenshots='overview.png inspect-pixel-lens.png compare-lenses.png edit-selection.png scale-options.png scaling-method-comparison.png game-asset-options.png game-asset-result.png game-asset-line-art.png flip-and-rotate.png mesh-warp-grid.png crop-detected-content.png canvas-resize.png preferences.png background-removal-cutout.png annotate-character.png export-options.png'
 
 command -v mdbook >/dev/null 2>&1 || {
     echo "mdbook is required; install it with: cargo install mdbook --version 0.5.4 --locked" >&2
