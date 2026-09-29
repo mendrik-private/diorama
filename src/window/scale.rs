@@ -779,4 +779,181 @@ echo stopped >> "$dir/launches"
         );
         window.0.window.close();
     }
+
+    #[test]
+    #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
+    fn scale_preview_zoom_follows_the_user_across_slow_method_switches() {
+        adw::init().expect("GTK initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ScaleZoomSwitchTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let source = Arc::new(image::RgbaImage::from_fn(96, 80, |x, y| {
+            image::Rgba(if (y as f64 - (0.57 * x as f64 + 10.)).abs() < 3. {
+                [8, 10, 4, 255]
+            } else {
+                [130, 170, 90, 255]
+            })
+        }));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: source.clone(),
+                path: None,
+                metadata: Default::default(),
+            })));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&source).unwrap()));
+        window.0.rendered.replace(Some((*source).clone()));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        // Uncached generations stay pending long enough for the user to act.
+        let install_slow_session = || {
+            window.0.scale_game_asset.replace(Some(Arc::new(
+                crate::tools::scale::game_asset::Session::with_test_generator(
+                    source.clone(),
+                    Arc::new(|image, size, cancel, progress| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        fixture_layers(image, size, cancel, progress)
+                    }),
+                ),
+            )));
+        };
+        const BICUBIC: u32 = 1;
+        const GAME_ASSET: u32 = 2;
+        window.0.scale_button.set_active(true);
+        window.0.scale_method.set_selected(BICUBIC);
+        window.0.scale_width.set_value(48.);
+        window.present();
+        let context = glib::MainContext::default();
+        let settle = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while (window.0.scale_spinner.get_visible()
+                || window.0.pending_fit.get().is_some()
+                || context.pending())
+                && std::time::Instant::now() < deadline
+            {
+                context.iteration(false);
+                std::thread::yield_now();
+            }
+            assert!(!window.0.scale_spinner.get_visible(), "preview completed");
+            assert!(window.0.pending_fit.get().is_none(), "fit applied");
+        };
+        // Realizing with an image already loaded queues a viewer fit for the
+        // next frame; apply it now so it cannot land in the middle of the test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !window.apply_pending_fit() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        let fit_zoom = || {
+            let preview = window.0.scale_preview.borrow().as_ref().unwrap().clone();
+            let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
+            assert!(usable_panel_size(viewport));
+            panel_fit_zoom(viewport, (preview.width() as i32, preview.height() as i32))
+        };
+        let press_fit = || {
+            gio::prelude::ActionGroupExt::activate_action(&window.0.window, "scale-fit", None);
+            assert_eq!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+        };
+        let switch_method = |method| {
+            window.0.scale_method.set_selected(method);
+            assert!(
+                window.0.scale_spinner.get_visible(),
+                "the switch schedules a preview"
+            );
+        };
+        settle();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().width(),
+            48
+        );
+
+        // Switching methods without zooming keeps a manual zoom exactly.
+        window.set_scale_preview_zoom(2.);
+        install_slow_session();
+        switch_method(GAME_ASSET);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), 2.);
+        switch_method(BICUBIC);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), 2.);
+
+        // A zoom chosen while a slow preview generates survives its arrival.
+        window.set_scale_preview_zoom(4.);
+        install_slow_session();
+        switch_method(GAME_ASSET);
+        window.zoom_at(1.25, None);
+        let user_zoom = window.0.canvas.zoom();
+        assert_ne!(user_zoom, 4.);
+        assert!(window.0.scale_spinner.get_visible(), "still generating");
+        settle();
+        assert_eq!(window.0.canvas.zoom(), user_zoom);
+        assert!(matches!(
+            window.0.scale_resampling.get(),
+            Resampling::GameAsset(_)
+        ));
+
+        // A manual zoom leaves Fit, so method switches keep it.
+        press_fit();
+        settle();
+        let fit_48 = window.0.canvas.zoom();
+        assert_eq!(fit_48, fit_zoom());
+        window.zoom_at(1.25, None);
+        let manual_zoom = window.0.canvas.zoom();
+        assert_ne!(manual_zoom, fit_48);
+        switch_method(BICUBIC);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), manual_zoom);
+        install_slow_session();
+        switch_method(GAME_ASSET);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), manual_zoom);
+        assert_ne!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+
+        // Untouched, Fit still refits each replacement to its own size ...
+        press_fit();
+        settle();
+        assert_eq!(window.0.canvas.zoom(), fit_48);
+        window.0.scale_width.set_value(32.);
+        assert!(window.0.scale_spinner.get_visible());
+        settle();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().width(),
+            32
+        );
+        let fit_32 = window.0.canvas.zoom();
+        assert_ne!(fit_32, fit_48);
+        assert_eq!(fit_32, fit_zoom());
+        // ... and keeps that fit across plain method switches.
+        switch_method(BICUBIC);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), fit_32);
+        install_slow_session();
+        switch_method(GAME_ASSET);
+        settle();
+        assert_eq!(window.0.canvas.zoom(), fit_32);
+        assert_eq!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+
+        // Choosing Fit while a preview generates fits that preview on arrival.
+        window.zoom_at(1.25, None);
+        assert_ne!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+        window.0.scale_width.set_value(40.);
+        assert!(window.0.scale_spinner.get_visible());
+        press_fit();
+        assert!(window.0.scale_spinner.get_visible(), "still generating");
+        settle();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().width(),
+            40
+        );
+        assert_eq!(window.0.canvas.zoom(), fit_zoom());
+        assert_eq!(window.0.scale_preview_view.get(), ScalePreviewView::Fit);
+        window.0.window.close();
+    }
 }

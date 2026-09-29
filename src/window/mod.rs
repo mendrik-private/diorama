@@ -3153,9 +3153,7 @@ impl ViewerWindow {
                 {
                     return;
                 }
-                this.refresh_scale_controls_with_preserved_zoom(
-                    this.scale_preview_zoom_to_preserve(),
-                );
+                this.refresh_scale_controls();
             }
         });
         let original = gtk::GestureClick::new();
@@ -3305,14 +3303,6 @@ impl ViewerWindow {
     }
 
     fn scale_dimension_changed(&self, width_changed: bool) {
-        self.scale_dimension_changed_with_preserved_zoom(width_changed, None);
-    }
-
-    fn scale_dimension_changed_with_preserved_zoom(
-        &self,
-        width_changed: bool,
-        preserved_zoom: Option<f64>,
-    ) {
         if self.0.scale_updating_controls.get() {
             return;
         }
@@ -3338,7 +3328,7 @@ impl ViewerWindow {
             }
         }
         self.0.scale_updating_controls.set(false);
-        self.refresh_scale_controls_with_preserved_zoom(preserved_zoom);
+        self.refresh_scale_controls();
     }
 
     fn scale_slider_changed(&self, value: f64) {
@@ -3370,21 +3360,9 @@ impl ViewerWindow {
     }
 
     fn refresh_scale_controls(&self) {
-        self.refresh_scale_controls_with_preserved_zoom(None);
-    }
-
-    fn scale_preview_zoom_to_preserve(&self) -> Option<f64> {
-        (self.0.scale_preview_view.get() != ScalePreviewView::Fit).then(|| self.0.canvas.zoom())
-    }
-
-    fn refresh_scale_controls_with_preserved_zoom(&self, preserved_zoom: Option<f64>) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
             return;
         };
-        // Replacing a preview should not discard a zoom chosen while scaling.
-        // Fit is the exception: it is a mode, so each replacement must refit
-        // to its own dimensions.
-        let preserved_zoom = preserved_zoom.or_else(|| self.scale_preview_zoom_to_preserve());
         let width = self.0.scale_width.value().round() as u32;
         let height = self.0.scale_height.value().round() as u32;
         let percent = f64::from(width) * 100.0 / f64::from(source.width().max(1));
@@ -3424,7 +3402,11 @@ impl ViewerWindow {
             source.width(),
             source.height()
         ));
-        self.schedule_scale_preview(width, height, preserved_zoom);
+        // Replacing a preview should not discard a zoom chosen while scaling,
+        // including one chosen while the preview was generating. Fit is the
+        // exception: it is a mode, so each replacement refits to its own
+        // dimensions until the user zooms manually, which leaves Fit.
+        self.schedule_scale_preview(width, height, true);
     }
 
     fn refresh_scale_method(&self) {
@@ -3446,18 +3428,13 @@ impl ViewerWindow {
         self.0.scale_updating_controls.set(true);
         self.configure_scale_ranges(source.width(), source.height());
         self.0.scale_updating_controls.set(false);
-        self.scale_dimension_changed_with_preserved_zoom(
-            true,
-            self.scale_preview_zoom_to_preserve(),
-        );
+        self.scale_dimension_changed(true);
     }
 
-    fn schedule_scale_preview(
-        &self,
-        target_width: u32,
-        target_height: u32,
-        preserved_zoom: Option<f64>,
-    ) {
+    /// Generate the preview for the target size. With `keep_zoom`, a non-Fit
+    /// view keeps whatever zoom the canvas has when the preview arrives;
+    /// otherwise the current [`ScalePreviewView`] decides the zoom.
+    fn schedule_scale_preview(&self, target_width: u32, target_height: u32, keep_zoom: bool) {
         let Some(source) = self.0.scale_source.borrow().clone() else {
             self.0.scale_spinner.set_visible(false);
             return;
@@ -3473,7 +3450,7 @@ impl ViewerWindow {
             && matches!(resampling, Resampling::GameAsset(_));
         if (target_width, target_height) == source.dimensions() && !show_line_art {
             self.0.scale_spinner.set_visible(false);
-            self.display_scale_preview(source, preserved_zoom);
+            self.display_scale_preview(source, keep_zoom);
             return;
         }
         let gpu = self.0.scale_gpu.borrow().clone();
@@ -3566,8 +3543,7 @@ impl ViewerWindow {
                 ViewerWindow(state.clone()).reset_scale_progress();
                 match preview {
                     Ok(Ok(preview)) => {
-                        ViewerWindow(state)
-                            .display_scale_preview(Arc::new(preview), preserved_zoom);
+                        ViewerWindow(state).display_scale_preview(Arc::new(preview), keep_zoom);
                     }
                     Ok(Err(error)) => state.toasts.add_toast(adw::Toast::new(&error.to_string())),
                     Err(_) => state
@@ -3609,7 +3585,7 @@ impl ViewerWindow {
         self.0.scale_progress.set_text(None);
     }
 
-    fn display_scale_preview(&self, preview: Arc<image::RgbaImage>, preserved_zoom: Option<f64>) {
+    fn display_scale_preview(&self, preview: Arc<image::RgbaImage>, keep_zoom: bool) {
         self.0.scale_spinner.set_visible(false);
         self.0.scale_preview.replace(Some(preview.clone()));
         self.0.scale_original_button.set_sensitive(true);
@@ -3626,8 +3602,13 @@ impl ViewerWindow {
         match texture_from_rgba(&preview) {
             Ok(texture) => {
                 self.0.canvas.set_texture(Some(&texture));
-                if let Some(zoom) = preserved_zoom {
-                    self.set_scale_preview_zoom(zoom);
+                // Resolve the zoom now, not when the preview was scheduled:
+                // generation can take minutes and the user may have zoomed or
+                // chosen Fit meanwhile.
+                if self.0.scale_preview_view.get() == ScalePreviewView::Fit {
+                    self.fit(false);
+                } else if keep_zoom {
+                    self.update_scale_preview_zoom();
                 } else {
                     self.apply_scale_preview_view(preview.width());
                 }
@@ -3710,7 +3691,7 @@ impl ViewerWindow {
                 self.set_scale_preview_zoom(self.0.scale_preview_zoom_before_original.get());
             }
         } else {
-            self.schedule_scale_preview(dimensions.0, dimensions.1, None);
+            self.schedule_scale_preview(dimensions.0, dimensions.1, false);
         }
     }
 
@@ -6920,6 +6901,13 @@ impl ViewerWindow {
     }
 
     fn set_zoom_with_alignment(&self, zoom: f64, align: bool) {
+        if self.0.tool.get() == Tool::Scale
+            && self.0.scale_preview_view.get() == ScalePreviewView::Fit
+        {
+            // A manual zoom leaves Fit, as it does in the viewer. Previews
+            // keep a non-Fit view's zoom, so later replacements keep this one.
+            self.0.scale_preview_view.set(ScalePreviewView::Footprint);
+        }
         self.0.zoom_mode.set(ZoomMode::Manual);
         self.0.settings.set_last_zoom_mode(ZoomMode::Manual);
         self.apply_zoom_with_alignment(zoom, align);
@@ -12324,7 +12312,7 @@ mod tests {
             3,
             image::Rgba([4, 5, 6, 255]),
         ));
-        window.display_scale_preview(preview, None);
+        window.display_scale_preview(preview, false);
         let viewport = (window.0.scrolled.width(), window.0.scrolled.height());
         assert!(usable_panel_size(viewport));
         assert!(window.0.canvas.zoom() > 64.0);
@@ -12634,7 +12622,7 @@ mod tests {
             2,
             image::Rgba([4, 5, 6, 255]),
         ));
-        window.display_scale_preview(preview, None);
+        window.display_scale_preview(preview, false);
         assert_eq!(window.0.canvas.texture().unwrap().width(), 2);
         window.set_scale_original_visible(true);
         assert_eq!(window.0.canvas.texture().unwrap().width(), 8);
