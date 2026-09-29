@@ -1,12 +1,16 @@
 //! Process plumbing shared by the local inference workers (LaMa, line art and
 //! BiRefNet): Flatpak host launch, setup-recorded runtime configuration, the
-//! cache directory, a logged spawn, and a cancellable, time-limited wait.
+//! cache directory, a logged spawn, streamed stdout lines, and a cancellable,
+//! time-limited wait.
 use std::{
     fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Mutex, MutexGuard, TryLockError},
+    sync::{
+        Mutex, MutexGuard, TryLockError,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -209,6 +213,66 @@ pub(super) fn spawn_logged(command: &mut Command, log: &Path) -> io::Result<Chil
         .spawn()
 }
 
+/// Spawn with stdin closed, stdout piped for [`StdoutLines`], and stderr
+/// appended to `log`.
+pub(super) fn spawn_streaming(command: &mut Command, log: &Path) -> io::Result<Child> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(File::create(log)?)
+        .spawn()
+}
+
+/// The lines a child writes to its piped stdout, read on a background thread
+/// so that waiting never blocks on the pipe.
+pub(super) struct StdoutLines(Receiver<String>);
+
+impl StdoutLines {
+    /// Take the child's piped stdout; `None` if it is not piped.
+    pub(super) fn take(child: &mut Child) -> Option<Self> {
+        let stdout = child.stdout.take()?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                        if sender.send(text).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Some(Self(receiver))
+    }
+
+    /// Lines received so far, without blocking.
+    pub(super) fn pending(&self) -> impl Iterator<Item = String> + '_ {
+        self.0.try_iter()
+    }
+
+    /// The remaining lines once the child has exited. A descendant that
+    /// inherited the pipe may keep it open, so this waits at most `grace`.
+    pub(super) fn finish(self, grace: Duration) -> Vec<String> {
+        let deadline = Instant::now() + grace;
+        let mut lines = Vec::new();
+        loop {
+            match self
+                .0
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => lines.push(line),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return lines,
+            }
+        }
+    }
+}
+
 /// Wait for `child`, killing and reaping it on cancellation, timeout, or a
 /// failed status query.
 pub(super) fn wait(
@@ -217,8 +281,20 @@ pub(super) fn wait(
     timeout: Duration,
     poll_interval: Duration,
 ) -> std::result::Result<ExitStatus, WaitError> {
+    wait_with(child, cancellation, timeout, poll_interval, || {})
+}
+
+/// [`wait`], calling `on_poll` on the waiting thread before every poll.
+pub(super) fn wait_with(
+    child: &mut Child,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut on_poll: impl FnMut(),
+) -> std::result::Result<ExitStatus, WaitError> {
     let started = Instant::now();
     loop {
+        on_poll();
         if let Err(error) = cancellation.check() {
             kill_and_reap(child);
             return Err(WaitError::Cancelled(error));
@@ -413,6 +489,74 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_stdout_lines_arrive_while_waiting_and_stderr_goes_to_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("worker.log");
+        let mut child = spawn_streaming(
+            Command::new("sh").args([
+                "-c",
+                "echo first; echo warning >&2; sleep 0.2; printf 'second\\r\\nno newline'",
+            ]),
+            &log,
+        )
+        .unwrap();
+        let lines = StdoutLines::take(&mut child).unwrap();
+        assert!(StdoutLines::take(&mut child).is_none());
+        let mut seen = Vec::new();
+        let mut polls = 0;
+        let status = wait_with(
+            &mut child,
+            &CancellationToken::default(),
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || {
+                polls += 1;
+                seen.extend(lines.pending());
+            },
+        )
+        .unwrap();
+        assert!(status.success());
+        assert!(polls > 1);
+        assert_eq!(seen.first().map(String::as_str), Some("first"));
+        seen.extend(lines.finish(Duration::from_secs(5)));
+        assert_eq!(seen, ["first", "second", "no newline"]);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "warning\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_streaming_wait_kills_the_child_and_ends_the_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = spawn_streaming(
+            Command::new("sh").args(["-c", "echo started; exec sleep 60"]),
+            &directory.path().join("worker.log"),
+        )
+        .unwrap();
+        let lines = StdoutLines::take(&mut child).unwrap();
+        let cancellation = CancellationToken::default();
+        let started = Instant::now();
+        let result = wait_with(
+            &mut child,
+            &cancellation,
+            Duration::from_secs(30),
+            Duration::from_millis(2),
+            || {
+                if lines.pending().any(|line| line == "started") {
+                    cancellation.cancel();
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(WaitError::Cancelled(AppError::Cancelled))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some(), "must be reaped");
+        assert!(lines.finish(Duration::from_secs(5)).is_empty());
     }
 
     #[cfg(unix)]

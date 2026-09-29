@@ -1,32 +1,32 @@
-//! Line-art overlay reduction.
+//! Line-art composition at the target size.
 //!
-//! An application-supplied line-art raster (grayscale, source-aligned, white
-//! is no ink) is reduced with bicubic (Catmull-Rom) resampling, sharpened with
-//! an unsharp mask of radius 1 and multiplied over the Lanczos foreground fill
-//! in 8-bit sRGB, like GIMP's Multiply layer mode. The line art never changes
-//! alpha: the result keeps the fill's alpha exactly.
+//! The application supplies two target-sized layers: grayscale line art
+//! (white is no ink) and an opaque fill without ink contours. Neither layer is
+//! resampled here. The line art is sharpened with an unsharp mask of radius 1
+//! and multiplies the fill in 8-bit sRGB, like GIMP's Multiply layer mode. Alpha comes from the foreground
+//! alone: its Lanczos reduction's silhouette alpha at the target size, with a
+//! fixed edge softness.
 use crate::{
     Cancellation, DEFAULT_MEMORY_LIMIT, Error, GameAssetAa, Result, color, lanczos,
     silhouette::Silhouette,
 };
-use image::{GrayImage, RgbaImage, imageops::FilterType};
+use image::{GrayImage, RgbImage, RgbaImage};
 use std::sync::{Arc, Mutex};
 
-/// Source-sized working set: the caller's foreground, its linear and isolated
-/// copies (2 × 32 B), premultiplied Lanczos input and its vertical pass
-/// (2 × 16 B), silhouette support, flood fill and projections, plus the line
-/// art and its bicubic intermediate.
+/// Source-sized working set of the alpha: the caller's foreground, its linear
+/// and isolated copies (2 × 32 B), premultiplied Lanczos input and its
+/// vertical pass (2 × 16 B), silhouette support, flood fill and projections.
 const SOURCE_BYTES: u64 = 160;
-/// Target-sized working set: the linear fill, silhouette coverage/opacity,
-/// the cached fill and line art, the blur and its horizontal pass, the
-/// sharpened line art and the output.
+/// Target-sized working set: the line art, its blur and horizontal pass, the
+/// sharpened copy, the fill, the linear Lanczos reduction, silhouette
+/// coverage/opacity, the cached alpha and the output.
 const TARGET_BYTES: u64 = 96;
 /// Gaussian standard deviation of the unsharp mask, in target pixels.
 const SHARPEN_RADIUS: f32 = 1.;
 /// Kernel half-width: the Gaussian is truncated at three standard deviations.
 const KERNEL_RADIUS: usize = 3;
-/// The fill's silhouette edge softness; this is the traced API's default AA.
-const FILL_EDGE: GameAssetAa = GameAssetAa::new(50);
+/// The silhouette's edge softness; this is the traced API's default AA.
+const ALPHA_EDGE: GameAssetAa = GameAssetAa::new(50);
 
 /// Unsharp-mask strength in percent, clamped to 0–100; the default is 40%.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,38 +53,57 @@ impl Default for Strength {
     }
 }
 
-/// Bicubic line art at one target size and its Gaussian blur. Both are
-/// independent of strength, so a strength change only re-sharpens.
-struct ReducedLineArt {
-    size: (u32, u32),
+/// Target-sized line art and fill, aligned pixel for pixel. The line art's
+/// blur is computed once, so a strength change only re-sharpens.
+pub struct LineArtLayers {
     line_art: GrayImage,
+    fill: RgbImage,
     blurred: Vec<f32>,
 }
 
-/// The finished straight-alpha sRGB fill of one foreground at one size.
-struct ReducedFill {
+impl LineArtLayers {
+    /// Both layers must have the same, non-zero dimensions.
+    pub fn new(line_art: GrayImage, fill: RgbImage, cancel: &dyn Cancellation) -> Result<Self> {
+        let (w, h) = line_art.dimensions();
+        if w == 0 || h == 0 || fill.dimensions() != (w, h) {
+            return Err(Error::InvalidDimensions);
+        }
+        let blurred = gaussian_blur(&line_art, cancel)?;
+        Ok(Self {
+            line_art,
+            fill,
+            blurred,
+        })
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        self.line_art.dimensions()
+    }
+
+    /// The line art as it is multiplied: sharpened at `strength`.
+    pub fn line_art(&self, strength: Strength, cancel: &dyn Cancellation) -> Result<GrayImage> {
+        cancel.check()?;
+        sharpen(&self.line_art, &self.blurred, strength.amount(), cancel)
+    }
+}
+
+/// The silhouette alpha of one foreground at one target size.
+struct TargetAlpha {
     size: (u32, u32),
+    alpha: Vec<u8>,
+}
+
+/// Composes target-sized layers over an extracted foreground's silhouette
+/// alpha. The alpha of the latest target size is cached; heavy work stays
+/// outside the lock and a cancelled request never populates it.
+pub struct LineArtComposer {
     foreground: Arc<RgbaImage>,
-    fill: RgbaImage,
+    alpha: Mutex<Option<Arc<TargetAlpha>>>,
 }
 
-#[derive(Default)]
-struct Cache {
-    line_art: Option<Arc<ReducedLineArt>>,
-    fill: Option<Arc<ReducedFill>>,
-}
-
-/// Reduce an extracted foreground with source-aligned line art multiplied
-/// over it. Each cache holds the latest completed target size; heavy work
-/// stays outside the lock and a cancelled request never populates it.
-pub struct LineArtSession {
-    line_art: Arc<GrayImage>,
-    cache: Mutex<Cache>,
-}
-
-impl LineArtSession {
+impl LineArtComposer {
     /// Check source-only limits, e.g. before an application generates the
-    /// line art for `source`.
+    /// layers for `source`.
     pub fn preflight(source: &RgbaImage) -> Result<()> {
         let (w, h) = source.dimensions();
         if w == 0 || h == 0 {
@@ -93,143 +112,64 @@ impl LineArtSession {
         check_budget((w, h), (1, 1))
     }
 
-    /// `line_art` must have exactly the dimensions of `source`.
-    pub fn new(source: &RgbaImage, line_art: Arc<GrayImage>) -> Result<Self> {
-        Self::preflight(source)?;
-        if line_art.dimensions() != source.dimensions() {
-            return Err(Error::InvalidDimensions);
-        }
+    /// `foreground` is the extracted, straight-alpha foreground at the source
+    /// size.
+    pub fn new(foreground: Arc<RgbaImage>) -> Result<Self> {
+        Self::preflight(&foreground)?;
         Ok(Self {
-            line_art,
-            cache: Mutex::new(Cache::default()),
+            foreground,
+            alpha: Mutex::new(None),
         })
     }
 
-    /// The line art as it is multiplied at `w`×`h`: bicubic and sharpened
-    /// when reduced, the unchanged source line art at the source size.
-    pub fn line_art(
+    /// `rgb = round(fill · sharpened line art / 255)` with the foreground's
+    /// silhouette alpha at the layers' size, in straight alpha. The layers
+    /// must be no larger than the foreground.
+    pub fn compose(
         &self,
-        w: u32,
-        h: u32,
-        strength: Strength,
-        cancel: &dyn Cancellation,
-    ) -> Result<GrayImage> {
-        cancel.check()?;
-        self.validate_target(w, h)?;
-        if (w, h) == self.line_art.dimensions() {
-            return Ok((*self.line_art).clone());
-        }
-        let reduced = self.reduced_line_art(w, h, cancel)?;
-        sharpen(
-            &reduced.line_art,
-            &reduced.blurred,
-            strength.amount(),
-            cancel,
-        )
-    }
-
-    /// Resize a source-aligned extracted foreground and multiply the reduced,
-    /// sharpened line art over it. The source size returns `foreground`.
-    pub fn resize_with_foreground(
-        &self,
-        foreground: &Arc<RgbaImage>,
-        w: u32,
-        h: u32,
+        layers: &LineArtLayers,
         strength: Strength,
         cancel: &dyn Cancellation,
     ) -> Result<RgbaImage> {
         cancel.check()?;
-        if foreground.dimensions() != self.line_art.dimensions() {
+        let (w, h) = layers.dimensions();
+        let (sw, sh) = self.foreground.dimensions();
+        if w > sw || h > sh {
             return Err(Error::InvalidDimensions);
         }
-        self.validate_target(w, h)?;
-        if (w, h) == self.line_art.dimensions() {
-            return Ok((**foreground).clone());
-        }
-        let fill = self.reduced_fill(foreground, w, h, cancel)?;
-        let reduced = self.reduced_line_art(w, h, cancel)?;
-        let line_art = sharpen(
-            &reduced.line_art,
-            &reduced.blurred,
-            strength.amount(),
-            cancel,
-        )?;
-        multiply(&fill.fill, &line_art, cancel)
+        check_budget((sw, sh), (w, h))?;
+        let alpha = self.alpha(w, h, cancel)?;
+        let line_art = layers.line_art(strength, cancel)?;
+        multiply(&layers.fill, &line_art, &alpha.alpha, cancel)
     }
 
-    fn validate_target(&self, w: u32, h: u32) -> Result<()> {
-        let (sw, sh) = self.line_art.dimensions();
-        if w == 0 || h == 0 || w > sw || h > sh {
-            return Err(Error::InvalidDimensions);
-        }
-        check_budget((sw, sh), (w, h))
-    }
-
-    fn reduced_line_art(
-        &self,
-        w: u32,
-        h: u32,
-        cancel: &dyn Cancellation,
-    ) -> Result<Arc<ReducedLineArt>> {
+    fn alpha(&self, w: u32, h: u32, cancel: &dyn Cancellation) -> Result<Arc<TargetAlpha>> {
         if let Some(cached) = self
-            .cache
+            .alpha
             .lock()
-            .expect("line-art cache poisoned")
-            .line_art
+            .expect("line-art alpha cache poisoned")
             .as_ref()
             .filter(|cached| cached.size == (w, h))
         {
             return Ok(cached.clone());
         }
-        let line_art = image::imageops::resize(&*self.line_art, w, h, FilterType::CatmullRom);
-        cancel.check()?;
-        let blurred = gaussian_blur(&line_art, cancel)?;
-        let built = Arc::new(ReducedLineArt {
-            size: (w, h),
-            line_art,
-            blurred,
-        });
-        let mut cache = self.cache.lock().expect("line-art cache poisoned");
-        cancel.check()?;
-        cache.line_art = Some(built.clone());
-        Ok(built)
-    }
-
-    fn reduced_fill(
-        &self,
-        foreground: &Arc<RgbaImage>,
-        w: u32,
-        h: u32,
-        cancel: &dyn Cancellation,
-    ) -> Result<Arc<ReducedFill>> {
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .expect("line-art cache poisoned")
-            .fill
-            .as_ref()
-            .filter(|cached| cached.size == (w, h) && Arc::ptr_eq(&cached.foreground, foreground))
-        {
-            return Ok(cached.clone());
-        }
-        let linear = color::LinearImage::from_rgba(foreground);
-        let silhouette = Silhouette::detect(foreground, cancel)?;
+        let linear = color::LinearImage::from_rgba(&self.foreground);
+        let silhouette = Silhouette::detect(&self.foreground, cancel)?;
         let fill = foreground_fill(&linear, silhouette.as_ref(), w, h, cancel)?;
-        let mut encoded = RgbaImage::new(w, h);
-        for (i, (pixel, output)) in fill.pixels.iter().zip(encoded.pixels_mut()).enumerate() {
+        let mut alpha = Vec::with_capacity(fill.pixels.len());
+        for (i, pixel) in fill.pixels.iter().enumerate() {
             if i.is_multiple_of(4096) {
                 cancel.check()?;
             }
-            *output = color::rgba(*pixel);
+            alpha.push(color::rgba(*pixel)[3]);
         }
-        let built = Arc::new(ReducedFill {
+        let built = Arc::new(TargetAlpha {
             size: (w, h),
-            foreground: foreground.clone(),
-            fill: encoded,
+            alpha,
         });
-        let mut cache = self.cache.lock().expect("line-art cache poisoned");
+        let mut cache = self.alpha.lock().expect("line-art alpha cache poisoned");
         cancel.check()?;
-        cache.fill = Some(built.clone());
+        *cache = Some(built.clone());
         Ok(built)
     }
 }
@@ -267,7 +207,7 @@ fn foreground_fill(
     let fill_source = isolated.as_ref().unwrap_or(linear);
     let base = lanczos::resize(fill_source, w as usize, h as usize, cancel)?;
     match silhouette {
-        Some(silhouette) => silhouette.target_alpha(base, fill_source, FILL_EDGE, cancel),
+        Some(silhouette) => silhouette.target_alpha(base, fill_source, ALPHA_EDGE, cancel),
         None => Ok(base),
     }
 }
@@ -341,25 +281,32 @@ fn sharpen(
         .ok_or_else(|| Error::Scaling("Invalid line-art dimensions".into()))
 }
 
-/// GIMP Multiply on encoded 8-bit channels: `round(base · line / 255)` for
-/// RGB, with the base alpha unchanged.
+/// GIMP Multiply on encoded 8-bit channels, `round(fill · line / 255)` for
+/// RGB, with `alpha` attached as straight alpha.
 fn multiply(
-    fill: &RgbaImage,
+    fill: &RgbImage,
     line_art: &GrayImage,
+    alpha: &[u8],
     cancel: &dyn Cancellation,
 ) -> Result<RgbaImage> {
-    if fill.dimensions() != line_art.dimensions() {
+    let (w, h) = fill.dimensions();
+    if line_art.dimensions() != (w, h) || alpha.len() != w as usize * h as usize {
         return Err(Error::InvalidDimensions);
     }
-    let mut output = fill.clone();
-    for (i, (pixel, line)) in output.pixels_mut().zip(line_art.pixels()).enumerate() {
+    let mut output = RgbaImage::new(w, h);
+    for (i, (((output, fill), line), &alpha)) in output
+        .pixels_mut()
+        .zip(fill.pixels())
+        .zip(line_art.pixels())
+        .zip(alpha)
+        .enumerate()
+    {
         if i.is_multiple_of(4096) {
             cancel.check()?;
         }
         let line = u16::from(line[0]);
-        for channel in &mut pixel.0[..3] {
-            *channel = ((u16::from(*channel) * line + 127) / 255) as u8;
-        }
+        let product = |channel: u8| ((u16::from(channel) * line + 127) / 255) as u8;
+        output.0 = [product(fill[0]), product(fill[1]), product(fill[2]), alpha];
     }
     cancel.check()?;
     Ok(output)
@@ -369,9 +316,9 @@ fn multiply(
 mod tests {
     use super::*;
     use crate::CancellationToken;
-    use image::{Luma, Rgba};
+    use image::{Luma, Rgb, Rgba};
 
-    /// A red disc-like square on transparency, with one soft alpha row.
+    /// A red square on transparency with one soft alpha row.
     fn foreground() -> Arc<RgbaImage> {
         Arc::new(RgbaImage::from_fn(48, 40, |x, y| {
             if !(8..40).contains(&x) || !(6..34).contains(&y) {
@@ -384,20 +331,37 @@ mod tests {
         }))
     }
 
-    fn flat_line_art(value: u8) -> Arc<GrayImage> {
-        Arc::new(GrayImage::from_pixel(48, 40, Luma([value])))
+    /// A fill whose RGB differs from the foreground's, so the result's RGB
+    /// can only come from the fill and its alpha only from the foreground.
+    fn fill(w: u32, h: u32) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| {
+            Rgb([(x * 9) as u8, (y * 11 + 3) as u8, 255 - (x + y) as u8])
+        })
     }
 
-    fn session(line_art: Arc<GrayImage>) -> LineArtSession {
-        LineArtSession::new(&foreground(), line_art).unwrap()
+    fn layers(line_art: GrayImage) -> LineArtLayers {
+        let (w, h) = line_art.dimensions();
+        LineArtLayers::new(line_art, fill(w, h), &|| false).unwrap()
     }
 
-    fn expected_fill(foreground: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    fn flat(value: u8) -> LineArtLayers {
+        layers(GrayImage::from_pixel(24, 20, Luma([value])))
+    }
+
+    fn composer() -> LineArtComposer {
+        LineArtComposer::new(foreground()).unwrap()
+    }
+
+    fn expected_alpha(w: u32, h: u32) -> Vec<u8> {
         let cancel = CancellationToken::default();
-        let linear = color::LinearImage::from_rgba(foreground);
-        let silhouette = Silhouette::detect(foreground, &cancel).unwrap();
+        let foreground = foreground();
+        let linear = color::LinearImage::from_rgba(&foreground);
+        let silhouette = Silhouette::detect(&foreground, &cancel).unwrap();
         let fill = foreground_fill(&linear, silhouette.as_ref(), w, h, &cancel).unwrap();
-        RgbaImage::from_fn(w, h, |x, y| color::rgba(fill.pixels[(y * w + x) as usize]))
+        fill.pixels
+            .iter()
+            .map(|pixel| color::rgba(*pixel)[3])
+            .collect()
     }
 
     #[test]
@@ -415,9 +379,7 @@ mod tests {
         // 0.300478 (±1..3), 0.058438 (±2..3) and 0.004433 (±3). A 64|192
         // step at amount 1.5 moves each side by 1.5 · 128 · tail.
         let step = GrayImage::from_fn(12, 3, |x, _| Luma([if x < 6 { 64 } else { 192 }]));
-        let cancel = CancellationToken::default();
-        let blurred = gaussian_blur(&step, &cancel).unwrap();
-        let sharpened = sharpen(&step, &blurred, 1.5, &cancel).unwrap();
+        let sharpened = layers(step).line_art(Strength::new(40), &|| false).unwrap();
         for y in 0..3 {
             let row: Vec<u8> = (0..12).map(|x| sharpened.get_pixel(x, y)[0]).collect();
             assert_eq!(
@@ -430,56 +392,62 @@ mod tests {
 
     #[test]
     fn unsharp_mask_leaves_a_flat_image_unchanged() {
-        let cancel = CancellationToken::default();
         for value in [0, 1, 128, 254, 255] {
             let flat = GrayImage::from_pixel(9, 7, Luma([value]));
-            let blurred = gaussian_blur(&flat, &cancel).unwrap();
-            assert_eq!(sharpen(&flat, &blurred, 3.0, &cancel).unwrap(), flat);
+            assert_eq!(
+                layers(flat.clone())
+                    .line_art(Strength::new(100), &|| false)
+                    .unwrap(),
+                flat
+            );
         }
     }
 
     #[test]
-    fn white_line_art_leaves_the_fill_unchanged() {
-        let output = session(flat_line_art(255))
-            .resize_with_foreground(&foreground(), 24, 20, Strength::new(100), &|| false)
+    fn white_line_art_leaves_the_fill_rgb_with_the_foreground_alpha() {
+        let output = composer()
+            .compose(&flat(255), Strength::new(100), &|| false)
             .unwrap();
-        assert_eq!(output, expected_fill(&foreground(), 24, 20));
-    }
-
-    #[test]
-    fn black_line_art_is_black_with_the_fill_alpha() {
-        let fill = expected_fill(&foreground(), 24, 20);
-        let output = session(flat_line_art(0))
-            .resize_with_foreground(&foreground(), 24, 20, Strength::default(), &|| false)
-            .unwrap();
-        assert!(fill.pixels().any(|pixel| (1..255).contains(&pixel[3])));
-        for (fill, output) in fill.pixels().zip(output.pixels()) {
-            assert_eq!(output.0, [0, 0, 0, fill[3]]);
+        let alpha = expected_alpha(24, 20);
+        assert!(alpha.iter().any(|alpha| (1..255).contains(alpha)));
+        assert!(alpha.contains(&0) && alpha.contains(&255));
+        for ((output, fill), alpha) in output.pixels().zip(fill(24, 20).pixels()).zip(alpha) {
+            assert_eq!(output.0, [fill[0], fill[1], fill[2], alpha]);
         }
     }
 
     #[test]
-    fn mid_gray_multiplies_each_channel_exactly_and_transparency_stays() {
-        let fill = expected_fill(&foreground(), 24, 20);
-        let output = session(flat_line_art(128))
-            .resize_with_foreground(&foreground(), 24, 20, Strength::new(0), &|| false)
+    fn black_line_art_is_black_with_the_foreground_alpha() {
+        let output = composer()
+            .compose(&flat(0), Strength::default(), &|| false)
             .unwrap();
-        assert!(fill.pixels().any(|pixel| pixel[3] == 0));
-        for (fill, output) in fill.pixels().zip(output.pixels()) {
+        for (output, alpha) in output.pixels().zip(expected_alpha(24, 20)) {
+            assert_eq!(output.0, [0, 0, 0, alpha]);
+        }
+    }
+
+    #[test]
+    fn mid_gray_multiplies_each_channel_exactly() {
+        let output = composer()
+            .compose(&flat(128), Strength::new(0), &|| false)
+            .unwrap();
+        for ((output, fill), alpha) in output
+            .pixels()
+            .zip(fill(24, 20).pixels())
+            .zip(expected_alpha(24, 20))
+        {
             for channel in 0..3 {
                 let expected = (f64::from(fill[channel]) * 128. / 255.).round() as u8;
                 assert_eq!(output[channel], expected);
             }
-            assert_eq!(output[3], fill[3]);
-            if fill[3] == 0 {
-                assert_eq!(output.0, [0; 4]);
-            }
+            assert_eq!(output[3], alpha);
         }
         assert_eq!(
             multiply(
-                &RgbaImage::from_pixel(1, 1, Rgba([200, 255, 1, 77])),
+                &RgbImage::from_pixel(1, 1, Rgb([200, 255, 1])),
                 &GrayImage::from_pixel(1, 1, Luma([128])),
-                &|| false,
+                &[77],
+                &CancellationToken::default()
             )
             .unwrap()
             .get_pixel(0, 0)
@@ -489,94 +457,78 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_raw_at_source_size_and_bicubic_sharpened_when_reduced() {
-        let line_art = Arc::new(GrayImage::from_fn(48, 40, |x, y| {
-            Luma([if x == 20 || y == 17 { 0 } else { 255 }])
-        }));
-        let session = session(line_art.clone());
-        let cancel = CancellationToken::default();
-        assert_eq!(
-            session
-                .line_art(48, 40, Strength::new(100), &cancel)
-                .unwrap(),
-            *line_art
-        );
-        let reduced = image::imageops::resize(&*line_art, 24, 20, FilterType::CatmullRom);
-        let blurred = gaussian_blur(&reduced, &cancel).unwrap();
-        for strength in [0, 40, 100] {
-            let strength = Strength::new(strength);
-            assert_eq!(
-                session.line_art(24, 20, strength, &cancel).unwrap(),
-                sharpen(&reduced, &blurred, strength.amount(), &cancel).unwrap()
-            );
+    fn the_sharpened_line_art_is_multiplied_without_resampling() {
+        let line_art = GrayImage::from_fn(24, 20, |x, y| {
+            Luma([if x == 9 || y == 13 { 0 } else { 230 }])
+        });
+        let layers = layers(line_art);
+        let composer = composer();
+        for strength in [0, 40, 100].map(Strength::new) {
+            let sharpened = layers.line_art(strength, &|| false).unwrap();
+            let output = composer.compose(&layers, strength, &|| false).unwrap();
+            for ((output, fill), line) in output
+                .pixels()
+                .zip(fill(24, 20).pixels())
+                .zip(sharpened.pixels())
+            {
+                for channel in 0..3 {
+                    let expected =
+                        (f64::from(fill[channel]) * f64::from(line[0]) / 255.).round() as u8;
+                    assert_eq!(output[channel], expected);
+                }
+            }
         }
-    }
-
-    #[test]
-    fn identity_returns_the_foreground() {
-        let foreground = foreground();
-        assert_eq!(
-            session(flat_line_art(0))
-                .resize_with_foreground(&foreground, 48, 40, Strength::default(), &|| false)
-                .unwrap(),
-            *foreground
+        assert_ne!(
+            layers.line_art(Strength::new(0), &|| false).unwrap(),
+            layers.line_art(Strength::new(100), &|| false).unwrap()
         );
     }
 
     #[test]
     fn dimensions_are_validated() {
-        let source = foreground();
-        assert!(matches!(
-            LineArtSession::new(&source, Arc::new(GrayImage::new(48, 39))),
-            Err(Error::InvalidDimensions)
-        ));
-        assert!(matches!(
-            LineArtSession::new(&RgbaImage::new(0, 0), Arc::new(GrayImage::new(0, 0))),
-            Err(Error::InvalidDimensions)
-        ));
-        let session = session(flat_line_art(255));
         let cancel = CancellationToken::default();
-        for (w, h) in [(0, 20), (24, 0), (49, 40), (48, 41)] {
+        assert!(matches!(
+            LineArtLayers::new(GrayImage::new(24, 20), RgbImage::new(24, 19), &cancel),
+            Err(Error::InvalidDimensions)
+        ));
+        assert!(matches!(
+            LineArtLayers::new(GrayImage::new(0, 0), RgbImage::new(0, 0), &cancel),
+            Err(Error::InvalidDimensions)
+        ));
+        assert!(matches!(
+            LineArtComposer::new(Arc::new(RgbaImage::new(0, 0))),
+            Err(Error::InvalidDimensions)
+        ));
+        let composer = composer();
+        for (w, h) in [(49, 40), (48, 41)] {
             assert!(matches!(
-                session.line_art(w, h, Strength::default(), &cancel),
-                Err(Error::InvalidDimensions)
-            ));
-            assert!(matches!(
-                session.resize_with_foreground(&source, w, h, Strength::default(), &cancel),
+                composer.compose(&layers(GrayImage::new(w, h)), Strength::default(), &cancel),
                 Err(Error::InvalidDimensions)
             ));
         }
-        assert!(matches!(
-            session.resize_with_foreground(
-                &Arc::new(RgbaImage::new(24, 20)),
-                24,
-                20,
+        // The foreground's own size is a valid target.
+        composer
+            .compose(
+                &layers(GrayImage::new(48, 40)),
                 Strength::default(),
-                &cancel
-            ),
-            Err(Error::InvalidDimensions)
-        ));
+                &cancel,
+            )
+            .unwrap();
     }
 
     #[test]
     fn cancellation_at_any_check_never_caches_cancelled_work() {
-        let line_art = Arc::new(GrayImage::from_fn(48, 40, |x, _| {
-            Luma([if x % 5 == 0 { 20 } else { 250 }])
-        }));
-        let foreground = foreground();
-        let expected = LineArtSession::new(&foreground, line_art.clone())
-            .unwrap()
-            .resize_with_foreground(&foreground, 24, 20, Strength::default(), &|| false)
+        let layers = flat(90);
+        let expected = composer()
+            .compose(&layers, Strength::default(), &|| false)
             .unwrap();
-        let reduced = image::imageops::resize(&*line_art, 24, 20, FilterType::CatmullRom);
         let mut cancelled_runs = 0;
         for allowed_checks in 0.. {
-            let session = LineArtSession::new(&foreground, line_art.clone()).unwrap();
+            let composer = composer();
             let checks = std::sync::atomic::AtomicUsize::new(0);
             let cancel =
                 || checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= allowed_checks;
-            match session.resize_with_foreground(&foreground, 24, 20, Strength::default(), &cancel)
-            {
+            match composer.compose(&layers, Strength::default(), &cancel) {
                 Ok(output) => {
                     assert_eq!(output, expected);
                     break;
@@ -584,73 +536,55 @@ mod tests {
                 Err(Error::Cancelled) => cancelled_runs += 1,
                 Err(error) => panic!("unexpected error: {error}"),
             }
-            // Only a stage that completed before cancellation may be cached.
-            let cache = session.cache.lock().unwrap();
-            if allowed_checks == 0 {
-                assert!(cache.fill.is_none() && cache.line_art.is_none());
+            // Only an alpha that completed before cancellation may be cached.
+            if let Some(alpha) = composer.alpha.lock().unwrap().as_ref() {
+                assert_eq!(alpha.alpha, expected_alpha(24, 20));
             }
-            if let Some(fill) = &cache.fill {
-                assert_eq!(fill.fill, expected_fill(&foreground, 24, 20));
-            }
-            if let Some(cached) = &cache.line_art {
-                assert_eq!(cached.line_art, reduced);
-            }
-            drop(cache);
             assert_eq!(
-                session
-                    .resize_with_foreground(&foreground, 24, 20, Strength::default(), &|| false)
+                composer
+                    .compose(&layers, Strength::default(), &|| false)
                     .unwrap(),
                 expected
             );
         }
         assert!(cancelled_runs > 10, "cancellation was checked throughout");
-        let session = LineArtSession::new(&foreground, line_art).unwrap();
-        let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        assert!(matches!(
-            session.line_art(24, 20, Strength::default(), &cancelled),
-            Err(Error::Cancelled)
-        ));
-        assert!(session.cache.lock().unwrap().line_art.is_none());
     }
 
     #[test]
-    fn strength_change_reuses_the_reduced_fill_and_line_art() {
-        let line_art = Arc::new(GrayImage::from_fn(48, 40, |x, y| {
+    fn strength_change_reuses_the_cached_alpha() {
+        let composer = composer();
+        let layers = layers(GrayImage::from_fn(24, 20, |x, y| {
             Luma([if (x + y) % 9 < 2 { 30 } else { 240 }])
         }));
-        let session = session(line_art.clone());
-        let foreground = foreground();
         let cancel = CancellationToken::default();
-        session
-            .resize_with_foreground(&foreground, 24, 20, Strength::new(40), &cancel)
+        composer
+            .compose(&layers, Strength::new(40), &cancel)
             .unwrap();
-        let (fill, reduced) = {
-            let cache = session.cache.lock().unwrap();
-            (cache.fill.clone().unwrap(), cache.line_art.clone().unwrap())
-        };
-        let strong = session
-            .resize_with_foreground(&foreground, 24, 20, Strength::new(100), &cancel)
+        let alpha = composer.alpha.lock().unwrap().clone().unwrap();
+        let strong = composer
+            .compose(&layers, Strength::new(100), &cancel)
             .unwrap();
-        {
-            let cache = session.cache.lock().unwrap();
-            assert!(Arc::ptr_eq(cache.fill.as_ref().unwrap(), &fill));
-            assert!(Arc::ptr_eq(cache.line_art.as_ref().unwrap(), &reduced));
-        }
-        let fresh = LineArtSession::new(&foreground, line_art)
+        assert!(Arc::ptr_eq(
+            composer.alpha.lock().unwrap().as_ref().unwrap(),
+            &alpha
+        ));
+        let fresh = LineArtComposer::new(foreground())
             .unwrap()
-            .resize_with_foreground(&foreground, 24, 20, Strength::new(100), &cancel)
+            .compose(&layers, Strength::new(100), &cancel)
             .unwrap();
         assert_eq!(strong, fresh);
 
-        // Another foreground or size replaces the single fill entry.
-        let other = Arc::new((*foreground).clone());
-        session
-            .resize_with_foreground(&other, 24, 20, Strength::new(100), &cancel)
+        // Another size replaces the single alpha entry.
+        composer
+            .compose(
+                &LineArtLayers::new(GrayImage::new(12, 10), fill(12, 10), &cancel).unwrap(),
+                Strength::new(100),
+                &cancel,
+            )
             .unwrap();
-        assert!(!Arc::ptr_eq(
-            session.cache.lock().unwrap().fill.as_ref().unwrap(),
-            &fill
-        ));
+        assert_eq!(
+            composer.alpha.lock().unwrap().as_ref().unwrap().size,
+            (12, 10)
+        );
     }
 }

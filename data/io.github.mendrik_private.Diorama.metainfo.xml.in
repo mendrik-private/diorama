@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.22" date="2026-09-29">
+      <description>
+        <p>Game Asset scaling now overlays locally generated FLUX.2 [klein] 9B line art on a de-inked fill, with a single Strength control and a progress bar that estimates the remaining generation time. Image selections also follow the image's opaque outline.</p>
+      </description>
+    </release>
     <release version="0.3.21" date="2026-09-26">
       <description>
         <p>Makes highlight thickness follow the shared pen setting: a setting of 1 renders at 2 image pixels, and the setting now persists through creation, editing, and image transforms.</p>

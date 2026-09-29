@@ -6,7 +6,7 @@
 mod api;
 pub use api::{Cancellation, CancellationToken, Error, GameAssetAa, Result};
 use image::{GrayImage, RgbaImage};
-pub use line_art::{LineArtSession, Strength};
+pub use line_art::{LineArtComposer, LineArtLayers, Strength};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},

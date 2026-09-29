@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Set up Diorama's local FLUX.2 [klein] 4B line-art model (no system changes).
+"""Set up Diorama's local FLUX.2 [klein] 9B line-art model (no system changes).
 
 Run with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA). The
 script is idempotent. It:
 
 1. creates a virtual environment with ``--system-site-packages`` (so it
-   reuses that PyTorch) and installs pinned diffusers, transformers and
-   accelerate into it, holding the existing torch version fixed;
-2. downloads the pinned model revision (Apache 2.0) from Hugging Face;
-3. records the environment's interpreter in ``line-art-runtime.conf``.
+   reuses that PyTorch) and installs pinned diffusers, transformers,
+   accelerate and gguf into it, holding the existing torch version fixed;
+2. downloads the pinned pipeline revision from Hugging Face, without its bf16
+   transformer weights. The model is gated under the FLUX Non-Commercial
+   License: accept it on the model page and run ``hf auth login`` first;
+3. downloads the pinned Q4_K_M GGUF transformer and verifies its SHA-256;
+4. records the environment's interpreter in ``line-art-runtime.conf``.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,22 +23,38 @@ import subprocess
 import sys
 import tempfile
 
-REPOSITORY = "black-forest-labs/FLUX.2-klein-4B"
-REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
-PINS = {"diffusers": "0.40.0", "transformers": "5.17.0", "accelerate": "1.15.0"}
-# The diffusers pipeline layout only; the single-file checkpoint and sample
-# images in the repository are not needed.
+REPOSITORY = "black-forest-labs/FLUX.2-klein-9B"
+REVISION = "92196c8e11f7b6cf2b7493e037d8c5345c559216"
+PINS = {
+    "diffusers": "0.40.0",
+    "transformers": "5.17.0",
+    "accelerate": "1.15.0",
+    "gguf": "0.19.0",
+}
+# The diffusers pipeline layout without the bf16 transformer weights, which
+# the GGUF replaces; the single-file checkpoint and sample images in the
+# repository are not needed either.
 ALLOW_PATTERNS = [
     "model_index.json",
     "LICENSE.md",
     "scheduler/*",
     "text_encoder/*",
     "tokenizer/*",
-    "transformer/*",
+    "transformer/config.json",
     "vae/*",
 ]
 REVISION_MARKER = ".diorama-revision"
+GGUF_REPOSITORY = "unsloth/FLUX.2-klein-9B-GGUF"
+GGUF_REVISION = "fde8634245fe6b749a221c25b34672b5b8fbd079"
+GGUF_FILE = "flux-2-klein-9b-Q4_K_M.gguf"
+# From the Hugging Face API (LFS metadata) of GGUF_REVISION.
+GGUF_SHA256 = "5489463ed96056b0bb5472abb5d1bba7055e48d574e37877acb43b407465e26f"
+GGUF_SIZE = 5_909_829_920
+# Written only after the file's SHA-256 matched; Diorama checks it and the
+# size instead of hashing 5.9 GB on every run.
+GGUF_MARKER = f"{GGUF_FILE}.diorama-sha256"
 DOWNLOAD_FAILED_EXIT = 3
+DOWNLOAD_GATED_EXIT = 4
 
 PROBE = """
 import importlib.metadata as metadata, json, os, sys
@@ -60,8 +80,8 @@ else:
         "device": torch.cuda.get_device_name(0) if available else None,
     }
     try:
-        import accelerate, transformers
-        from diffusers import Flux2KleinPipeline
+        import accelerate, gguf, transformers
+        from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel, GGUFQuantizationConfig
     except Exception as error:
         report["pipeline_error"] = repr(error)
 print(json.dumps(report))
@@ -92,6 +112,7 @@ DOWNLOAD = """
 import sys
 import httpx
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 repository, revision, destination = sys.argv[1:4]
 try:
     snapshot_download(
@@ -100,10 +121,17 @@ try:
         local_dir=destination,
         allow_patterns=sys.argv[4:],
     )
+except GatedRepoError as error:
+    print(f"{type(error).__name__}: {error}", file=sys.stderr)
+    sys.exit(%d)
+except HfHubHTTPError as error:
+    print(f"{type(error).__name__}: {error}", file=sys.stderr)
+    status = getattr(error.response, "status_code", None)
+    sys.exit(%d if status in (401, 403) else %d)
 except (httpx.HTTPError, OSError) as error:
     print(f"{type(error).__name__}: {error}", file=sys.stderr)
     sys.exit(%d)
-""" % DOWNLOAD_FAILED_EXIT
+""" % (DOWNLOAD_GATED_EXIT, DOWNLOAD_GATED_EXIT, DOWNLOAD_FAILED_EXIT, DOWNLOAD_FAILED_EXIT)
 
 
 def cache_home():
@@ -112,7 +140,12 @@ def cache_home():
 
 def model_directory():
     configured = os.environ.get("DIORAMA_LINE_ART_MODEL")
-    return Path(configured) if configured else cache_home() / "diorama/flux2-klein-4b"
+    return Path(configured) if configured else cache_home() / "diorama/flux2-klein-9b"
+
+
+def gguf_path():
+    configured = os.environ.get("DIORAMA_LINE_ART_GGUF")
+    return Path(configured) if configured else cache_home() / "diorama/flux2-klein-9b-gguf" / GGUF_FILE
 
 
 def runtime_config_path():
@@ -123,8 +156,10 @@ def runtime_config_path():
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
-        epilog="The model goes to $XDG_CACHE_HOME/diorama/flux2-klein-4b "
-        "(or DIORAMA_LINE_ART_MODEL); the runtime is recorded in "
+        epilog="The pipeline goes to $XDG_CACHE_HOME/diorama/flux2-klein-9b "
+        "(or DIORAMA_LINE_ART_MODEL), the GGUF transformer to "
+        f"$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf/{GGUF_FILE} "
+        "(or DIORAMA_LINE_ART_GGUF); the runtime is recorded in "
         "$XDG_CONFIG_HOME/diorama/line-art-runtime.conf.",
     )
     parser.add_argument(
@@ -268,27 +303,87 @@ def model_complete(model_dir):
 
 def ensure_model(python, model_dir):
     if model_complete(model_dir):
-        print(f"FLUX.2 [klein] 4B revision {REVISION} already installed: {model_dir}")
-        return
+        print(f"FLUX.2 [klein] 9B revision {REVISION} already installed: {model_dir}")
+    else:
+        install_model(python, model_dir)
+
+
+def install_model(python, model_dir):
     model_dir.mkdir(parents=True, exist_ok=True)
     # A stale marker must not vouch for a partial or different download.
     (model_dir / REVISION_MARKER).unlink(missing_ok=True)
-    print(f"Downloading {REPOSITORY}@{REVISION} (about 16 GB) to {model_dir}", flush=True)
+    print(f"Downloading {REPOSITORY}@{REVISION} (about 16.5 GB) to {model_dir}", flush=True)
+    download(python, REPOSITORY, REVISION, model_dir, ALLOW_PATTERNS)
+    if not (model_dir / "model_index.json").is_file():
+        raise SystemExit(f"The download finished without model_index.json in {model_dir}")
+    write_atomically(model_dir / REVISION_MARKER, f"{REVISION}\n")
+    print(f"Installed FLUX.2 [klein] 9B revision {REVISION}: {model_dir}")
+
+
+def download(python, repository, revision, destination, patterns):
+    """Resumable: completed files are not downloaded again."""
     result = subprocess.run(
-        [str(python), "-c", DOWNLOAD, REPOSITORY, REVISION, str(model_dir), *ALLOW_PATTERNS]
+        [str(python), "-c", DOWNLOAD, repository, revision, str(destination), *patterns]
     )
+    if result.returncode == DOWNLOAD_GATED_EXIT:
+        raise SystemExit(
+            f"{repository} is gated under the FLUX Non-Commercial License. Sign in at "
+            f"https://huggingface.co/{repository}, accept the licence on the model page, "
+            f"then run `{Path(python).with_name('hf')} auth login` and rerun this script."
+        )
     if result.returncode == DOWNLOAD_FAILED_EXIT:
         raise SystemExit(
-            f"Could not download {REPOSITORY} from Hugging Face (see the error above). "
+            f"Could not download {repository} from Hugging Face (see the error above). "
             "Check the network connection and disk space, then rerun this script; "
             "completed files are not downloaded again."
         )
     if result.returncode != 0:
         raise SystemExit("The model download failed; rerun this script to resume it.")
-    if not (model_dir / "model_index.json").is_file():
-        raise SystemExit(f"The download finished without model_index.json in {model_dir}")
-    write_atomically(model_dir / REVISION_MARKER, f"{REVISION}\n")
-    print(f"Installed FLUX.2 [klein] 4B revision {REVISION}: {model_dir}")
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(16 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def gguf_complete(gguf):
+    marker = gguf.with_name(GGUF_MARKER)
+    return (
+        gguf.is_file()
+        and gguf.stat().st_size == GGUF_SIZE
+        and marker.is_file()
+        and marker.read_text(encoding="utf-8").strip() == GGUF_SHA256
+    )
+
+
+def ensure_gguf(python, gguf):
+    if gguf_complete(gguf):
+        print(f"{GGUF_FILE} ({GGUF_REPOSITORY}@{GGUF_REVISION}) already verified: {gguf}")
+        return
+    # A stale marker must not vouch for a partial or different file.
+    gguf.with_name(GGUF_MARKER).unlink(missing_ok=True)
+    if not (gguf.is_file() and gguf.stat().st_size == GGUF_SIZE):
+        print(
+            f"Downloading {GGUF_FILE} from {GGUF_REPOSITORY}@{GGUF_REVISION} (5.9 GB) "
+            f"to {gguf.parent}",
+            flush=True,
+        )
+        gguf.parent.mkdir(parents=True, exist_ok=True)
+        download(python, GGUF_REPOSITORY, GGUF_REVISION, gguf.parent, [GGUF_FILE])
+        if gguf.name != GGUF_FILE:
+            (gguf.parent / GGUF_FILE).replace(gguf)
+    print(f"Verifying the SHA-256 of {gguf}", flush=True)
+    actual = sha256(gguf)
+    if actual != GGUF_SHA256:
+        raise SystemExit(
+            f"{gguf} has SHA-256 {actual}, not the pinned {GGUF_SHA256}. "
+            "Remove it and rerun this script."
+        )
+    write_atomically(gguf.with_name(GGUF_MARKER), f"{GGUF_SHA256}\n")
+    print(f"Installed {GGUF_FILE} ({GGUF_REPOSITORY}@{GGUF_REVISION}): {gguf}")
 
 
 def runtime_configuration(python, library_path):
@@ -303,6 +398,7 @@ def main(argv=None):
     python, report = ensure_environment(arguments.venv)
     report_torch(report)
     ensure_model(python, model_directory())
+    ensure_gguf(python, gguf_path())
     config = runtime_config_path()
     write_atomically(config, runtime_configuration(python, os.environ.get("LD_LIBRARY_PATH")))
     print(f"Recorded line-art runtime: {config}")

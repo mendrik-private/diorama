@@ -4,6 +4,7 @@ src/application.rs
 src/canvas/mod.rs
 src/window/mod.rs
 src/window/print.rs
+src/window/scale.rs
 src/window/annotation.rs
 src/window/tool.rs
 src/tools/annotation/arrow.rs

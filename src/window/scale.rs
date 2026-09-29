@@ -1,4 +1,10 @@
-use crate::document::Resampling;
+use std::time::Duration;
+
+use crate::{document::Resampling, i18n::gettext, tools::line_art::Progress};
+
+/// How often a pending Game Asset preview shows the latest generation
+/// progress.
+pub(super) const SCALE_PROGRESS_REFRESH: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScaleUnit {
@@ -46,6 +52,21 @@ pub(super) fn scale_unit(index: u32) -> ScaleUnit {
     }
 }
 
+/// The progress bar's text: whole seconds left, rounded up, or minutes from
+/// 90 s. Once the model is done, the preview is still being composed.
+pub(super) fn generation_progress_text(progress: Progress) -> String {
+    if progress.fraction >= 1. {
+        return gettext("Finishing line art…");
+    }
+    let seconds = progress.remaining.as_secs_f64().ceil().max(1.) as u64;
+    if seconds < 90 {
+        gettext("Generating line art… ~{seconds} s left").replace("{seconds}", &seconds.to_string())
+    } else {
+        gettext("Generating line art… ~{minutes} min left")
+            .replace("{minutes}", &seconds.div_ceil(60).to_string())
+    }
+}
+
 pub(super) fn resampling_index(resampling: Resampling) -> u32 {
     match resampling {
         Resampling::Nearest => 0,
@@ -74,23 +95,33 @@ mod tests {
         Ok(image.clone())
     }
 
-    fn fixture_line_art(
+    fn fixture_pair(
         image: &image::RgbaImage,
+        size: (u32, u32),
         cancel: &CancellationToken,
-    ) -> crate::error::Result<image::GrayImage> {
-        let mut line_art = image::GrayImage::new(image.width(), image.height());
-        for (index, (source, output)) in image.pixels().zip(line_art.pixels_mut()).enumerate() {
-            if index.is_multiple_of(4096) {
-                cancel.check()?;
-            }
-            output[0] = if source[0].max(source[1]).max(source[2]) < 48 {
-                0
-            } else {
-                255
-            };
+        progress: &dyn Fn(Progress),
+    ) -> crate::error::Result<crate::tools::line_art::LineArtPair> {
+        crate::tools::scale::game_asset::model_like_test_pair(image, size, cancel, progress)
+    }
+
+    #[test]
+    fn generation_progress_text_rounds_up_to_seconds_then_minutes() {
+        let text = |fraction, seconds| {
+            generation_progress_text(Progress {
+                fraction,
+                remaining: Duration::from_secs_f64(seconds),
+            })
+        };
+        for (seconds, expected) in [
+            (0., "Generating line art… ~1 s left"),
+            (11.2, "Generating line art… ~12 s left"),
+            (89., "Generating line art… ~89 s left"),
+            (90., "Generating line art… ~2 min left"),
+            (125., "Generating line art… ~3 min left"),
+        ] {
+            assert_eq!(text(0.5, seconds), expected);
         }
-        cancel.check()?;
-        Ok(line_art)
+        assert_eq!(text(1., 0.), "Finishing line art…");
     }
 
     #[test]
@@ -130,7 +161,7 @@ mod tests {
         let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
             source.clone(),
             remove_background,
-            Arc::new(fixture_line_art),
+            Arc::new(fixture_pair),
         ));
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(0);
@@ -184,7 +215,7 @@ mod tests {
             wait_for_preview();
             assert_eq!(window.0.settings.game_asset_options(), options);
             let expected = session
-                .resize(32, 27, options, &CancellationToken::default())
+                .resize(32, 27, options, &CancellationToken::default(), &|_| {})
                 .unwrap();
             assert_eq!(
                 window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
@@ -218,6 +249,7 @@ mod tests {
                 27,
                 GameAssetOptions::new(100),
                 &CancellationToken::default(),
+                &|_| {},
             )
             .unwrap();
         assert_eq!(
@@ -328,6 +360,136 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
+    fn game_asset_generation_shows_estimated_progress_and_resets_on_cancellation() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        adw::init().expect("GTK initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.ScaleProgressTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let source = Arc::new(image::RgbaImage::from_fn(96, 80, |x, y| {
+            image::Rgba(if (y as f64 - (0.57 * x as f64 + 10.)).abs() < 3. {
+                [8, 10, 4, 255]
+            } else {
+                [130, 170, 90, 255]
+            })
+        }));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: source.clone(),
+                path: None,
+                metadata: Default::default(),
+            })));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&source).unwrap()));
+        window.0.rendered.replace(Some((*source).clone()));
+        window.0.content_stack.set_visible_child_name("viewer");
+        window.update_action_states();
+        // Each generation reports an estimate, then runs until released or
+        // cancelled.
+        let release = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let generator: Arc<crate::tools::scale::game_asset::LineArtGenerator> = {
+            let (release, runs) = (release.clone(), runs.clone());
+            Arc::new(move |image, size, cancel, progress| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                progress(Progress {
+                    fraction: 0.25,
+                    remaining: Duration::from_millis(11_200),
+                });
+                while !release.load(Ordering::Relaxed) {
+                    cancel.check()?;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                fixture_pair(image, size, cancel, progress)
+            })
+        };
+        let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
+            source.clone(),
+            Arc::new(identity_background_remover),
+            generator,
+        ));
+        window.0.scale_button.set_active(true);
+        window.0.scale_method.set_selected(2);
+        window.0.scale_game_asset.replace(Some(session.clone()));
+        assert!(!window.0.scale_progress.get_visible());
+        window.0.scale_width.set_value(32.);
+        window.present();
+
+        let context = glib::MainContext::default();
+        let wait_until = |condition: &dyn Fn() -> bool, what: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !condition() && std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::yield_now();
+            }
+            assert!(condition(), "{what}");
+        };
+        let progress = &window.0.scale_progress;
+        wait_until(&|| progress.get_visible(), "the estimate is shown");
+        assert_eq!(
+            progress.text().as_deref(),
+            Some("Generating line art… ~12 s left")
+        );
+        assert_eq!(progress.fraction(), 0.25);
+        assert!(window.0.scale_spinner.get_visible());
+
+        // A new size cancels the running generation and resets the bar.
+        let obsolete = window
+            .0
+            .scale_preview_cancellation
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .clone();
+        window.0.scale_width.set_value(48.);
+        assert!(obsolete.check().is_err());
+        assert!(!progress.get_visible());
+        assert_eq!(progress.fraction(), 0.);
+        wait_until(
+            &|| progress.get_visible(),
+            "the new generation's estimate is shown",
+        );
+        release.store(true, Ordering::Relaxed);
+        wait_until(
+            &|| !window.0.scale_spinner.get_visible(),
+            "the preview completed",
+        );
+        assert!(!progress.get_visible());
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        let expected = session
+            .resize(
+                48,
+                40,
+                GameAssetOptions::default(),
+                &CancellationToken::default(),
+                &|_| panic!("the pair is cached"),
+            )
+            .unwrap();
+        assert_eq!(
+            window.0.scale_preview.borrow().as_ref().unwrap().as_ref(),
+            &expected
+        );
+
+        // A Strength change reuses the pair: no generation, no bar.
+        window.0.scale_strength.set_value(100.);
+        wait_until(
+            &|| !window.0.scale_spinner.get_visible(),
+            "the re-sharpened preview completed",
+        );
+        assert!(!progress.get_visible());
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        window.0.window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display and compiled schema; run with GSETTINGS_BACKEND=memory"]
     fn game_asset_line_art_toggle_uses_the_preview_worker_without_committing_it() {
         adw::init().expect("GTK initialization");
         let application = adw::Application::builder()
@@ -361,7 +523,7 @@ mod tests {
         let session = Arc::new(crate::tools::scale::game_asset::Session::with_test_workers(
             source.clone(),
             Arc::new(identity_background_remover),
-            Arc::new(fixture_line_art),
+            Arc::new(fixture_pair),
         ));
         window.0.scale_button.set_active(true);
         window.0.scale_method.set_selected(2);
@@ -391,6 +553,7 @@ mod tests {
                 27,
                 GameAssetOptions::default(),
                 &CancellationToken::default(),
+                &|_| {},
             )
             .unwrap();
         assert_eq!(
@@ -423,7 +586,8 @@ mod tests {
                     32,
                     27,
                     GameAssetOptions::new(100),
-                    &CancellationToken::default()
+                    &CancellationToken::default(),
+                    &|_| {},
                 )
                 .unwrap()
         );
@@ -457,6 +621,7 @@ mod tests {
                 80,
                 GameAssetOptions::default(),
                 &CancellationToken::default(),
+                &|_| {},
             )
             .unwrap();
         assert_eq!(

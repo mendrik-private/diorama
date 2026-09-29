@@ -131,11 +131,13 @@ window responsive while larger edits render.
 - Preview scaling fitted to the window or at actual output-pixel size, and hold
   a control to compare against the original.
 - Choose nearest-neighbor, bicubic, Lanczos, or line-art Game Asset scaling.
-- Game Asset draws line art of the original artwork with FLUX.2 [klein],
-  removes its background with BiRefNet, and scales the isolated foreground with
-  Lanczos3. The line art is scaled with bicubic, sharpened with an unsharp
-  mask whose **Strength** (0–100, default 40) sets its amount, and multiplied
-  over the foreground. See [Game Asset scaling](docs/game-asset-scaling.md).
+- Game Asset has FLUX.2 [klein] draw line art and a fill without ink contours
+  at the output size, or at 512 pixels on the shorter side and then reduced,
+  sharpens the line art with an unsharp mask whose **Strength** (0–100,
+  default 40) sets its amount, multiplies it over the fill, and takes the
+  outline's transparency from a BiRefNet cutout. A progress bar estimates the remaining
+  generation time. See [Game Asset
+  scaling](docs/game-asset-scaling.md).
 - Reduce an image to 2–256 colors, optionally apply dithering, and preserve
   isolated accent colors.
 
@@ -335,43 +337,84 @@ download a second copy. The setup script verifies the checksum published by the
 
 ### Local line-art generation
 
-Game Asset scaling multiplies line art that [FLUX.2 [klein]
-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) draws from the
-original image, locally and offline, over the scaled foreground. Run setup once
-with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA):
+Game Asset scaling generates its line art and fill with [FLUX.2 [klein]
+9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B), locally and
+offline, using unsloth's [Q4_K_M GGUF
+transformer](https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF). The model is
+licensed under the FLUX Non-Commercial License; see [the attribution
+notice](THIRD_PARTY_FLUX2.md). Its Hugging Face repository is gated: sign in,
+accept the licence on the model page, and log in once with the token of that
+account:
 
 ```sh
+~/.cache/diorama/line-art-venv/bin/hf auth login   # after the first setup run
 python3 build-aux/setup-line-art.py
 ```
 
-Setup is idempotent. It creates `~/.cache/diorama/line-art-venv` with
+Run setup with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA).
+It is idempotent. It creates `~/.cache/diorama/line-art-venv` with
 `--system-site-packages`, so it reuses that PyTorch, and installs pinned
-diffusers, transformers, and accelerate. It then downloads the pinned model
-revision (about 16 GB) to `$XDG_CACHE_HOME/diorama/flux2-klein-4b`, and records
-the environment in `~/.config/diorama/line-art-runtime.conf`. An interrupted
-download can be resumed by rerunning it; completed files are kept.
+diffusers, transformers, accelerate, and gguf. It downloads the pinned pipeline
+revision without its bf16 transformer weights (text encoder, VAE, tokenizer,
+configuration and licence; about 16.5 GB) to
+`$XDG_CACHE_HOME/diorama/flux2-klein-9b`, and the pinned
+`flux-2-klein-9b-Q4_K_M.gguf` (5.9 GB) to
+`$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf`, whose SHA-256 it verifies:
+about 22 GB in all. Without access to the gated repository it says how to get
+it. Setup records the environment in `~/.config/diorama/line-art-runtime.conf`.
+An interrupted download can be resumed by rerunning it; completed files are
+kept.
 
-Inference runs in bf16 with every component loaded straight onto the GPU. The
-fixed prompt is encoded once and its embeddings are cached next to the model, so
-the text encoder (about 8 GB) and the transformer (about 8 GB) are never loaded
-together; plan for about 8 GB of free GPU memory. Diorama refuses CPU inference
-unless `DIORAMA_LINE_ART_DEVICE=cpu` is set. `DIORAMA_LINE_ART_PYTHON` and
-`DIORAMA_LINE_ART_MODEL` override the interpreter and model directory. The
-model must carry setup's revision marker; the worker never downloads anything.
-Flatpak uses the host runtime and an app-cache or host-cache model through its
-host-launch permission.
+For a target size, Diorama scales the target up until its shorter side is 512
+pixels (never down), rounds each side up to a multiple of 16, resizes the
+white-composited original to that size with Lanczos, and generates two images
+from it, one after the other on one model load: line art ("convert this to
+line-art, remove thin lines") and a fill ("remove the black outlines, change
+nothing else"). Both are cropped around the center to the scaled target. A
+target of at least 512 pixels per side is therefore generated at its own size
+and never resampled; a smaller one is reduced afterwards, the line art with
+bicubic and the fill with Lanczos. Any target from 1 pixel works, with an
+aspect ratio up to 8:1 and a generation of at most 1024 × 1024 pixels; a
+narrow target whose 512-pixel scaling would exceed that is generated at a
+smaller scale.
 
-Input is white-composited, reduced to at most 1024 pixels on its longest side
-with both sides rounded down to multiples of 16, and the result is restored to
-the original dimensions. Accepted results are cached in
-`$XDG_CACHE_HOME/diorama/line-art`, keyed by the input pixels, model revision,
-prompt, and generation settings, so a repeated image skips inference; the 64
-most recently used results are kept. Diorama rejects solid results and line art
-that does not line up with the source's colour edges; sparse or empty line art
-is accepted, so a flat source scales with fill only. Rejected, failed, and
-cancelled runs are never cached.
-The model is licensed under Apache 2.0; see [the attribution
-notice](THIRD_PARTY_FLUX2.md).
+Each prompt is encoded once, and its embeddings are cached next to the model.
+Encoding loads the text encoder (Qwen3-8B, only the 28 layers FLUX reads, in
+bf16) on the CPU, in a process of its own that exits before generation starts;
+it needs about 13 GB of RAM and takes about 10 s for both prompts. Generation
+loads the transformer and VAE straight onto the GPU and peaks at about 7.3 GB
+of GPU memory at 512². Diorama refuses CPU generation unless
+`DIORAMA_LINE_ART_DEVICE=cpu` is set. `DIORAMA_LINE_ART_PYTHON`,
+`DIORAMA_LINE_ART_MODEL`, and `DIORAMA_LINE_ART_GGUF` override the
+interpreter, pipeline directory, and GGUF file. The pipeline must carry setup's
+revision marker and the GGUF its size and verified hash; the worker never
+downloads anything. Flatpak uses the host runtime and an app-cache or
+host-cache model through its host-launch permission.
+
+Measured on an AMD Radeon 8060S (ROCm), per image with the model loaded. A
+generation runs both images and adds about 8 s of start-up, model load and
+warm-up (more when the 5.9 GB GGUF is not in the page cache). Every square
+target up to 512² is generated at 512², which takes about 35–40 s for both
+images and 45–50 s in all:
+
+| Generation | 512² | 640² | 768² | 1024² |
+|---|---|---|---|---|
+| Seconds per image | 16.5–19.7 | 27.3 | 43–51 | 87 |
+
+While a preview generates, a progress bar shows the estimated time left. The
+estimate starts from these measurements, scaled by how long earlier runs took
+on this computer, and follows the model's denoising steps once they run.
+Changing the size cancels the running generation.
+
+Accepted pairs are cached in `$XDG_CACHE_HOME/diorama/line-art`, keyed by the
+generation size, the reference pixels, the pipeline revision and GGUF hash, the
+prompts, seeds and generation settings, and the worker, so a repeated size
+skips inference, and targets under 512 pixels of the same aspect share one
+generation; the 64 most recently used pairs are kept (about 330 KB per pair at
+512²). A Strength change reuses the pair. Diorama rejects solid line art and
+line art that does not line up with the reference's colour edges; sparse or
+empty line art is accepted, so a flat source scales with the fill only.
+Rejected, failed, and cancelled runs are never cached.
 
 ### Optional embedded Python runtime
 

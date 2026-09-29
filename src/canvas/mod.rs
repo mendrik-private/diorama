@@ -772,31 +772,41 @@ fn edge_direction(edge: LassoBoundaryEdge) -> usize {
 /// two diagonal components touch, taking the clockwise continuation keeps the
 /// components as separate loops instead of joining them through that point.
 fn trace_lasso_contours(mask: &image::GrayImage) -> Vec<LassoContour> {
+    trace_opaque_contours(mask.width(), mask.height(), |x, y| {
+        opaque_mask_pixel(mask, x, y)
+    })
+}
+
+fn trace_opaque_contours(
+    width: u32,
+    height: u32,
+    opaque: impl Fn(i64, i64) -> bool,
+) -> Vec<LassoContour> {
     let mut edges = Vec::new();
-    for y in 0..mask.height() {
-        for x in 0..mask.width() {
-            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y)) {
+    for y in 0..height {
+        for x in 0..width {
+            if !opaque(i64::from(x), i64::from(y)) {
                 continue;
             }
-            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) - 1) {
+            if !opaque(i64::from(x), i64::from(y) - 1) {
                 edges.push(LassoBoundaryEdge {
                     start: (x, y),
                     end: (x + 1, y),
                 });
             }
-            if !opaque_mask_pixel(mask, i64::from(x) + 1, i64::from(y)) {
+            if !opaque(i64::from(x) + 1, i64::from(y)) {
                 edges.push(LassoBoundaryEdge {
                     start: (x + 1, y),
                     end: (x + 1, y + 1),
                 });
             }
-            if !opaque_mask_pixel(mask, i64::from(x), i64::from(y) + 1) {
+            if !opaque(i64::from(x), i64::from(y) + 1) {
                 edges.push(LassoBoundaryEdge {
                     start: (x + 1, y + 1),
                     end: (x, y + 1),
                 });
             }
-            if !opaque_mask_pixel(mask, i64::from(x) - 1, i64::from(y)) {
+            if !opaque(i64::from(x) - 1, i64::from(y)) {
                 edges.push(LassoBoundaryEdge {
                     start: (x, y + 1),
                     end: (x, y),
@@ -866,7 +876,7 @@ fn lasso_dash_segments(points: &[(f32, f32)], phase: f32) -> Vec<LassoDashSegmen
     for edge in points.windows(2) {
         let start = edge[0];
         let end = edge[1];
-        let length = (end.0 - start.0).abs() + (end.1 - start.1).abs();
+        let length = (end.0 - start.0).hypot(end.1 - start.1);
         if length <= f32::EPSILON {
             continue;
         }
@@ -896,6 +906,80 @@ fn lasso_dash_segments(points: &[(f32, f32)], phase: f32) -> Vec<LassoDashSegmen
         distance += length;
     }
     segments
+}
+
+/// Alpha-matte contours cached for the selected image source. The frame may
+/// move, resize, or rotate, but its immutable source pixels remain shared.
+#[derive(Debug, Clone)]
+pub(super) struct CachedImageSelection {
+    pixels: Arc<image::RgbaImage>,
+    contours: Vec<LassoContour>,
+}
+
+impl CachedImageSelection {
+    fn new(pixels: Arc<image::RgbaImage>) -> Self {
+        let contours = if pixels.width() != 0
+            && pixels.height() != 0
+            && pixels.pixels().any(|pixel| pixel[3] != 255)
+        {
+            trace_opaque_contours(pixels.width(), pixels.height(), |x, y| {
+                x >= 0
+                    && y >= 0
+                    && x < i64::from(pixels.width())
+                    && y < i64::from(pixels.height())
+                    && pixels.get_pixel(x as u32, y as u32)[3] != 0
+            })
+        } else {
+            Vec::new()
+        };
+        Self { pixels, contours }
+    }
+
+    fn matches(&self, pixels: &Arc<image::RgbaImage>) -> bool {
+        Arc::ptr_eq(&self.pixels, pixels)
+    }
+
+    fn has_contours(&self) -> bool {
+        !self.contours.is_empty()
+    }
+}
+
+fn image_contour_points(
+    contours: &[LassoContour],
+    pixels: &image::RgbaImage,
+    corners: [Point; 4],
+) -> Vec<Vec<Point>> {
+    let width = pixels.width().max(1) as f32;
+    let height = pixels.height().max(1) as f32;
+    let horizontal = Point {
+        x: corners[1].x - corners[0].x,
+        y: corners[1].y - corners[0].y,
+    };
+    let vertical = Point {
+        x: corners[3].x - corners[0].x,
+        y: corners[3].y - corners[0].y,
+    };
+    contours
+        .iter()
+        .map(|contour| {
+            contour
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    let horizontal_ratio = x as f32 / width;
+                    let vertical_ratio = y as f32 / height;
+                    Point {
+                        x: corners[0].x
+                            + horizontal.x * horizontal_ratio
+                            + vertical.x * vertical_ratio,
+                        y: corners[0].y
+                            + horizontal.y * horizontal_ratio
+                            + vertical.y * vertical_ratio,
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -996,6 +1080,7 @@ mod imp {
         pub(super) pencil_overlay: RefCell<Option<PencilOverlay>>,
         pub(super) annotation_previews: RefCell<PreviewLayers<AnnotationOverlay>>,
         pub(super) selection: RefCell<Option<SelectionHandles>>,
+        pub(super) image_selection: RefCell<Option<CachedImageSelection>>,
     }
 
     #[glib::object_subclass]
@@ -1145,6 +1230,8 @@ mod imp {
                         .map_or((1, 1), |texture| (texture.width(), texture.height())),
                     selection,
                     self.render_scale.get(),
+                    self.image_selection.borrow().as_ref(),
+                    self.crop_dash_phase.get(),
                 );
             }
             if let Some(image_bounds) = image_bounds
@@ -1349,6 +1436,8 @@ mod imp {
         image_dimensions: (i32, i32),
         selection: &SelectionHandles,
         render_scale: f64,
+        image_selection: Option<&CachedImageSelection>,
+        dash_phase: f32,
     ) {
         let scale_x = image_bounds.width() / image_dimensions.0.max(1) as f32;
         let scale_y = image_bounds.height() / image_dimensions.1.max(1) as f32;
@@ -1356,6 +1445,12 @@ mod imp {
             gtk::graphene::Point::new(
                 snap_to_device(image_bounds.x() + point.x * scale_x, render_scale),
                 snap_to_device(image_bounds.y() + point.y * scale_y, render_scale),
+            )
+        };
+        let map_unsnapped = |point: Point| {
+            gtk::graphene::Point::new(
+                image_bounds.x() + point.x * scale_x,
+                image_bounds.y() + point.y * scale_y,
             )
         };
         let mut outline = Vec::new();
@@ -1418,6 +1513,29 @@ mod imp {
             ] {
                 snapshot.append_stroke(&path, &gtk::gsk::Stroke::new(width), &color);
             }
+        }
+        if let (
+            Shape::Image {
+                pixels, corners, ..
+            },
+            Some(image_selection),
+        ) = (&selection.annotation.shape, image_selection)
+            && image_selection.matches(pixels)
+        {
+            let contours = image_contour_points(&image_selection.contours, pixels, *corners);
+            draw_dashed_image_contours(
+                snapshot,
+                contours.iter().map(|contour| {
+                    contour
+                        .iter()
+                        .copied()
+                        .map(map_unsnapped)
+                        .map(|point| (point.x(), point.y()))
+                        .collect()
+                }),
+                render_scale,
+                dash_phase,
+            );
         }
         for (kind, point) in handles(&selection.annotation) {
             let point = map(point);
@@ -1704,6 +1822,45 @@ mod imp {
                     )
                 };
                 snapshot.append_color(color, &rect);
+            }
+        }
+    }
+
+    fn draw_dashed_image_contours(
+        snapshot: &gtk::Snapshot,
+        contours: impl Iterator<Item = Vec<(f32, f32)>>,
+        render_scale: f64,
+        phase: f32,
+    ) {
+        let thickness = 1.0 / sanitized_render_scale(render_scale) as f32;
+        for points in contours {
+            let black = gtk::gsk::PathBuilder::new();
+            let white = gtk::gsk::PathBuilder::new();
+            let mut has_black = false;
+            let mut has_white = false;
+            for segment in lasso_dash_segments(&points, phase) {
+                let (builder, has_segment) = if segment.dash_index.rem_euclid(2) == 0 {
+                    (&black, &mut has_black)
+                } else {
+                    (&white, &mut has_white)
+                };
+                builder.move_to(segment.start.0, segment.start.1);
+                builder.line_to(segment.end.0, segment.end.1);
+                *has_segment = true;
+            }
+            if has_black {
+                snapshot.append_stroke(
+                    &black.to_path(),
+                    &gtk::gsk::Stroke::new(thickness),
+                    &gdk::RGBA::BLACK,
+                );
+            }
+            if has_white {
+                snapshot.append_stroke(
+                    &white.to_path(),
+                    &gtk::gsk::Stroke::new(thickness),
+                    &gdk::RGBA::WHITE,
+                );
             }
         }
     }
@@ -2149,6 +2306,12 @@ impl ImageCanvas {
             };
             if canvas.imp().crop_overlay.borrow().is_none()
                 && canvas.imp().lasso_overlay.borrow().is_none()
+                && !canvas
+                    .imp()
+                    .image_selection
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(CachedImageSelection::has_contours)
             {
                 canvas.imp().crop_dash_phase.set(0.0);
                 canvas.imp().crop_animation_running.set(false);
@@ -2260,7 +2423,38 @@ impl ImageCanvas {
         if self.imp().selection.borrow().as_ref() == selection.as_ref() {
             return;
         }
+        match selection
+            .as_ref()
+            .and_then(|selection| match &selection.annotation.shape {
+                Shape::Image { pixels, .. } => Some(pixels),
+                _ => None,
+            }) {
+            Some(pixels)
+                if self
+                    .imp()
+                    .image_selection
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|cached| cached.matches(pixels)) => {}
+            Some(pixels) => {
+                self.imp()
+                    .image_selection
+                    .replace(Some(CachedImageSelection::new(Arc::clone(pixels))));
+            }
+            None => {
+                self.imp().image_selection.borrow_mut().take();
+            }
+        }
         self.imp().selection.replace(selection);
+        if self
+            .imp()
+            .image_selection
+            .borrow()
+            .as_ref()
+            .is_some_and(CachedImageSelection::has_contours)
+        {
+            self.ensure_selection_animation();
+        }
         self.queue_draw();
     }
 
@@ -2587,9 +2781,10 @@ impl MiniMap {
 mod tests {
     use super::*;
     use crate::document::{
-        AnnotationId, BrushPoint, PencilGeometry, Rect, Shape, StrokePath, StrokeStyle,
+        AnnotationId, BrushPoint, PencilGeometry, Rect, Resampling, Shape, StrokePath, StrokeStyle,
     };
     use std::collections::{BTreeMap, HashSet};
+    use std::sync::Arc;
 
     fn mask_with_opaque_pixels(width: u32, height: u32, pixels: &[(u32, u32)]) -> image::GrayImage {
         let mut mask = image::GrayImage::new(width, height);
@@ -2681,6 +2876,134 @@ mod tests {
     fn lasso_contours_keep_diagonal_contacts_as_separate_loops() {
         let mask = mask_with_opaque_pixels(2, 2, &[(0, 0), (1, 1)]);
         assert_complete_closed_contours(&mask, 2);
+    }
+
+    #[test]
+    fn transparent_image_contours_are_cached_and_follow_the_affine_frame() {
+        let mut pixels = image::RgbaImage::new(2, 2);
+        pixels.get_pixel_mut(0, 0)[3] = 255;
+        let pixels = Arc::new(pixels);
+        let cached = CachedImageSelection::new(Arc::clone(&pixels));
+        assert!(
+            cached.matches(&pixels),
+            "the cache is keyed by source identity"
+        );
+        assert_eq!(
+            image_contour_points(
+                &cached.contours,
+                &pixels,
+                [
+                    Point { x: -20.0, y: 20.0 },
+                    Point { x: 80.0, y: 40.0 },
+                    Point { x: 100.0, y: 90.0 },
+                    Point { x: 0.0, y: 70.0 },
+                ],
+            ),
+            vec![vec![
+                Point { x: -20.0, y: 20.0 },
+                Point { x: 30.0, y: 30.0 },
+                Point { x: 40.0, y: 55.0 },
+                Point { x: -10.0, y: 45.0 },
+                Point { x: -20.0, y: 20.0 },
+            ]],
+            "the alpha contour must use the image frame basis, including off-canvas points"
+        );
+
+        let opaque = Arc::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        let transparent = Arc::new(image::RgbaImage::new(2, 2));
+        assert!(!CachedImageSelection::new(opaque).has_contours());
+        assert!(!CachedImageSelection::new(transparent).has_contours());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn annotation_selection_discards_image_alpha_cache_when_deselected_or_replaced() {
+        gtk::init().expect("GTK display initialization");
+        let canvas = ImageCanvas::default();
+        let pixels = Arc::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0, 0, 0, 128]),
+        ));
+        let image_selection = |corners| SelectionHandles {
+            annotation: Annotation {
+                id: AnnotationId(1),
+                shape: Shape::Image {
+                    pixels: Arc::clone(&pixels),
+                    corners,
+                    resampling: Resampling::Nearest,
+                },
+            },
+            hot: None,
+        };
+        let frame = [
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 2.0, y: 0.0 },
+            Point { x: 2.0, y: 2.0 },
+            Point { x: 0.0, y: 2.0 },
+        ];
+        canvas.set_annotation_selection(Some(image_selection(frame)));
+        assert!(
+            canvas
+                .imp()
+                .image_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(CachedImageSelection::has_contours)
+        );
+        assert!(canvas.imp().crop_animation_running.get());
+        let contour_buffer = canvas
+            .imp()
+            .image_selection
+            .borrow()
+            .as_ref()
+            .expect("cached image selection")
+            .contours
+            .as_ptr();
+
+        let moved = [
+            Point { x: 10.0, y: 5.0 },
+            Point { x: 12.0, y: 5.0 },
+            Point { x: 12.0, y: 7.0 },
+            Point { x: 10.0, y: 7.0 },
+        ];
+        canvas.set_annotation_selection(Some(image_selection(moved)));
+        assert!(
+            canvas
+                .imp()
+                .image_selection
+                .borrow()
+                .as_ref()
+                .is_some_and(|cache| {
+                    cache.matches(&pixels) && cache.contours.as_ptr() == contour_buffer
+                })
+        );
+
+        canvas.set_annotation_selection(Some(SelectionHandles {
+            annotation: Annotation {
+                id: AnnotationId(2),
+                shape: Shape::Pencil {
+                    geometry: PencilGeometry::Line(vec![
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: 1.0, y: 1.0 },
+                    ]),
+                    style: StrokeStyle {
+                        color: [0, 0, 0, 255],
+                        width: 1.0,
+                    },
+                    anti_aliasing: true,
+                },
+            },
+            hot: None,
+        }));
+        assert!(canvas.imp().image_selection.borrow().is_none());
+
+        canvas.set_annotation_selection(None);
+        assert!(canvas.imp().image_selection.borrow().is_none());
     }
 
     #[test]
@@ -3025,6 +3348,8 @@ mod tests {
                     hot: None,
                 },
                 1.0,
+                None,
+                0.0,
             );
             let node = snapshot
                 .to_node()
@@ -3371,12 +3696,118 @@ mod tests {
                 hot: None,
             },
             1.0,
+            None,
+            0.0,
         );
 
         assert_eq!(
             count_colors(&snapshot.to_node().expect("pencil selection render node")),
             16,
             "eight handles must each have an outer and inner node"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn selected_transparent_image_draws_alpha_contour_with_frame_and_handles() {
+        fn count_strokes(node: &gtk::gsk::RenderNode) -> u32 {
+            if node.clone().downcast::<gtk::gsk::StrokeNode>().is_ok() {
+                return 1;
+            }
+            node.clone()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .map_or(0, |container| {
+                    (0..container.n_children())
+                        .map(|index| count_strokes(&container.child(index)))
+                        .sum()
+                })
+        }
+
+        fn count_colors(node: &gtk::gsk::RenderNode) -> u32 {
+            if node.clone().downcast::<gtk::gsk::ColorNode>().is_ok() {
+                return 1;
+            }
+            node.clone()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .map_or(0, |container| {
+                    (0..container.n_children())
+                        .map(|index| count_colors(&container.child(index)))
+                        .sum()
+                })
+        }
+
+        fn stroke_bounds(node: &gtk::gsk::RenderNode) -> Vec<gtk::graphene::Rect> {
+            if let Ok(stroke) = node.clone().downcast::<gtk::gsk::StrokeNode>() {
+                return vec![stroke.path().bounds().expect("stroke path bounds")];
+            }
+            node.clone()
+                .downcast::<gtk::gsk::ContainerNode>()
+                .map_or_else(
+                    |_| Vec::new(),
+                    |container| {
+                        (0..container.n_children())
+                            .flat_map(|index| stroke_bounds(&container.child(index)))
+                            .collect()
+                    },
+                )
+        }
+
+        gtk::init().expect("GTK display initialization");
+        let mut pixels = image::RgbaImage::new(2, 2);
+        pixels.get_pixel_mut(0, 0)[3] = 255;
+        let cached = CachedImageSelection::new(Arc::new(pixels.clone()));
+        let selection = SelectionHandles {
+            annotation: Annotation {
+                id: AnnotationId(1),
+                shape: Shape::Image {
+                    pixels: Arc::clone(&cached.pixels),
+                    // An affine frame exercises the outline after rotation and resizing.
+                    corners: [
+                        Point { x: 20.0, y: 20.0 },
+                        Point { x: 80.0, y: 40.0 },
+                        Point { x: 60.0, y: 90.0 },
+                        Point { x: 0.0, y: 70.0 },
+                    ],
+                    resampling: Resampling::Nearest,
+                },
+            },
+            hot: None,
+        };
+        let snapshot_for = |phase| {
+            let snapshot = gtk::Snapshot::new();
+            imp::draw_annotation_selection(
+                &snapshot,
+                gtk::graphene::Rect::new(0.0, 0.0, 100.0, 100.0),
+                (100, 100),
+                &selection,
+                1.0,
+                Some(&cached),
+                phase,
+            );
+            snapshot.to_node().expect("image selection render node")
+        };
+        let node = snapshot_for(0.0);
+
+        assert!(
+            count_strokes(&node) > 2,
+            "the alpha contour must add animated dash strokes alongside the black and white frame"
+        );
+        assert_eq!(
+            count_colors(&node),
+            16,
+            "the image frame must retain its eight resize handles"
+        );
+        let alpha_dash = stroke_bounds(&node)[2];
+        assert!((alpha_dash.x() - 10.0).abs() < 0.01 && (alpha_dash.y() - 20.0).abs() < 0.01);
+        assert!(
+            alpha_dash.width() < 40.1 && alpha_dash.height() < 35.1,
+            "the dashed alpha contour must stay inside its transformed one-pixel silhouette"
+        );
+        let phase_two_strokes = stroke_bounds(&snapshot_for(2.0));
+        assert_ne!(
+            &stroke_bounds(&node)[2..],
+            &phase_two_strokes[2..],
+            "advancing the dash phase must move the alpha outline"
         );
     }
 
@@ -3422,6 +3853,8 @@ mod tests {
                         hot: None,
                     },
                     1.0,
+                    None,
+                    0.0,
                 );
 
                 let node = snapshot.to_node().expect("freehand selection render node");

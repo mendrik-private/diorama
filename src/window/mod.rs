@@ -24,6 +24,7 @@ use crate::navigation::{DirectorySequence, find_matching_file};
 use crate::settings::ColorFormat;
 use crate::settings::{Settings, ZoomMode};
 use crate::tools::crop::CropBounds;
+use crate::tools::line_art::Progress;
 use adw::prelude::{
     ActionRowExt, AdwApplicationWindowExt, AdwDialogExt, AlertDialogExt, BreakpointBinExt,
     ComboRowExt, PreferencesDialogExt, PreferencesGroupExt, PreferencesPageExt, PreferencesRowExt,
@@ -54,8 +55,8 @@ use file_state::{
 use presentation::relative_modified_time;
 use presentation::{compare_metadata, folder_path, image_subtitle};
 use scale::{
-    ScaleUnit, dimensions_from_percent, resampling_at, resampling_index, scale_unit,
-    scaled_dimensions, scaled_width_for_height,
+    SCALE_PROGRESS_REFRESH, ScaleUnit, dimensions_from_percent, generation_progress_text,
+    resampling_at, resampling_index, scale_unit, scaled_dimensions, scaled_width_for_height,
 };
 use tool::{Tool, palette_visible, pencil_drag_available, resting_tool};
 use zoom::{
@@ -756,6 +757,7 @@ struct WindowState {
     scale_slider: gtk::Scale,
     scale_value_label: gtk::Label,
     scale_spinner: adw::Spinner,
+    scale_progress: gtk::ProgressBar,
     scale_width: gtk::SpinButton,
     scale_height: gtk::SpinButton,
     scale_lock: gtk::ToggleButton,
@@ -1017,12 +1019,25 @@ impl ViewerWindow {
         let scale_spinner = adw::Spinner::new();
         scale_spinner.set_visible(false);
         scale_spinner.set_tooltip_text(Some(&gettext("Generating scale preview")));
+        let scale_progress = gtk::ProgressBar::builder()
+            .visible(false)
+            .show_text(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .valign(gtk::Align::Center)
+            .tooltip_text(gettext(
+                "Estimated from earlier runs on this computer and refined while the model runs",
+            ))
+            .build();
+        scale_progress.update_property(&[gtk::accessible::Property::Label(&gettext(
+            "Line-art generation progress",
+        ))]);
         let scale_slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 2.0, 1.0);
         scale_slider.set_hexpand(true);
         scale_slider.set_draw_value(false);
         scale_slider.set_tooltip_text(Some(&gettext("Scaled width in pixels")));
         scale_slider_row.append(&scale_value_label);
         scale_slider_row.append(&scale_spinner);
+        scale_slider_row.append(&scale_progress);
         scale_slider_row.append(&scale_slider);
         let scale_show_line_art = gtk::ToggleButton::builder()
             .label(gettext("Show line art"))
@@ -1298,6 +1313,7 @@ impl ViewerWindow {
             scale_slider,
             scale_value_label,
             scale_spinner,
+            scale_progress,
             scale_width,
             scale_height,
             scale_lock,
@@ -3237,6 +3253,7 @@ impl ViewerWindow {
             cancellation.cancel();
         }
         self.0.scale_spinner.set_visible(false);
+        self.reset_scale_progress();
         self.0.scale_controls.set_visible(false);
         self.0.pending_fit.set(None);
         self.0.zoom_controls.set_visible(true);
@@ -3440,6 +3457,7 @@ impl ViewerWindow {
         if let Some(cancellation) = self.0.scale_preview_cancellation.borrow_mut().take() {
             cancellation.cancel();
         }
+        self.reset_scale_progress();
         let resampling = self.0.scale_resampling.get();
         let show_line_art = self.0.scale_show_line_art.is_active()
             && matches!(resampling, Resampling::GameAsset(_));
@@ -3470,6 +3488,12 @@ impl ViewerWindow {
         self.0
             .scale_preview_cancellation
             .replace(Some(cancellation.clone()));
+        // The worker thread records the latest generation progress; the main
+        // loop shows it while this preview is pending.
+        let progress = Arc::new(Mutex::new(None::<Progress>));
+        if game_asset.is_some() {
+            self.follow_scale_progress(generation, progress.clone());
+        }
         let weak = Rc::downgrade(&self.0);
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
             let Some(state) = weak.upgrade() else {
@@ -3484,15 +3508,27 @@ impl ViewerWindow {
             glib::spawn_future_local(async move {
                 let preview = gio::spawn_blocking(move || {
                     if let Some((session, options)) = game_asset {
+                        let report = |update: Progress| {
+                            if let Ok(mut latest) = progress.lock() {
+                                *latest = Some(update);
+                            }
+                        };
                         if show_line_art {
                             return session.line_art(
                                 target_width,
                                 target_height,
                                 options,
                                 &cancellation,
+                                &report,
                             );
                         }
-                        return session.resize(target_width, target_height, options, &cancellation);
+                        return session.resize(
+                            target_width,
+                            target_height,
+                            options,
+                            &cancellation,
+                            &report,
+                        );
                     }
                     if let Some(gpu) = gpu
                         && let Some(preview) =
@@ -3517,6 +3553,7 @@ impl ViewerWindow {
                 }
                 state.scale_preview_cancellation.borrow_mut().take();
                 state.scale_spinner.set_visible(false);
+                ViewerWindow(state.clone()).reset_scale_progress();
                 match preview {
                     Ok(Ok(preview)) => {
                         ViewerWindow(state)
@@ -3529,6 +3566,37 @@ impl ViewerWindow {
                 }
             });
         });
+    }
+
+    /// Show the latest progress of preview `generation` until it finishes,
+    /// is replaced, or is cancelled.
+    fn follow_scale_progress(&self, generation: u64, progress: Arc<Mutex<Option<Progress>>>) {
+        let weak = Rc::downgrade(&self.0);
+        glib::timeout_add_local(SCALE_PROGRESS_REFRESH, move || {
+            let Some(state) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if state.scale_preview_generation.get() != generation
+                || state.scale_preview_cancellation.borrow().is_none()
+            {
+                return glib::ControlFlow::Break;
+            }
+            let latest = progress.lock().ok().and_then(|mut latest| latest.take());
+            if let Some(latest) = latest {
+                state.scale_progress.set_fraction(latest.fraction);
+                state
+                    .scale_progress
+                    .set_text(Some(&generation_progress_text(latest)));
+                state.scale_progress.set_visible(true);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn reset_scale_progress(&self) {
+        self.0.scale_progress.set_visible(false);
+        self.0.scale_progress.set_fraction(0.);
+        self.0.scale_progress.set_text(None);
     }
 
     fn display_scale_preview(&self, preview: Arc<image::RgbaImage>, preserved_zoom: Option<f64>) {
@@ -12452,6 +12520,16 @@ mod tests {
         let previous_generation = window.0.scale_preview_generation.get();
         let async_preserved_zoom = 1.625;
         window.set_scale_preview_zoom(async_preserved_zoom);
+        // Game Asset previews run local models; the asynchronous replacement
+        // is checked with the deterministic stand-in instead.
+        let scale_source = window.0.scale_source.borrow().clone().unwrap();
+        window.0.scale_game_asset.replace(Some(Arc::new(
+            crate::tools::scale::game_asset::Session::with_test_workers(
+                scale_source,
+                Arc::new(|image: &image::RgbaImage, _: &CancellationToken| Ok(image.clone())),
+                Arc::new(crate::tools::scale::game_asset::model_like_test_pair),
+            ),
+        )));
         window.0.scale_method.set_selected(2);
         assert_eq!(
             window.0.scale_resampling.get(),
