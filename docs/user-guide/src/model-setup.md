@@ -29,27 +29,27 @@ cmake . -B build
 cmake --build build --config Release
 ```
 
-That build supports the `cpu` backend. To use Diorama's default `gpu` backend, vision.cpp documents a Vulkan build; install the Vulkan SDK first, then configure it with `cmake . -B build -D VISP_VULKAN=ON` before building. If you keep the CPU build, set `SPRITE_STUDIO_BIREFNET_BACKEND=cpu`.
+That build supports the `cpu` backend. To use Diorama's default `gpu` backend, vision.cpp documents a Vulkan build; install the Vulkan SDK first, then configure it with `cmake . -B build -D VISP_VULKAN=ON` before building. If you keep the CPU build, set `ASSET_SCALER_BIREFNET_BACKEND=cpu`.
 
 Obtain `BiRefNet-F16.gguf` from vision.cpp's [BiRefNet model download](https://huggingface.co/Acly/BiRefNet-GGUF/tree/main) and place it in `~/vision.cpp/models/`. The vision.cpp documentation also describes release packages if you prefer not to build it.
 
 If the executable or model is elsewhere, set exact paths before starting Diorama:
 
 ```sh
-export SPRITE_STUDIO_VISION_CLI=/absolute/path/to/vision-cli
-export SPRITE_STUDIO_BIREFNET_MODEL=/absolute/path/to/BiRefNet-F16.gguf
-export SPRITE_STUDIO_BIREFNET_BACKEND=gpu
+export ASSET_SCALER_VISION_CLI=/absolute/path/to/vision-cli
+export ASSET_SCALER_BIREFNET_MODEL=/absolute/path/to/BiRefNet-F16.gguf
+export ASSET_SCALER_BIREFNET_BACKEND=gpu
 ```
 
-The backend must be `gpu` or `cpu`; `gpu` is the default. Diorama waits up to ten minutes for this cutout and includes the worker's log tail in a failure message. A missing executable or model produces a message asking for `SPRITE_STUDIO_VISION_CLI` and `SPRITE_STUDIO_BIREFNET_MODEL`.
+The backend must be `gpu` or `cpu`; `gpu` is the default. Diorama waits up to ten minutes for this cutout and includes the worker's log tail in a failure message. A missing executable or model produces a message asking for `ASSET_SCALER_VISION_CLI` and `ASSET_SCALER_BIREFNET_MODEL`.
 
 In a Flatpak build the command is launched on the host, so those paths must exist there. A shell `export` on the host is not automatically an environment variable inside the sandbox. Use the normal `~/vision.cpp/...` paths, or pass overrides when launching the Flatpak:
 
 ```sh
 flatpak run \
-  --env=SPRITE_STUDIO_VISION_CLI=/absolute/path/to/vision-cli \
-  --env=SPRITE_STUDIO_BIREFNET_MODEL=/absolute/path/to/BiRefNet-F16.gguf \
-  --env=SPRITE_STUDIO_BIREFNET_BACKEND=gpu \
+  --env=ASSET_SCALER_VISION_CLI=/absolute/path/to/vision-cli \
+  --env=ASSET_SCALER_BIREFNET_MODEL=/absolute/path/to/BiRefNet-F16.gguf \
+  --env=ASSET_SCALER_BIREFNET_BACKEND=gpu \
   io.github.mendrik_private.Diorama
 ```
 

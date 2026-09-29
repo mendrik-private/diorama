@@ -134,13 +134,13 @@ fn birefnet_runtime() -> Result<BiRefNetRuntime> {
         AppError::BackgroundRemoval("HOME is unavailable; configure vision.cpp".into())
     })?;
     Ok(BiRefNetRuntime {
-        executable: std::env::var_os("SPRITE_STUDIO_VISION_CLI")
+        executable: std::env::var_os("ASSET_SCALER_VISION_CLI")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("vision.cpp/build/bin/vision-cli")),
-        model: std::env::var_os("SPRITE_STUDIO_BIREFNET_MODEL")
+        model: std::env::var_os("ASSET_SCALER_BIREFNET_MODEL")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("vision.cpp/models/BiRefNet-F16.gguf")),
-        backend: std::env::var("SPRITE_STUDIO_BIREFNET_BACKEND").unwrap_or_else(|_| "gpu".into()),
+        backend: std::env::var("ASSET_SCALER_BIREFNET_BACKEND").unwrap_or_else(|_| "gpu".into()),
         timeout: Duration::from_secs(600),
         poll_interval: Duration::from_millis(20),
         launch: Launch::detect(),
@@ -258,7 +258,7 @@ fn birefnet_with_runtime(
     let backend = &runtime.backend;
     if !executable.is_file() || !model.is_file() || !matches!(backend.as_str(), "cpu" | "gpu") {
         return Err(AppError::BackgroundRemoval(
-            "BiRefNet runtime is unavailable; set SPRITE_STUDIO_VISION_CLI and SPRITE_STUDIO_BIREFNET_MODEL."
+            "BiRefNet runtime is unavailable; set ASSET_SCALER_VISION_CLI and ASSET_SCALER_BIREFNET_MODEL."
                 .into(),
         ));
     }
