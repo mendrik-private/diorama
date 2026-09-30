@@ -8,7 +8,7 @@
 deploys the static site. Releases use the same read-only documentation build
 workflow before publication.
 
-The guide's seventeen screenshot filenames are part of the build contract. Their
+The guide's twenty-six screenshot filenames are part of the build contract. Their
 source directory is `data/screenshots/guide/`; the documentation build copies
 them into an isolated temporary book and never writes generated assets into
 the checkout. Keep every required capture versioned with the guide; verify
@@ -72,6 +72,15 @@ one task per frame. Required files are:
 | `game-asset-options.png` | Game Asset strength and preview controls |
 | `game-asset-result.png` | Game Asset result at output size |
 | `game-asset-line-art.png` | Generated line-art inspection |
+| `game-asset-vs-bicubic-cave-spider-128.png` | Cave spider: Bicubic and Game Asset at 128 × 128 |
+| `game-asset-vs-bicubic-cave-spider-180.png` | Cave spider: Bicubic and Game Asset at 180 × 180 |
+| `game-asset-vs-bicubic-cave-spider-256.png` | Cave spider: Bicubic and Game Asset at 256 × 256 |
+| `game-asset-vs-bicubic-goblin-128.png` | Goblin: Bicubic and Game Asset at 128 × 128 |
+| `game-asset-vs-bicubic-goblin-180.png` | Goblin: Bicubic and Game Asset at 180 × 180 |
+| `game-asset-vs-bicubic-goblin-256.png` | Goblin: Bicubic and Game Asset at 256 × 256 |
+| `game-asset-vs-bicubic-dragon-128.png` | Dragon: Bicubic and Game Asset at 128 × 128 |
+| `game-asset-vs-bicubic-dragon-180.png` | Dragon: Bicubic and Game Asset at 180 × 180 |
+| `game-asset-vs-bicubic-dragon-256.png` | Dragon: Bicubic and Game Asset at 256 × 256 |
 | `flip-and-rotate.png` | Whole-image rotation and flipping |
 | `mesh-warp-grid.png` | Mesh nodes, guide grid, and deformation preview |
 | `crop-detected-content.png` | Detected-content crop confirmation |
@@ -81,7 +90,8 @@ one task per frame. Required files are:
 
 The current expanded workflow captures are `scale-options.png`,
 `scaling-method-comparison.png`, `game-asset-options.png`,
-`game-asset-result.png`, `game-asset-line-art.png`, `flip-and-rotate.png`,
+`game-asset-result.png`, `game-asset-line-art.png`, the nine
+`game-asset-vs-bicubic-*.png` comparisons, `flip-and-rotate.png`,
 `mesh-warp-grid.png`, `crop-detected-content.png`, `canvas-resize.png`,
 `preferences.png`, and `background-removal-cutout.png`. Keep these in the
 build contract with their Markdown references, so a deployed chapter cannot
@@ -103,6 +113,17 @@ Wayland compositor running, then run:
 ```sh
 bash build-aux/capture-guide-screenshots.sh
 ```
+
+The nine `game-asset-vs-bicubic-*.png` monster comparisons are captured by a
+separate harness. Pass the directory containing the supplied monster originals
+as its optional first argument, or set `DIORAMA_SCALE_COMPARISON_SOURCE_ROOT`:
+
+```sh
+bash build-aux/capture-scale-comparison-screenshots.sh /path/to/monster-originals
+```
+
+Their exact source filenames, hashes, and reproduction command belong in the
+guide screenshot provenance alongside the generated captures.
 
 The guide build requires POSIX `sh`, mdBook `0.5.4`, and Ruby with its standard
 library. Screenshot capture additionally requires Bash, Cargo/Rust, a Wayland

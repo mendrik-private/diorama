@@ -44,6 +44,15 @@ Mark what matters with drawings, curved arrows, and text, then export the result
 
 ![Exported shrine artwork with red circles, an arrow, and a handwritten label](data/screenshots/shrine-annotated.png)
 
+Compare a conventional Bicubic reduction with Game Asset's generated line art,
+colour fill, and cutout at small output sizes. This 128 × 128 cave-spider output
+is shown at 200% hard zoom so each output pixel is easy to inspect.
+
+[![Bicubic and Game Asset 128-pixel cave-spider outputs side by side in Diorama](data/screenshots/guide/game-asset-vs-bicubic-cave-spider-128.png)](https://mendrik-private.github.io/diorama/game-asset-scaling.html#compare-game-asset-with-bicubic)
+
+See all nine [Game Asset and Bicubic comparisons](https://mendrik-private.github.io/diorama/game-asset-scaling.html#compare-game-asset-with-bicubic)
+at 128, 180, and 256 pixels.
+
 ## Made for visual work
 
 - **Browse quickly.** Open one image, a hand-picked sequence, or an entire

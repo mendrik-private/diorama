@@ -34,11 +34,16 @@ For a square 1024 × 1024 character image, leave **Aspect** on, type `256` in **
 
 Nearest, Bicubic, and Lanczos accept output dimensions from 1 pixel up to twice the source width and height. Diorama warns when you apply a larger size because enlarging may reduce perceived quality. Game Asset accepts only positive dimensions no larger than the source in either direction.
 
+For a direct visual comparison, see [Game Asset beside Bicubic at 128, 180,
+and 256 pixels](game-asset-scaling.md#compare-game-asset-with-bicubic). The
+captures use the same original on both sides and separate output dimensions
+from the 200% zoom used to inspect them.
+
 ## Understand the controls
 
 **W × H** is the exact output canvas size. With **Aspect** enabled, editing one field recalculates the other from the original image ratio. The slider follows the selected unit: in **Pixels**, it controls width; in **Percent**, it ranges from 1% to 200% for Nearest, Bicubic, and Lanczos, or 1% to 100% for Game Asset. The percent slider scales both dimensions together even when **Aspect** is off; use W and H for a non-proportional result.
 
-**Preview** changes only how you inspect the proposed image. **Actual Pixels** maps one output pixel to one display pixel. **Fit Pixels** refits every newly generated preview to the available canvas. The initial preview keeps the source image's on-screen footprint, which makes a smaller result easy to judge in context. Neither choice changes output dimensions.
+**Preview** changes only how you inspect the proposed image. **Actual Pixels** maps one output pixel to one display pixel. **Fit Pixels** refits every newly generated preview to the available canvas. The initial preview keeps the source image's on-screen footprint, which makes a smaller result easy to judge in context. If you zoom while a slow preview is being generated, that zoom remains when the preview arrives. A manual zoom leaves Fit Pixels; otherwise Fit Pixels continues to refit replacement previews. Neither choice changes output dimensions.
 
 **Hold Original** is a press-and-hold comparison, not an undo action. Keep it pressed to see the source and release it to return to the current preview. It becomes available once a preview is ready. **Apply Scale** commits the exact dimensions and method shown. Closing the Scale tool without applying restores the source view. Changing dimensions or method replaces the pending preview; only the latest successful preview is displayed.
 

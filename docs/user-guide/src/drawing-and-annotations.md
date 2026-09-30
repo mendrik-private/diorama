@@ -38,7 +38,9 @@ strokes and circles matter; leave it off for crisp pixel-art marks.
 Press <kbd>P</kbd> for **Pencil**. Draw normally for freehand. Hold
 <kbd>Ctrl</kbd> for connected straight segments, <kbd>Shift</kbd> for a
 rectangle, or <kbd>Alt</kbd> for a circle. Pencil stroke width is 1–128 image
-pixels. Existing pencil shapes can be selected and resized; hold
+pixels. A freehand stroke ends at the last point the pointer moved across;
+lifting the pen does not add a separate segment, and clicking without moving
+creates a dot. Existing pencil shapes can be selected and resized; hold
 <kbd>Shift</kbd> while resizing to preserve an object's aspect ratio. Drag just
 outside a rotatable object's corner to rotate it; hold <kbd>Shift</kbd> to snap
 the rotation to 15-degree steps.

@@ -69,6 +69,8 @@ use zoom::{
 pub struct ViewerWindow(Rc<WindowState>);
 
 #[cfg(test)]
+mod scale_comparison_screenshots;
+#[cfg(test)]
 mod screenshots;
 
 struct HeaderWidgets {
@@ -4711,7 +4713,20 @@ impl ViewerWindow {
         screen_y: f64,
         timestamp_ms: u32,
     ) -> Option<(Vec<BrushPoint>, StrokePath, PencilDragMode)> {
-        self.update_pencil_drag(canvas, screen_x, screen_y, timestamp_ms);
+        // GestureDrag already reports pointer motion through drag-update. If
+        // a pen release reports a discontinuous device position, treating
+        // that release-only coordinate as another freehand sample draws a
+        // long straight tail from the last observed motion point.
+        // Shape gestures still need their exact release endpoint.
+        let update_release = self
+            .0
+            .pencil_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.mode != PencilDragMode::Freehand);
+        if update_release {
+            self.update_pencil_drag(canvas, screen_x, screen_y, timestamp_ms);
+        }
         let drag = self.0.pencil_drag.take()?;
         if drag.canvas != *canvas {
             self.0.pencil_drag.replace(Some(drag));
@@ -11032,6 +11047,132 @@ mod tests {
         );
 
         assert!(window.0.pencil_drag.borrow().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn freehand_release_does_not_append_an_unobserved_distant_tail_after_highlight() {
+        adw::init().expect("GTK display initialization");
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.PencilReleaseTailTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = ViewerWindow::new(&application, None);
+        let image = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        window
+            .0
+            .canvas
+            .set_texture(Some(&texture_from_rgba(&image).unwrap()));
+        window.0.canvas.allocate(64, 64, -1, None);
+        window.0.rendered.replace(Some(image.clone()));
+        window
+            .0
+            .document
+            .replace(Some(Document::new(crate::document::ImageSource {
+                pixels: Arc::new(image),
+                path: None,
+                metadata: crate::document::Metadata::default(),
+            })));
+
+        window.set_tool(Tool::Highlight);
+        let highlight_drag = (0..window.0.canvas.observe_controllers().n_items())
+            .filter_map(|index| window.0.canvas.observe_controllers().item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureDrag>().ok())
+            .find(|candidate| {
+                candidate.emit_by_name::<()>("drag-begin", &[&24.0_f64, &24.0_f64]);
+                window.0.annotation_drag.borrow().is_some()
+            })
+            .expect("annotation drag controller");
+        highlight_drag.emit_by_name::<()>("drag-end", &[&8.0_f64, &4.0_f64]);
+        assert!(matches!(
+            window
+                .0
+                .document
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .annotations()
+                .as_slice(),
+            [Annotation {
+                shape: Shape::Highlight { .. },
+                ..
+            }]
+        ));
+        window.set_tool(Tool::Pencil);
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            1,
+            8.0,
+            8.0,
+            gtk::gdk::ModifierType::empty(),
+            0,
+        );
+        window.update_pencil_drag(&window.0.canvas, 12.0, 12.0, 1);
+        window.update_pencil_drag(&window.0.canvas, 16.0, 16.0, 2);
+
+        let (points, _, mode) = window
+            .finish_pencil_drag(&window.0.canvas, 60.0, 2.0, 3)
+            .expect("active pencil drag");
+
+        assert_eq!(mode, PencilDragMode::Freehand);
+        assert_eq!(
+            points.last(),
+            Some(&BrushPoint {
+                x: 16.5,
+                y: 16.5,
+                pressure: 1.0,
+            }),
+            "the stroke must end at its last motion sample: {points:?}"
+        );
+        window.commit_editable_pencil_stroke(&points, mode);
+        let annotations = window.0.document.borrow().as_ref().unwrap().annotations();
+        let Shape::Pencil {
+            geometry: PencilGeometry::Freehand(stored),
+            ..
+        } = &annotations[1].shape
+        else {
+            panic!("the second annotation must be the pencil stroke");
+        };
+        assert_eq!(stored.last(), points.last());
+
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            1,
+            2.0,
+            2.0,
+            gtk::gdk::ModifierType::empty(),
+            4,
+        );
+        window.update_pencil_drag(&window.0.canvas, 58.0, 58.0, 5);
+        let (fast_points, _, _) = window
+            .finish_pencil_drag(&window.0.canvas, 58.0, 58.0, 6)
+            .expect("fast pencil drag");
+        assert!(
+            fast_points.last().is_some_and(|point| point.x > 50.0),
+            "a genuine long motion update must remain part of the stroke: {fast_points:?}"
+        );
+
+        window.begin_pencil_drag(
+            &window.0.canvas,
+            1,
+            32.0,
+            32.0,
+            gtk::gdk::ModifierType::empty(),
+            7,
+        );
+        let (click_points, _, _) = window
+            .finish_pencil_drag(&window.0.canvas, 60.0, 2.0, 8)
+            .expect("pencil click");
+        assert_eq!(
+            click_points,
+            vec![BrushPoint {
+                x: 32.5,
+                y: 32.5,
+                pressure: 1.0,
+            }],
+            "a click remains a dot even if release reports a different position"
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.26" date="2026-09-30">
+      <description>
+        <p>Game Asset scaling now draws black line art over the generated fill, including along the silhouette, and the guide adds real-app Bicubic comparisons at three output sizes. Scale previews preserve the zoom chosen while a slow method finishes. Pencil strokes no longer grow a long straight tail from a discontinuous pen-release position. BiRefNet runtime overrides use the ASSET_SCALER environment-variable names.</p>
+      </description>
+    </release>
     <release version="0.3.25" date="2026-09-29">
       <description>
         <p>Game Asset scaling now cuts out the generated fill instead of the original image, so the sprite edge follows the drawn outline and no background halo remains.</p>
