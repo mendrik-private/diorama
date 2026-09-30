@@ -69,6 +69,8 @@ use zoom::{
 pub struct ViewerWindow(Rc<WindowState>);
 
 #[cfg(test)]
+mod scale_comparison_screenshots;
+#[cfg(test)]
 mod screenshots;
 
 struct HeaderWidgets {

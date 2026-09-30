@@ -25,6 +25,76 @@ That makes it useful for a 1024-pixel fantasy character reduced to a 256-pixel s
 
 *Show line art reveals the sharpened layer that is combined with the generated fill. Use it to spot missing or overly heavy contours before applying.*
 
+## Compare Game Asset with Bicubic
+
+These captures use the same unchanged 1024 × 1024 JPEG original for both sides
+of each comparison. The left side is a **Bicubic** (Catmull–Rom) reduction; the
+right side is **Game Asset** at the default **Strength 40%**. Each square output
+is shown in Diorama at **200% hard zoom** over the same gray viewer background.
+The 200% setting only doubles each output pixel on screen: it does not change
+the 128 × 128, 180 × 180, or 256 × 256 output dimensions. Select any capture to
+open it at full size.
+
+[![Cave spider reduced from the same 1024-pixel JPEG to 128 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-cave-spider-128.png)](assets/screenshots/game-asset-vs-bicubic-cave-spider-128.png)
+
+*Cave spider at 128 × 128: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+<details>
+<summary>Cave spider at 180 and 256 pixels</summary>
+
+[![Cave spider reduced from the same 1024-pixel JPEG to 180 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-cave-spider-180.png)](assets/screenshots/game-asset-vs-bicubic-cave-spider-180.png)
+
+*Cave spider at 180 × 180: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+[![Cave spider reduced from the same 1024-pixel JPEG to 256 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-cave-spider-256.png)](assets/screenshots/game-asset-vs-bicubic-cave-spider-256.png)
+
+*Cave spider at 256 × 256: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+</details>
+
+<details>
+<summary>Goblin at 128, 180, and 256 pixels</summary>
+
+[![Goblin reduced from the same 1024-pixel JPEG to 128 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-goblin-128.png)](assets/screenshots/game-asset-vs-bicubic-goblin-128.png)
+
+*Goblin at 128 × 128: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+[![Goblin reduced from the same 1024-pixel JPEG to 180 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-goblin-180.png)](assets/screenshots/game-asset-vs-bicubic-goblin-180.png)
+
+*Goblin at 180 × 180: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+[![Goblin reduced from the same 1024-pixel JPEG to 256 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-goblin-256.png)](assets/screenshots/game-asset-vs-bicubic-goblin-256.png)
+
+*Goblin at 256 × 256: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+</details>
+
+<details>
+<summary>Dragon at 128, 180, and 256 pixels</summary>
+
+[![Dragon reduced from the same 1024-pixel JPEG to 128 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-dragon-128.png)](assets/screenshots/game-asset-vs-bicubic-dragon-128.png)
+
+*Dragon at 128 × 128: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+[![Dragon reduced from the same 1024-pixel JPEG to 180 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-dragon-180.png)](assets/screenshots/game-asset-vs-bicubic-dragon-180.png)
+
+*Dragon at 180 × 180: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+[![Dragon reduced from the same 1024-pixel JPEG to 256 pixels, with Bicubic on the left and Game Asset on the right](assets/screenshots/game-asset-vs-bicubic-dragon-256.png)](assets/screenshots/game-asset-vs-bicubic-dragon-256.png)
+
+*Dragon at 256 × 256: Bicubic on the left and Game Asset on the right, both viewed at 200% hard zoom.*
+
+</details>
+
+The Bicubic side resamples the opaque JPEG, including its original background.
+Game Asset instead asks FLUX to draw new line art and a new colour fill, then
+uses a real BiRefNet cutout for transparency; the gray visible around that
+subject is Diorama's viewer background. Cleaner small-scale shapes can come
+with changes to facial features, ornaments, line placement, colours, or the
+silhouette. Treat the right side as a generated interpretation rather than a
+sharper version of the same pixels, and review important details before
+applying it.
+
 ## What happens to a 1024 × 1024 image reduced to 256 × 256
 
 The requested output is 256 × 256. For reliable line work, Diorama uses a 512 × 512 generation canvas rather than asking the model to draw directly at 256 pixels. It composites the source over white and resizes that reference with Lanczos3. FLUX generates a grayscale line-art image and an ink-free colour fill at 512 × 512, one after the other. BiRefNet cuts the generated fill out. The layers are centre-cropped consistently and then reduced to 256 × 256: line art with Catmull–Rom bicubic, fill and alpha with Lanczos3.

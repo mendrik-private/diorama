@@ -34,6 +34,11 @@ For a square 1024 × 1024 character image, leave **Aspect** on, type `256` in **
 
 Nearest, Bicubic, and Lanczos accept output dimensions from 1 pixel up to twice the source width and height. Diorama warns when you apply a larger size because enlarging may reduce perceived quality. Game Asset accepts only positive dimensions no larger than the source in either direction.
 
+For a direct visual comparison, see [Game Asset beside Bicubic at 128, 180,
+and 256 pixels](game-asset-scaling.md#compare-game-asset-with-bicubic). The
+captures use the same original on both sides and separate output dimensions
+from the 200% zoom used to inspect them.
+
 ## Understand the controls
 
 **W × H** is the exact output canvas size. With **Aspect** enabled, editing one field recalculates the other from the original image ratio. The slider follows the selected unit: in **Pixels**, it controls width; in **Percent**, it ranges from 1% to 200% for Nearest, Bicubic, and Lanczos, or 1% to 100% for Game Asset. The percent slider scales both dimensions together even when **Aspect** is off; use W and H for a non-proportional result.
