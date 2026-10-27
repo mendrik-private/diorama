@@ -20,9 +20,17 @@ flatpak run io.github.mendrik_private.Diorama
 
 Diorama opens PNG, JPEG, GIF, WebP, AVIF/HEIF, BMP, TIFF, SVG, JPEG 2000,
 JPEG XL, QOI, ICO, EXR, Netpbm, TGA, XBM, and XPM images when their installed
-image loader supports them. Animated files with more than one frame show
+image loader supports them, and WebM videos through the GNOME runtime's video
+decoders. Animated files with more than one frame, and WebM videos, show
 previous-frame, play/pause, and next-frame controls in the header. Stepping a
-frame pauses playback; press **Play animation** to resume.
+frame pauses playback; press **Play animation** to resume. WebM plays muted and
+loops; frame stepping in a video moves by roughly one frame.
+
+A paused WebM frame is the image you edit. Choosing a drawing tool, applying an
+edit, saving, copying, or printing pauses the video first, so the result always
+matches the frame on screen. Video playback stays unavailable while the frame
+has edits; undo them to play again. Save a WebM frame with **Save As…** as PNG
+or JPEG.
 
 [![Diorama browsing fantasy-character PNG files](assets/screenshots/overview.png)](assets/screenshots/overview.png)
 
@@ -52,6 +60,6 @@ toggles the normal application fullscreen mode.
 **File → Open With…** opens the current file in another application through
 the system chooser. **Copy Filepath** copies the local path when there is one.
 **Print…** opens the system print dialog; it prints the displayed animation
-frame for an animation and uses white paper regardless of the viewer's
+frame for an animation or video and uses white paper regardless of the viewer's
 transparency backdrop. Use **Delete Image** (<kbd>Delete</kbd>) only when you
 intend to delete the current file; Diorama asks for confirmation.

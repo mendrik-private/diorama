@@ -101,7 +101,8 @@ at 128, 180, and 256 pixels.
   images.
 - Display transparency over a checkerboard, automatic contrasting shade,
   white, gray, or black background.
-- Play and pause animated images or step through their frames manually.
+- Play and pause animated images and WebM videos, or step through their frames
+  manually; edit and export the paused frame.
 
 ### Inspect pixels, colors, and image details
 
@@ -212,6 +213,9 @@ Folder navigation also recognizes the following formats when a compatible
 system decoder is available:
 
 `QOI` · `ICO` · `OpenEXR` · `PBM/PGM/PPM/PNM` · `TGA` · `XBM` · `XPM`
+
+WebM videos open through GTK's GStreamer media support; their paused frame can
+be edited and exported as PNG or JPEG.
 
 Images are normalized for EXIF orientation while loading. Availability of some
 modern formats depends on the codecs supplied by the installed GNOME runtime.
