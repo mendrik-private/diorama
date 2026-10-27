@@ -4,6 +4,7 @@ use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 
 impl ViewerWindow {
     pub(super) fn print(&self) {
+        self.pause_video();
         let Some(texture) = self.0.canvas.texture() else {
             return;
         };

@@ -213,6 +213,7 @@ pub fn is_supported(name: &str) -> bool {
             | "tga"
             | "xbm"
             | "xpm"
+            | "webm"
     )
 }
 
@@ -367,6 +368,7 @@ mod tests {
         assert!(is_supported("photo.HEIC"));
         assert!(is_supported("vector.svgz"));
         assert!(!is_supported("video.mp4"));
+        assert!(is_supported("clip.WEBM"));
     }
 
     #[test]

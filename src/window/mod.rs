@@ -17,7 +17,8 @@ use crate::document::{
 use crate::export::{ExportOptions, JpegOptions, PngOptions};
 use crate::i18n::gettext;
 use crate::image::{
-    AnimationFrame, DecodeLimits, decode_animation, decode_headless, decode_memory, load_preview,
+    AnimationFrame, DecodeLimits, current_video_frame, decode_animation, decode_headless,
+    decode_memory, is_video, load_preview, open_video,
 };
 use crate::navigation::{DirectorySequence, find_matching_file};
 #[cfg(test)]
@@ -122,6 +123,7 @@ struct PreparedSelection {
 
 const MAX_COPIED_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_COPIED_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const DEFAULT_VIDEO_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(33_333);
 
 /// Renders only an image annotation into its own transparent bounding box.
 /// This keeps Copy useful after affine edits without leaking canvas pixels
@@ -742,6 +744,8 @@ struct WindowState {
     animation_frames: RefCell<Vec<AnimationFrame>>,
     animation_index: Cell<usize>,
     animation_paused: Cell<bool>,
+    video: RefCell<Option<gtk::MediaFile>>,
+    video_frame_interval: Cell<std::time::Duration>,
     animation_controls: gtk::Box,
     animation_play_button: gtk::Button,
     export_cancellation: RefCell<Option<CancellationToken>>,
@@ -1302,6 +1306,8 @@ impl ViewerWindow {
             animation_frames: RefCell::new(Vec::new()),
             animation_index: Cell::new(0),
             animation_paused: Cell::new(false),
+            video: RefCell::new(None),
+            video_frame_interval: Cell::new(DEFAULT_VIDEO_FRAME_INTERVAL),
             animation_controls: header_widgets.animation_controls,
             animation_play_button: header_widgets.animation_play_button,
             pending_fit: Cell::new(None),
@@ -1454,6 +1460,7 @@ impl ViewerWindow {
             .render_generation
             .set(self.0.render_generation.get().wrapping_add(1));
         self.0.animation_frames.borrow_mut().clear();
+        self.stop_video();
         self.0.animation_controls.set_visible(false);
         self.0.document.replace(None);
         self.0.rendered.replace(None);
@@ -1504,7 +1511,8 @@ impl ViewerWindow {
         self.0.content_stack.set_visible_child_name("viewer");
         self.update_action_states();
 
-        let decode = file.path().map(|path| {
+        let video = is_video(&file);
+        let decode = file.path().filter(|_| !video).map(|path| {
             gio::spawn_blocking(move || decode_headless(&path, DecodeLimits::default()))
         });
         let cache_key = file.uri().to_string();
@@ -1535,7 +1543,9 @@ impl ViewerWindow {
                     if preview.animation_delay.is_some() {
                         ViewerWindow(state.clone()).start_animation(file.clone(), generation);
                     }
-                    let editable = if let Some(decode) = decode {
+                    let editable = if video {
+                        Ok(video_frame_source(&preview.texture, file.path()))
+                    } else if let Some(decode) = decode {
                         decode.await
                     } else {
                         let bytes_file = file.clone();
@@ -2720,13 +2730,19 @@ impl ViewerWindow {
         };
         self.set_action_enabled("undo", can_undo);
         self.set_action_enabled("redo", can_redo);
-        let has_animation = self.0.animation_frames.borrow().len() > 1;
+        // Video frames would hide applied edits, so playback stops at the first edit.
+        let has_animation = self.0.animation_frames.borrow().len() > 1
+            || (self.0.video.borrow().is_some()
+                && document
+                    .as_ref()
+                    .is_none_or(|document| document.operations().is_empty()));
         self.set_action_enabled("play-pause", has_animation);
         self.set_action_enabled("previous-frame", has_animation);
         self.set_action_enabled("next-frame", has_animation);
     }
 
     fn apply(&self, operation: Operation) {
+        self.pause_video();
         // Any history mutation can make a cached cutout refer to pixels no
         // longer displayed (undo/redo included).
         if self.0.tool.get() == Tool::MeshPoints {
@@ -2782,6 +2798,9 @@ impl ViewerWindow {
     }
 
     fn set_tool(&self, tool: Tool) {
+        if !matches!(tool, Tool::None | Tool::Select) {
+            self.pause_video();
+        }
         let editable = self.0.document.borrow().is_some() && self.0.rendered.borrow().is_some();
         let tool = resting_tool(tool, editable);
         let previous = self.0.tool.get();
@@ -3842,6 +3861,7 @@ impl ViewerWindow {
     }
 
     fn copy_current_selection_or_image_to_clipboard(&self) {
+        self.pause_video();
         if self.0.region_selection.get().is_some() {
             self.copy_selected_region();
         } else if let Some(
@@ -4921,6 +4941,7 @@ impl ViewerWindow {
     }
 
     fn save(&self, force_dialog: bool) {
+        self.pause_video();
         let Some(document) = self.0.document.borrow().clone() else {
             self.0
                 .toasts
@@ -5741,6 +5762,10 @@ impl ViewerWindow {
     }
 
     fn start_animation(&self, file: gio::File, generation: u64) {
+        if is_video(&file) {
+            self.start_video(file, generation);
+            return;
+        }
         let cancellable = gio::Cancellable::new();
         self.0
             .animation_cancellable
@@ -5803,6 +5828,10 @@ impl ViewerWindow {
     }
 
     fn step_animation(&self, forward: bool) {
+        if self.0.video.borrow().is_some() {
+            self.step_video(forward);
+            return;
+        }
         let frames = self.0.animation_frames.borrow();
         if frames.is_empty() {
             return;
@@ -5822,11 +5851,212 @@ impl ViewerWindow {
     }
 
     fn toggle_animation(&self) {
+        if self.0.video.borrow().is_some() {
+            if self.0.animation_paused.get() {
+                self.play_video();
+            } else {
+                self.pause_video();
+            }
+            return;
+        }
         if self.0.animation_frames.borrow().is_empty() {
             return;
         }
         self.0.animation_paused.set(!self.0.animation_paused.get());
         self.sync_animation_play_button();
+    }
+
+    fn start_video(&self, file: gio::File, generation: u64) {
+        let cancellable = gio::Cancellable::new();
+        self.0
+            .animation_cancellable
+            .replace(Some(cancellable.clone()));
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            let media = open_video(&file, &cancellable).await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if state.load_generation.get() != generation || cancellable.is_cancelled() {
+                if let Ok((media, _)) = media {
+                    media.clear();
+                }
+                return;
+            }
+            let media = match media {
+                Ok((media, _)) => media,
+                Err(error) => {
+                    tracing::debug!(%error, "Video playback unavailable");
+                    return;
+                }
+            };
+            let last_frame = Cell::new(None::<i64>);
+            media.connect_invalidate_contents({
+                let weak = Rc::downgrade(&state);
+                move |media| {
+                    let Some(state) = weak.upgrade() else {
+                        return;
+                    };
+                    let window = ViewerWindow(state);
+                    let timestamp = media.timestamp();
+                    if let Some(previous) = last_frame.replace(Some(timestamp))
+                        && let Ok(interval) = u64::try_from(timestamp - previous)
+                        && (1_000..=1_000_000).contains(&interval)
+                    {
+                        window
+                            .0
+                            .video_frame_interval
+                            .set(std::time::Duration::from_micros(interval));
+                    }
+                    window.show_video_frame();
+                }
+            });
+            media.connect_error_notify(|media| {
+                if let Some(error) = media.error() {
+                    tracing::warn!(%error, "Video playback failed");
+                }
+            });
+            state.video.replace(Some(media.clone()));
+            state.animation_paused.set(false);
+            state.animation_controls.set_visible(true);
+            let window = ViewerWindow(state);
+            window.sync_animation_play_button();
+            window.update_action_states();
+            media.play();
+        });
+    }
+
+    fn stop_video(&self) {
+        if let Some(media) = self.0.video.borrow_mut().take() {
+            media.clear();
+        }
+        self.0
+            .video_frame_interval
+            .set(DEFAULT_VIDEO_FRAME_INTERVAL);
+    }
+
+    fn video_document_is_clean(&self) -> bool {
+        self.0
+            .document
+            .borrow()
+            .as_ref()
+            .is_none_or(|document| document.operations().is_empty())
+    }
+
+    fn show_video_frame(&self) {
+        let Some(texture) = self.0.video.borrow().as_ref().and_then(current_video_frame) else {
+            return;
+        };
+        if !self.video_document_is_clean() {
+            return;
+        }
+        self.0.canvas.set_texture(Some(&texture));
+        self.update_minimap();
+        self.update_subtitle();
+        if self.0.animation_paused.get() {
+            self.adopt_video_frame();
+        }
+    }
+
+    fn play_video(&self) {
+        let Some(media) = self.0.video.borrow().clone() else {
+            return;
+        };
+        if !self.video_document_is_clean() {
+            return;
+        }
+        self.0.animation_paused.set(false);
+        self.sync_animation_play_button();
+        media.play();
+    }
+
+    /// Pauses playback so edits, exports, and copies use the displayed frame.
+    fn pause_video(&self) {
+        let Some(media) = self.0.video.borrow().clone() else {
+            return;
+        };
+        if self.0.animation_paused.get() {
+            return;
+        }
+        media.pause();
+        self.0.animation_paused.set(true);
+        self.sync_animation_play_button();
+        self.adopt_video_frame();
+    }
+
+    fn step_video(&self, forward: bool) {
+        let Some(media) = self.0.video.borrow().clone() else {
+            return;
+        };
+        if !self.video_document_is_clean() {
+            return;
+        }
+        self.pause_video();
+        let interval =
+            i64::try_from(self.0.video_frame_interval.get().as_micros()).unwrap_or(i64::MAX);
+        let duration = media.duration();
+        let mut target = if forward {
+            media.timestamp().saturating_add(interval)
+        } else {
+            media.timestamp().saturating_sub(interval)
+        };
+        if duration > 0 {
+            target = target.rem_euclid(duration);
+        }
+        media.seek(target.max(0));
+    }
+
+    /// Makes the displayed frame the editable source while it carries no edits.
+    fn adopt_video_frame(&self) {
+        if self.0.document.borrow().is_none() || !self.video_document_is_clean() {
+            return;
+        }
+        let Some(texture) = self.0.canvas.texture() else {
+            return;
+        };
+        let path = self
+            .0
+            .current_file
+            .borrow()
+            .as_ref()
+            .and_then(gio::File::path);
+        let Ok(mut source) = video_frame_source(&texture, path) else {
+            return;
+        };
+        if self
+            .0
+            .rendered
+            .borrow()
+            .as_ref()
+            .is_some_and(|rendered| rendered == source.pixels.as_ref())
+        {
+            return;
+        }
+        if let Some(cancellation) = self.0.selection_preparation.borrow_mut().take() {
+            cancellation.cancel();
+        }
+        self.0.selection_preparation_generation.set(
+            self.0
+                .selection_preparation_generation
+                .get()
+                .wrapping_add(1),
+        );
+        self.0.prepared_selection.borrow_mut().take();
+        if let Some(document) = self.0.document.borrow().as_ref() {
+            source.metadata = document.source().metadata.clone();
+        }
+        let document = Document::new(source);
+        self.0
+            .rendered
+            .replace(Some(document.source().pixels.as_ref().clone()));
+        self.0
+            .render_generation
+            .set(self.0.render_generation.get().wrapping_add(1));
+        self.0
+            .rendered_generation
+            .set(self.0.render_generation.get());
+        self.0.document.replace(Some(document));
+        self.update_action_states();
     }
 
     fn sync_animation_play_button(&self) {
@@ -8339,6 +8569,20 @@ fn texture_from_owned_rgba(image: image::RgbaImage) -> Result<gtk::gdk::Texture,
     .upcast())
 }
 
+fn video_frame_source(
+    texture: &gtk::gdk::Texture,
+    path: Option<PathBuf>,
+) -> crate::error::Result<crate::document::ImageSource> {
+    let pixels = rgba_from_texture(texture).ok_or_else(|| {
+        crate::error::AppError::CorruptImage("Could not read video frame pixels".to_owned())
+    })?;
+    Ok(crate::document::ImageSource {
+        pixels: Arc::new(pixels),
+        path,
+        metadata: crate::document::Metadata::default(),
+    })
+}
+
 fn rgba_from_texture(texture: &gtk::gdk::Texture) -> Option<image::RgbaImage> {
     let width = u32::try_from(texture.width()).ok()?;
     let height = u32::try_from(texture.height()).ok()?;
@@ -8371,6 +8615,113 @@ fn sync_adjustment(source: &gtk::Adjustment, target: &gtk::Adjustment) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 16×16 VP8 WebM: 0.2 s red, then green, then blue at 10 fps (ffmpeg libvpx).
+    const WEBM_FIXTURE: &str = "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAALmEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEjTbuMU6uEHFO7a1OsggKt7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjIuMy4xMDBXQYxMYXZmNjIuMy4xMDBEiYhAgsAAAAAAABZUrmvIrgEAAAAAAAA/14EBc8WISIFWf8eoGducgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QF9eEA4JCwgRC6gRCagQJVsIRVuYEBElTDZ/tzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYyLjMuMTAwc3PWY8CLY8WISIFWf8eoGdtnyKFFo4dFTkNPREVSRIeUTGF2YzYyLjExLjEwMCBsaWJ2cHhnyKFFo4hEVVJBVElPTkSHkzAwOjAwOjAwLjYwMDAwMDAwMAAfQ7Z1QQTngQCjvYEAAIDwAgCdASoQABAAAEcIhYWIhYSIAgICdaoD+AP6Ag1NGAD+/W7z/+OZNzDE/45t//FhPA4oyP/xUQCjlYEAZACxAQABEBAAGAAYWC/0AAgAAKO9gQDIgPACAJ0BKhAAEAAARwiFhYiFhIgCAgJ1qgP4A/oCDU0YAP7xcg//JB68nn5/5IR//Znm3/yZf/ZbAKOVgQEsALEBAAEQEAAYABhYL/QACAAAo7yBAZCAsAIAnQEqEAAQAABHCIWFiIWEiAICAnWqA/gCDP0oAP7/TRL//FhX8WFfxYV/8WFf/PzO7cX85gCjlYEB9ACxAQABEBAAGAAYWC/0AAgAABxTu2u0u4+zgQC3iveBAfGCAaPwgQO7j7OByLeK94EB8YIBo/CBWbuQs4IBkLeK94EB8YIBo/CBrw==";
+
+    fn wait_for(context: &glib::MainContext, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    fn dominant_channel(image: &image::RgbaImage) -> usize {
+        let pixel = image.get_pixel(8, 8).0;
+        (0..3).max_by_key(|&channel| pixel[channel]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn webm_plays_and_edits_the_paused_frame() {
+        adw::init().expect("GTK display initialization");
+        let context = glib::MainContext::default();
+        let application = adw::Application::builder()
+            .application_id("io.github.mendrik_private.Diorama.WebmPlaybackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(gio::Cancellable::NONE)
+            .expect("application registration");
+        let window = ViewerWindow::new(&application, None);
+        let enabled = |name: &str| {
+            window
+                .0
+                .window
+                .lookup_action(name)
+                .expect("window action")
+                .is_enabled()
+        };
+        let directory = tempfile::tempdir().expect("temporary video directory");
+        let path = directory.path().join("clip.webm");
+        std::fs::write(
+            &path,
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, WEBM_FIXTURE)
+                .expect("fixture base64"),
+        )
+        .expect("temporary video");
+
+        window.load(gio::File::for_path(&path));
+        assert!(
+            wait_for(&context, || window.0.video.borrow().is_some()
+                && window.0.document.borrow().is_some()),
+            "a WebM must open with playback and an editable frame"
+        );
+        assert!(window.0.animation_controls.get_visible());
+        assert!(enabled("play-pause"));
+        let size = window.0.canvas.texture().map(|t| (t.width(), t.height()));
+        assert_eq!(size, Some((16, 16)));
+
+        // Playback must advance past the red opening frame.
+        assert!(
+            wait_for(&context, || window
+                .0
+                .canvas
+                .texture()
+                .and_then(|texture| rgba_from_texture(&texture))
+                .is_some_and(|frame| dominant_channel(&frame) != 0)),
+            "playback must show later frames"
+        );
+
+        window.toggle_animation();
+        assert!(window.0.animation_paused.get());
+        let displayed = window
+            .0
+            .canvas
+            .texture()
+            .and_then(|texture| rgba_from_texture(&texture))
+            .expect("displayed frame");
+        let source = window
+            .0
+            .document
+            .borrow()
+            .as_ref()
+            .map(|document| document.source().pixels.as_ref().clone())
+            .expect("editable document");
+        assert_eq!(
+            source, displayed,
+            "pausing must make the displayed frame the editable source"
+        );
+
+        window.toggle_animation();
+        assert!(!window.0.animation_paused.get());
+        window.apply(Operation::FlipHorizontal);
+        assert!(
+            window.0.animation_paused.get(),
+            "editing must pause playback"
+        );
+        assert!(
+            !enabled("play-pause"),
+            "playback must stay disabled while edits are applied"
+        );
+        window.toggle_animation();
+        assert!(window.0.animation_paused.get());
+    }
 
     #[test]
     fn copying_a_rotated_image_annotation_keeps_only_its_transformed_pixels() {

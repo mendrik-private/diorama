@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gio::prelude::CancellableExt;
+use gtk::prelude::{MediaFileExt, TextureExt};
 use image::{DynamicImage, ImageDecoder, ImageReader};
 
 use crate::document::{ImageSource, Metadata};
@@ -54,6 +55,9 @@ pub async fn load_preview(
     limits: DecodeLimits,
     cancellable: &gio::Cancellable,
 ) -> Result<LoadedPreview> {
+    if super::video::is_video(file) {
+        return load_video_preview(file, limits, cancellable).await;
+    }
     let mut loader = glycin::Loader::new(file.clone());
     loader.cancellable(cancellable.clone());
     loader.use_expose_base_dir(false);
@@ -74,6 +78,28 @@ pub async fn load_preview(
         height: frame.height(),
         metadata,
         animation_delay: frame.delay(),
+    })
+}
+
+async fn load_video_preview(
+    file: &gio::File,
+    limits: DecodeLimits,
+    cancellable: &gio::Cancellable,
+) -> Result<LoadedPreview> {
+    let (media, texture) = super::video::open_video(file, cancellable).await?;
+    media.clear();
+    let width = u32::try_from(texture.width()).map_err(|_| AppError::InvalidDimensions)?;
+    let height = u32::try_from(texture.height()).map_err(|_| AppError::InvalidDimensions)?;
+    enforce_limits(width, height, limits)?;
+    Ok(LoadedPreview {
+        texture,
+        width,
+        height,
+        metadata: Metadata {
+            mime_type: Some(super::video::VIDEO_MIME_TYPE.to_owned()),
+            ..Metadata::default()
+        },
+        animation_delay: Some(std::time::Duration::from_millis(33)),
     })
 }
 

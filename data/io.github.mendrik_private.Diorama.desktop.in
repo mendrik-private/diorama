@@ -6,5 +6,5 @@ Icon=io.github.mendrik_private.Diorama
 Terminal=false
 Type=Application
 Categories=Graphics;Viewer;
-MimeType=image/png;image/jpeg;image/gif;image/webp;image/avif;image/heif;image/tiff;image/svg+xml;image/bmp;image/jxl;image/jp2;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/avif;image/heif;image/tiff;image/svg+xml;image/bmp;image/jxl;image/jp2;video/webm;
 StartupNotify=true
