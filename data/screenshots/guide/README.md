@@ -91,3 +91,27 @@ The script runs with `GSETTINGS_BACKEND=memory`, `GDK_SCALE=1`, and
 `GDK_DPI_SCALE=1`. Pass the directory containing the three named originals as
 its first argument or set `DIORAMA_SCALE_COMPARISON_SOURCE_ROOT` to reproduce
 the captures from another checkout.
+
+## Main menu capture (0.3.28)
+
+`main-menu.png` was captured on 2026-10-30 from Diorama 0.3.28, based on
+source revision `9f22d5e` with the menu changes and capture harness committed
+in the 0.3.28 release. It shows the real open hamburger popover: Copy Filepath,
+Open Location, then File, Tools, Edit, Transform, and Info. A local image is
+loaded, so both file actions are enabled. The sample is a temporary copy of
+`50-wyvern.png` with the original SHA-256 recorded above; the original is
+unchanged.
+
+The existing 1280 × 800 headless Weston command was used with socket
+`diorama-menu-release`. The capture selects the menu contents from the real
+window at 1× scale, 96 Xft DPI, and Adwaita Sans 11; it does not composite or
+recreate menu text. Reproduce with the same source environment as the guide
+script and `DIORAMA_SCREENSHOT_MENU_ONLY=1`:
+
+```sh
+DIORAMA_SCREENSHOT_MENU_ONLY=1 GSK_RENDERER=cairo GDK_BACKEND=wayland \
+  WAYLAND_DISPLAY=diorama-menu-release build-aux/capture-guide-screenshots.sh
+```
+
+The menu capture was reviewed at native PNG size and as embedded in the guide.
+Other screenshots remain accurate because this release changes only the menu.

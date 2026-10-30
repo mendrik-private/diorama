@@ -8,7 +8,7 @@
 deploys the static site. Releases use the same read-only documentation build
 workflow before publication.
 
-The guide's twenty-six screenshot filenames are part of the build contract. Their
+The guide's twenty-seven screenshot filenames are part of the build contract. Their
 source directory is `data/screenshots/guide/`; the documentation build copies
 them into an isolated temporary book and never writes generated assets into
 the checkout. Keep every required capture versioned with the guide; verify
@@ -33,7 +33,7 @@ feature list as authoritative.
 
 | Reachable capability | Source reference | Guide page |
 | --- | --- | --- |
-| File: Open, Open With, Copy Image or Selection, Copy Filepath, Save, Save As, Print | `src/window/mod.rs`: `main_menu`, `install_actions`, clipboard and print handlers | [Get started](user-guide/src/getting-started.md), [Save and export](user-guide/src/save-and-export.md), [Background removal](user-guide/src/background-removal.md) |
+| Main menu: Copy Filepath, Open Location; File: Open, Open With, Copy Image or Selection, Save, Save As, Print | `src/window/mod.rs`: `main_menu`, `install_actions`, clipboard and print handlers | [Get started](user-guide/src/getting-started.md), [Save and export](user-guide/src/save-and-export.md), [Background removal](user-guide/src/background-removal.md) |
 | Sequence browsing, supported formats, folder sort, delete, normal fullscreen, image preview, zoom/pinch/minimap, fit, hard/soft zoom | `src/window/mod.rs`: navigation, minimap, `image-preview`, zoom actions; `src/navigation/directory.rs`; `src/application.rs`: `SHORTCUTS` | [Get started](user-guide/src/getting-started.md), [Preferences](user-guide/src/preferences.md), [Shortcuts](user-guide/src/shortcuts-and-troubleshooting.md) |
 | Animated-image and WebM play/pause and frame stepping | `src/window/mod.rs`: `start_animation`, `start_video`, `toggle_animation`, `step_animation`; `src/image/video.rs` | [Get started](user-guide/src/getting-started.md), [Shortcuts](user-guide/src/shortcuts-and-troubleshooting.md) |
 | Select Region; region zoom, crop, copy, cutout, and background fill | `src/window/mod.rs`: region toolbar, `start_selection_preparation`, `activate_prepared_selection`, `fill_selected_region_with_background` | [Crop and select](user-guide/src/cropping.md), [Background removal](user-guide/src/background-removal.md) |
@@ -61,6 +61,7 @@ one task per frame. Required files are:
 
 | File | Demonstrates |
 | --- | --- |
+| `main-menu.png` | Top-level Copy Filepath and Open Location, followed by grouped commands |
 | `overview.png` | Open image and main viewing workspace |
 | `inspect-pixel-lens.png` | Pixel lens over a face |
 | `compare-lenses.png` | Synchronized comparison and paired lenses |

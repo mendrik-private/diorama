@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.28" date="2026-10-30">
+      <description>
+        <p>Copy Filepath is now at the top of the main menu. The new Open Location action opens the current image in its parent folder in the desktop file manager.</p>
+      </description>
+    </release>
     <release version="0.3.27" date="2026-10-27">
       <description>
         <p>Diorama now opens WebM videos. They play muted and loop with the animation controls, and the paused frame can be edited, copied, printed, and saved as PNG or JPEG.</p>

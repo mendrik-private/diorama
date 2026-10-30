@@ -211,6 +211,48 @@ fn capture_guide_screenshots() {
     // The guide deliberately captures a real application window: its widgets,
     // canvas overlays, dialogs, and annotations all take the normal rendering
     // paths. The fixture source is read-only and lives outside the repository.
+    if std::env::var_os("DIORAMA_SCREENSHOT_MENU_ONLY").is_some() {
+        fn find_menu(widget: &gtk::Widget) -> Option<gtk::MenuButton> {
+            if let Ok(button) = widget.clone().downcast::<gtk::MenuButton>()
+                && button.tooltip_text().as_deref() == Some("Main Menu")
+                && button.is_mapped()
+            {
+                return Some(button);
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(button) = find_menu(&widget) {
+                    return Some(button);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let button = find_menu(window.0.window.upcast_ref()).expect("main menu button");
+        let popover = button.popover().expect("main menu popover");
+        // Headless capture has no input serial for a Wayland popup grab.
+        popover.set_autohide(false);
+        button.popup();
+        settle();
+        assert!(popover.is_mapped(), "main menu is visible");
+        let widget = popover.first_child().expect("main menu surface");
+        let snapshot = gtk::Snapshot::new();
+        widget
+            .parent()
+            .expect("menu contents host")
+            .snapshot_child(&widget, &snapshot);
+        let node = snapshot.to_node().expect("menu snapshot");
+        window
+            .0
+            .window
+            .renderer()
+            .expect("renderer")
+            .render_texture(&node, Some(&node.bounds()))
+            .save_to_png(std::path::Path::new(&output).join("main-menu.png"))
+            .expect("menu PNG capture");
+        window.0.window.close();
+        return;
+    }
     capture(&window, "overview.png");
     if std::env::var_os("DIORAMA_SCREENSHOT_OVERVIEW_ONLY").is_some() {
         window.0.window.close();

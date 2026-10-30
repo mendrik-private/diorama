@@ -58,7 +58,17 @@ toggles the normal application fullscreen mode.
 ## Files and sequences
 
 **File → Open With…** opens the current file in another application through
-the system chooser. **Copy Filepath** copies the local path when there is one.
+the system chooser. At the top of the main menu, **Copy Filepath** copies the
+local path. Directly below it, **Open Location** opens the current file in its
+parent folder in the desktop file manager (Nautilus on GNOME). These actions
+are unavailable until an image with a local file is open; **Open Location**
+also requires a parent folder.
+
+[![Main menu with Copy Filepath and Open Location above File, Tools, Edit, Transform, and Info](assets/screenshots/main-menu.png)](assets/screenshots/main-menu.png)
+
+*Open the hamburger menu to copy the current path or find the image in its
+folder. The existing grouped commands follow these two actions.*
+
 **Print…** opens the system print dialog; it prints the displayed animation
 frame for an animation or video and uses white paper regardless of the viewer's
 transparency backdrop. Use **Delete Image** (<kbd>Delete</kbd>) only when you

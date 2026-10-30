@@ -1654,6 +1654,10 @@ impl ViewerWindow {
             let this = self.clone();
             move || this.copy_current_filepath_to_clipboard()
         });
+        self.add_action("open-location", {
+            let this = self.clone();
+            move || this.open_current_file_location()
+        });
         self.add_action("zoom-in", {
             let this = self.clone();
             move || this.step_zoom(true)
@@ -2672,6 +2676,16 @@ impl ViewerWindow {
                     .is_some_and(|file| file.path().is_some()),
         );
         self.set_action_enabled("delete-file", has_file && has_image);
+        self.set_action_enabled(
+            "open-location",
+            has_image
+                && self
+                    .0
+                    .current_file
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|file| file.is_native() && file.parent().is_some()),
+        );
         self.set_action_enabled("previous", has_image && has_neighbors);
         self.set_action_enabled("next", has_image && has_neighbors);
 
@@ -3843,6 +3857,33 @@ impl ViewerWindow {
         self.0
             .toasts
             .add_toast(adw::Toast::new(&gettext("Copied filepath")));
+    }
+
+    fn open_current_file_location(&self) {
+        let Some(file) = self
+            .0
+            .current_file
+            .borrow()
+            .as_ref()
+            .filter(|file| file.is_native() && file.parent().is_some())
+            .cloned()
+        else {
+            return;
+        };
+        let launcher = gtk::FileLauncher::new(Some(&file));
+        let parent = self.0.window.clone();
+        let weak = Rc::downgrade(&self.0);
+        glib::spawn_future_local(async move {
+            if let Err(error) = launcher.open_containing_folder_future(Some(&parent)).await
+                && !open_with_was_cancelled(&error)
+                && let Some(state) = weak.upgrade()
+            {
+                state.toasts.add_toast(adw::Toast::new(
+                    &gettext("Could not open file location: {error}")
+                        .replace("{error}", &error.to_string()),
+                ));
+            }
+        });
     }
 
     fn copy_current_image_to_clipboard(&self) {
@@ -8444,12 +8485,13 @@ fn menu_submenu(menu: &gio::Menu, label: &str, submenu: &gio::Menu) {
 
 fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
+    menu_item(&menu, "Copy Filepath", "win.copy-filepath");
+    menu_item(&menu, "Open Location", "win.open-location");
 
     let file_menu = gio::Menu::new();
     menu_item(&file_menu, "Open…", "win.open");
     menu_item(&file_menu, "Open With…", "win.open-with");
     menu_item(&file_menu, "Copy Image or Selection", "win.copy-image");
-    menu_item(&file_menu, "Copy Filepath", "win.copy-filepath");
     menu_item(&file_menu, "Save", "win.save");
     menu_item(&file_menu, "Save As…", "win.save-as");
     menu_item(&file_menu, "Print…", "win.print");
@@ -9484,7 +9526,6 @@ mod tests {
                     ("Open…", "win.open"),
                     ("Open With…", "win.open-with"),
                     ("Copy Image or Selection", "win.copy-image"),
-                    ("Copy Filepath", "win.copy-filepath"),
                     ("Save", "win.save"),
                     ("Save As…", "win.save-as"),
                     ("Print…", "win.print"),
@@ -9540,8 +9581,21 @@ mod tests {
             ),
         ];
 
-        assert_eq!(menu.n_items(), expected.len() as i32);
+        let top_level_actions = [
+            ("Copy Filepath", "win.copy-filepath"),
+            ("Open Location", "win.open-location"),
+        ];
+        assert_eq!(
+            menu.n_items(),
+            (top_level_actions.len() + expected.len()) as i32
+        );
+        for (index, (label, action)) in top_level_actions.iter().enumerate() {
+            assert_eq!(string_attribute(&menu, index as i32, "label"), *label);
+            assert_eq!(string_attribute(&menu, index as i32, "action"), *action);
+            assert!(menu.item_link(index as i32, "submenu").is_none());
+        }
         for (index, (group_label, expected_items)) in expected.iter().enumerate() {
+            let index = index + top_level_actions.len();
             assert_eq!(
                 string_attribute(&menu, index as i32, "label"),
                 *group_label,
