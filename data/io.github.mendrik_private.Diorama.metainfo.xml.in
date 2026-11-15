@@ -45,6 +45,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.29" date="2026-11-15">
+      <description>
+        <p>Game Asset scaling now downloads missing FLUX model files and sets up its Python environment automatically on first use. Download progress, cancellation, verified cache reuse, and actionable Hugging Face access errors replace the missing-model setup failure.</p>
+      </description>
+    </release>
     <release version="0.3.28" date="2026-10-30">
       <description>
         <p>Copy Filepath is now at the top of the main menu. The new Open Location action opens the current image in its parent folder in the desktop file manager.</p>

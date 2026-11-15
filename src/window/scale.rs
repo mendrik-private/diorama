@@ -65,6 +65,7 @@ pub(super) fn generation_progress_text(progress: Progress) -> String {
     }
     let seconds = progress.remaining.as_secs_f64().ceil().max(1.) as u64;
     match (progress.stage, seconds < 90) {
+        (Stage::Downloading, _) => gettext("Downloading line-art dependencies…"),
         (Stage::Generating, true) => gettext("Generating line art… ~{seconds} s left")
             .replace("{seconds}", &seconds.to_string()),
         (Stage::Generating, false) => gettext("Generating line art… ~{minutes} min left")
@@ -138,6 +139,14 @@ mod tests {
         assert_eq!(cutting_out(0.9, 0.), "Cutting out… ~1 s left");
         assert_eq!(cutting_out(0.9, 100.), "Cutting out… ~2 min left");
         assert_eq!(cutting_out(1., 0.), "Finishing line art…");
+        assert_eq!(
+            generation_progress_text(Progress {
+                fraction: 0.,
+                remaining: Duration::ZERO,
+                stage: Stage::Downloading,
+            }),
+            "Downloading line-art dependencies…"
+        );
     }
 
     #[test]

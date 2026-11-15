@@ -1,7 +1,7 @@
 project(
   'diorama',
   'rust',
-  version: '0.3.28',
+  version: '0.3.29',
   meson_version: '>= 1.3.0',
   default_options: ['warning_level=2'],
 )
@@ -33,4 +33,11 @@ test(
   cargo_script,
   args: [meson.project_source_root(), '', 'test'],
   timeout: 1800,
+)
+
+test(
+  'line-art-setup-tests',
+  find_program('python3'),
+  args: [meson.project_source_root() / 'build-aux/test-setup-line-art.py'],
+  timeout: 30,
 )

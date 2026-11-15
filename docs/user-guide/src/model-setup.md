@@ -76,18 +76,19 @@ LaMa defaults to CPU inference. `DIORAMA_LAMA_DEVICE=cuda` requests a supported 
 
 ## FLUX.2 [klein]: Game Asset scaling
 
-Game Asset requires more storage and a capable GPU than the other local tools. It uses [FLUX.2 [klein] 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) under its non-commercial licence, plus a 5.9 GB Q4_K_M GGUF transformer. First accept the licence on the FLUX model page. Then use the host Python with GPU-enabled PyTorch for ROCm or CUDA and run:
+Game Asset requires more storage and a capable GPU than the other local tools. It uses [FLUX.2 [klein] 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) under its non-commercial licence, plus a 5.9 GB Q4_K_M GGUF transformer.
 
-```sh
-cd /path/to/diorama
-python3 build-aux/setup-line-art.py
-~/.cache/diorama/line-art-venv/bin/hf auth login
-python3 build-aux/setup-line-art.py
-```
+On the first uncached generation, Diorama automatically installs missing Python packages and downloads missing model files. The progress bar shows **Downloading line-art dependencies…**. Cancelling stops the download; retrying reuses completed files. Later generations use the verified local files without downloading them again. A working host Python with GPU-enabled PyTorch for ROCm or CUDA is required; setup preserves that PyTorch installation.
 
-The first run creates `~/.cache/diorama/line-art-venv` with system site packages. It reuses host PyTorch and installs pinned diffusers, transformers, accelerate, and gguf without replacing that PyTorch. Authenticate with the same Hugging Face account that accepted the gated FLUX licence, then rerun setup. The process is idempotent: rerunning it resumes incomplete downloads and keeps completed files.
+[![Game Asset preview downloading missing line-art dependencies before generation](assets/screenshots/game-asset-download.png)](assets/screenshots/game-asset-download.png)
 
-The pipeline, about 16.5 GB, lives at `$XDG_CACHE_HOME/diorama/flux2-klein-9b`; the transformer lives at `$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf/flux-2-klein-9b-Q4_K_M.gguf`. Together they need about 22 GB. Setup verifies the GGUF hash and writes `~/.config/diorama/line-art-runtime.conf`. Diorama validates the setup revision marker, GGUF size, and hash marker before it runs; its worker never downloads models itself.
+*The first uncached preview prepares missing dependencies automatically. Generation starts after setup finishes; the preview remains unapplied.*
+
+FLUX requires Hugging Face access. Accept the licence on the model page and authenticate with the same account. If access is missing, Diorama reports the model page and the `hf auth login` command for its runtime. After signing in, retry generation in Diorama.
+
+The pipeline, about 16.5 GB, lives at `$XDG_CACHE_HOME/diorama/flux2-klein-9b`; the transformer lives at `$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf/flux-2-klein-9b-Q4_K_M.gguf`. Together they need about 22 GB. Flatpak uses its app cache and can reuse verified files from the host cache. Diorama validates the pipeline revision marker, GGUF size, and hash marker before inference; the inference worker stays offline.
+
+For manual preparation, run `python3 build-aux/setup-line-art.py` from the source checkout using the host Python with GPU-enabled PyTorch. It creates a virtual environment with system site packages, installs pinned diffusers, transformers, accelerate, and gguf, downloads the models, and records `~/.config/diorama/line-art-runtime.conf`. Rerunning setup reuses completed files.
 
 To use deliberately managed locations, set these before starting Diorama:
 
@@ -97,6 +98,6 @@ export DIORAMA_LINE_ART_MODEL=/absolute/path/to/flux2-klein-9b
 export DIORAMA_LINE_ART_GGUF=/absolute/path/to/flux-2-klein-9b-Q4_K_M.gguf
 ```
 
-Diorama requires a GPU by default. Set `DIORAMA_LINE_ART_DEVICE=cpu` only when you accept very slow CPU inference. A 512-square generation needs about 7.3 GB of GPU memory on the documented configuration, more for larger images; prompt encoding also needs about 13 GB of system RAM. If the worker reports out of memory, close other GPU-heavy applications and retry. A gated-download message means the licence has not been accepted or the account is not authenticated; rerun authentication and setup rather than placing incomplete files by hand.
+Diorama requires a GPU by default. Set `DIORAMA_LINE_ART_DEVICE=cpu` only when you accept very slow CPU inference. A 512-square generation needs about 7.3 GB of GPU memory on the documented configuration, more for larger images; prompt encoding also needs about 13 GB of system RAM. If the worker reports out of memory, close other GPU-heavy applications and retry. A gated-download message means the licence has not been accepted or the account is not authenticated; authenticate with that account and retry generation.
 
 For the feature's size limits, previews, cancellation, and quality trade-offs, see [Game Asset scaling](game-asset-scaling.md).

@@ -6,7 +6,7 @@ That makes it useful for a 1024-pixel fantasy character reduced to a 256-pixel s
 
 ## Make a Game Asset preview
 
-1. Complete the **BiRefNet** and **FLUX.2 [klein]** sections of [model setup](model-setup.md) once. Game Asset needs both runtimes; ordinary scale methods do not.
+1. Configure **BiRefNet** and the host GPU-enabled PyTorch described in [model setup](model-setup.md). Diorama sets up the FLUX environment and downloads missing model files automatically on the first uncached preview. Accept the FLUX licence and authenticate with Hugging Face if prompted; ordinary scale methods do not need these models.
 2. Open the artwork, press <kbd>S</kbd>, and select **Game Asset**. Diorama begins warming the worker while this method is selected.
 3. Set target dimensions. Keep **Aspect** enabled for a normal character, then enter one dimension or use the percent slider. Game Asset only shrinks: both target dimensions must be no larger than the source.
 4. Wait for the line-art and cutout progress bar, then inspect at **Preview → Actual Pixels**. Hold **Hold Original** to compare source and preview at the same display footprint.
@@ -117,7 +117,9 @@ For example, a 256 × 128 target generates around 1024 × 512 before reduction, 
 
 ## Waiting, cancellation, and caching
 
-The first Game Asset preview can take time. Before generation, Diorama encodes two fixed prompts and caches their embeddings next to the model. This needs about 13 GB of system RAM on the documented configuration. The resident worker then keeps the transformer and VAE on the GPU and handles one job at a time. A 512-square generation was measured at about 7.3 GB GPU memory, with more needed at larger sizes.
+The first uncached Game Asset preview downloads any missing FLUX dependencies before generation. The progress bar shows **Downloading line-art dependencies…** without a time estimate. You can cancel and retry later; completed files are reused. A missing model no longer requires running a setup command from a source checkout. If Hugging Face access is denied, accept the licence and use the runtime's `hf auth login` command shown in the error, then retry. See [model setup](model-setup.md) for storage requirements and managed paths.
+
+Before generation, Diorama encodes two fixed prompts and caches their embeddings next to the model. This needs about 13 GB of system RAM on the documented configuration. The resident worker then keeps the transformer and VAE on the GPU and handles one job at a time. A 512-square generation was measured at about 7.3 GB GPU memory, with more needed at larger sizes.
 
 The worker is warmed when the Scale tool opens with Game Asset selected, or when you choose the method. It unloads when you leave Scale or change to another method, after ten idle minutes, and when Diorama exits. Changing a size cancels the current generation at its next step. If a worker does not stop within 20 seconds, crashes, or runs out of memory, Diorama reports the error and replaces it for a later request. Close other GPU-heavy applications and retry after an out-of-memory failure. CPU generation is refused unless `DIORAMA_LINE_ART_DEVICE=cpu` is set; it is expected to be very slow.
 

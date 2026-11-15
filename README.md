@@ -363,23 +363,27 @@ accept the licence on the model page, and log in once with the token of that
 account:
 
 ```sh
-~/.cache/diorama/line-art-venv/bin/hf auth login   # after the first setup run
+# Use the hf auth login command from Diorama if its runtime has a different path.
+~/.cache/diorama/line-art-venv/bin/hf auth login   # after the first setup attempt
 python3 build-aux/setup-line-art.py
 ```
 
-Run setup with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA).
-It is idempotent. It creates `~/.cache/diorama/line-art-venv` with
-`--system-site-packages`, so it reuses that PyTorch, and installs pinned
-diffusers, transformers, accelerate, and gguf. It downloads the pinned pipeline
-revision without its bf16 transformer weights (text encoder, VAE, tokenizer,
-configuration and licence; about 16.5 GB) to
-`$XDG_CACHE_HOME/diorama/flux2-klein-9b`, and the pinned
-`flux-2-klein-9b-Q4_K_M.gguf` (5.9 GB) to
-`$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf`, whose SHA-256 it verifies:
-about 22 GB in all. Without access to the gated repository it says how to get
-it. Setup records the environment in `~/.config/diorama/line-art-runtime.conf`.
-An interrupted download can be resumed by rerunning it; completed files are
-kept.
+Diorama automatically installs missing Python packages and downloads the model
+files on the first uncached generation, showing **Downloading line-art
+dependencies…**. Retry after authentication or an interrupted download;
+completed files are reused. The inference worker runs offline after setup.
+A host Python with GPU-enabled PyTorch (ROCm or CUDA) is required. Setup
+creates a virtual environment with `--system-site-packages`, preserves that
+PyTorch, and installs pinned diffusers, transformers, accelerate, and gguf.
+You can also prepare everything manually with `python3 build-aux/setup-line-art.py`.
+
+The pinned pipeline revision without its bf16 transformer weights (text
+encoder, VAE, tokenizer, configuration and licence; about 16.5 GB) lives at
+`$XDG_CACHE_HOME/diorama/flux2-klein-9b`. The SHA-256-verified
+`flux-2-klein-9b-Q4_K_M.gguf` (5.9 GB) lives at
+`$XDG_CACHE_HOME/diorama/flux2-klein-9b-gguf`: about 22 GB in all. Flatpak
+uses its app cache and reuses verified files from the host cache when available.
+The runtime is recorded in `~/.config/diorama/line-art-runtime.conf`.
 
 For a target size, Diorama scales the target up until its shorter side is 512
 pixels (never down), rounds each side up to a multiple of 16, resizes the

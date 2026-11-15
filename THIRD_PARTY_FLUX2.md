@@ -17,6 +17,7 @@ only. The line art and fills it generates are Outputs under that licence and
 subject to its terms (section 2(d)–(e)), including reviewing them for
 unlawful or infringing content and disclosing AI generation where the law
 requires it. Diorama does not include or redistribute the weights.
-`build-aux/setup-line-art.py` downloads them from Hugging Face on your machine
+`build-aux/setup-line-art.py`, also embedded for automatic first-use setup,
+downloads them from Hugging Face on your machine
 after you have accepted the licence on the model page; a copy of the licence
 is downloaded with the pipeline.

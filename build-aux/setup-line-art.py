@@ -2,7 +2,7 @@
 """Set up Diorama's local FLUX.2 [klein] 9B line-art model (no system changes).
 
 Run with the host Python that has a GPU-enabled PyTorch (ROCm or CUDA). The
-script is idempotent. It:
+script is idempotent and is also embedded by Diorama for first-use setup. It:
 
 1. creates a virtual environment with ``--system-site-packages`` (so it
    reuses that PyTorch) and installs pinned diffusers, transformers,
@@ -53,8 +53,6 @@ GGUF_SIZE = 5_909_829_920
 # Written only after the file's SHA-256 matched; Diorama checks it and the
 # size instead of hashing 5.9 GB on every run.
 GGUF_MARKER = f"{GGUF_FILE}.diorama-sha256"
-DOWNLOAD_FAILED_EXIT = 3
-DOWNLOAD_GATED_EXIT = 4
 
 PROBE = """
 import importlib.metadata as metadata, json, os, sys
@@ -105,34 +103,6 @@ for text in metadata.requires("accelerate") or []:
 print(json.dumps(requirements))
 """
 
-# Hub, HTTP, and connection errors (httpx.HTTPError covers HfHubHTTPError and
-# transport failures; OSError covers local and offline-cache errors) become a
-# short message instead of a traceback. Anything else is a bug and propagates.
-DOWNLOAD = """
-import sys
-import httpx
-from huggingface_hub import snapshot_download
-from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
-repository, revision, destination = sys.argv[1:4]
-try:
-    snapshot_download(
-        repository,
-        revision=revision,
-        local_dir=destination,
-        allow_patterns=sys.argv[4:],
-    )
-except GatedRepoError as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-    sys.exit(%d)
-except HfHubHTTPError as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-    status = getattr(error.response, "status_code", None)
-    sys.exit(%d if status in (401, 403) else %d)
-except (httpx.HTTPError, OSError) as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-    sys.exit(%d)
-""" % (DOWNLOAD_GATED_EXIT, DOWNLOAD_GATED_EXIT, DOWNLOAD_FAILED_EXIT, DOWNLOAD_FAILED_EXIT)
-
 
 def cache_home():
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
@@ -168,6 +138,14 @@ def parse_arguments(argv=None):
         default=cache_home() / "diorama/line-art-venv",
         help="virtual environment to create or reuse (default: %(default)s)",
     )
+    parser.add_argument("--model", type=Path, default=model_directory())
+    parser.add_argument("--gguf", type=Path, default=gguf_path())
+    parser.add_argument("--runtime-config", type=Path, default=runtime_config_path())
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--models-only", action="store_true",
+                      help="download models using this interpreter; do not change the runtime")
+    mode.add_argument("--environment-only", action="store_true",
+                      help="install Python dependencies and record the runtime without downloading models")
     return parser.parse_args(argv)
 
 
@@ -301,44 +279,52 @@ def model_complete(model_dir):
     )
 
 
-def ensure_model(python, model_dir):
+def ensure_model(model_dir):
     if model_complete(model_dir):
         print(f"FLUX.2 [klein] 9B revision {REVISION} already installed: {model_dir}")
     else:
-        install_model(python, model_dir)
+        install_model(model_dir)
 
 
-def install_model(python, model_dir):
+def install_model(model_dir):
     model_dir.mkdir(parents=True, exist_ok=True)
     # A stale marker must not vouch for a partial or different download.
     (model_dir / REVISION_MARKER).unlink(missing_ok=True)
     print(f"Downloading {REPOSITORY}@{REVISION} (about 16.5 GB) to {model_dir}", flush=True)
-    download(python, REPOSITORY, REVISION, model_dir, ALLOW_PATTERNS)
+    download(REPOSITORY, REVISION, model_dir, ALLOW_PATTERNS)
     if not (model_dir / "model_index.json").is_file():
         raise SystemExit(f"The download finished without model_index.json in {model_dir}")
     write_atomically(model_dir / REVISION_MARKER, f"{REVISION}\n")
     print(f"Installed FLUX.2 [klein] 9B revision {REVISION}: {model_dir}")
 
 
-def download(python, repository, revision, destination, patterns):
-    """Resumable: completed files are not downloaded again."""
-    result = subprocess.run(
-        [str(python), "-c", DOWNLOAD, repository, revision, str(destination), *patterns]
-    )
-    if result.returncode == DOWNLOAD_GATED_EXIT:
-        raise SystemExit(
-            f"{repository} is gated under the FLUX Non-Commercial License. Sign in at "
-            f"https://huggingface.co/{repository}, accept the licence on the model page, "
-            f"then run `{Path(python).with_name('hf')} auth login` and rerun this script."
+def download(repository, revision, destination, patterns, *, force=False):
+    """Run in this process so cancelling Diorama also stops the download."""
+    import httpx
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+
+    try:
+        snapshot_download(
+            repository, revision=revision, local_dir=str(destination),
+            allow_patterns=patterns, force_download=force,
         )
-    if result.returncode == DOWNLOAD_FAILED_EXIT:
-        raise SystemExit(
-            f"Could not download {repository} from Hugging Face (see the error above). "
-            "Check the network connection and disk space, then rerun this script; "
-            "completed files are not downloaded again."
+    except (httpx.HTTPError, OSError) as error:
+        gated = isinstance(error, GatedRepoError) or (
+            isinstance(error, HfHubHTTPError)
+            and getattr(error.response, "status_code", None) in (401, 403)
         )
-    if result.returncode != 0:
-        raise SystemExit("The model download failed; rerun this script to resume it.")
+        if gated:
+            raise SystemExit(
+                f"{repository} requires Hugging Face access. Accept the FLUX Non-Commercial "
+                f"License at https://huggingface.co/{REPOSITORY}, then run "
+                f"`{Path(sys.executable).with_name('hf')} auth login` with that account "
+                "and retry in Diorama."
+            ) from error
+        raise SystemExit(
+            f"Could not download {repository}: {error}. Check the network connection "
+            "and disk space, then retry in Diorama; completed files are reused."
+        ) from error
 
 
 def sha256(path):
@@ -359,7 +345,7 @@ def gguf_complete(gguf):
     )
 
 
-def ensure_gguf(python, gguf):
+def ensure_gguf(gguf):
     if gguf_complete(gguf):
         print(f"{GGUF_FILE} ({GGUF_REPOSITORY}@{GGUF_REVISION}) already verified: {gguf}")
         return
@@ -372,16 +358,23 @@ def ensure_gguf(python, gguf):
             flush=True,
         )
         gguf.parent.mkdir(parents=True, exist_ok=True)
-        download(python, GGUF_REPOSITORY, GGUF_REVISION, gguf.parent, [GGUF_FILE])
+        download(GGUF_REPOSITORY, GGUF_REVISION, gguf.parent, [GGUF_FILE])
         if gguf.name != GGUF_FILE:
             (gguf.parent / GGUF_FILE).replace(gguf)
     print(f"Verifying the SHA-256 of {gguf}", flush=True)
     actual = sha256(gguf)
     if actual != GGUF_SHA256:
-        raise SystemExit(
-            f"{gguf} has SHA-256 {actual}, not the pinned {GGUF_SHA256}. "
-            "Remove it and rerun this script."
-        )
+        # A same-sized damaged file must not require a manual cache deletion.
+        download(GGUF_REPOSITORY, GGUF_REVISION, gguf.parent, [GGUF_FILE], force=True)
+        downloaded = gguf.parent / GGUF_FILE
+        actual = sha256(downloaded)
+        if actual != GGUF_SHA256:
+            raise SystemExit(
+                f"{downloaded} has SHA-256 {actual}, not the pinned {GGUF_SHA256}. "
+                "Retry in Diorama to download it again."
+            )
+        if downloaded != gguf:
+            downloaded.replace(gguf)
     write_atomically(gguf.with_name(GGUF_MARKER), f"{GGUF_SHA256}\n")
     print(f"Installed {GGUF_FILE} ({GGUF_REPOSITORY}@{GGUF_REVISION}): {gguf}")
 
@@ -395,11 +388,23 @@ def runtime_configuration(python, library_path):
 
 def main(argv=None):
     arguments = parse_arguments(argv)
+    if arguments.models_only:
+        # The inference worker sets these to 1, but provisioning needs network
+        # access. Change only this setup process, never Diorama's environment.
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        ensure_model(arguments.model)
+        ensure_gguf(arguments.gguf)
+        return
     python, report = ensure_environment(arguments.venv)
     report_torch(report)
-    ensure_model(python, model_directory())
-    ensure_gguf(python, gguf_path())
-    config = runtime_config_path()
+    if not arguments.environment_only:
+        subprocess.run(
+            [str(python), str(Path(__file__).absolute()), "--models-only",
+             "--model", str(arguments.model), "--gguf", str(arguments.gguf)],
+            check=True,
+        )
+    config = arguments.runtime_config
     write_atomically(config, runtime_configuration(python, os.environ.get("LD_LIBRARY_PATH")))
     print(f"Recorded line-art runtime: {config}")
 

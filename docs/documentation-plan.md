@@ -71,6 +71,7 @@ one task per frame. Required files are:
 | `scale-options.png` | Exact dimensions, resampling, and preview controls |
 | `scaling-method-comparison.png` | Visual result of scaling-method choices |
 | `game-asset-options.png` | Game Asset strength and preview controls |
+| `game-asset-download.png` | Automatic first-use dependency setup before an uncached preview |
 | `game-asset-result.png` | Game Asset result at output size |
 | `game-asset-line-art.png` | Generated line-art inspection |
 | `game-asset-vs-bicubic-cave-spider-128.png` | Cave spider: Bicubic and Game Asset at 128 × 128 |

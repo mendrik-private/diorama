@@ -32,6 +32,8 @@ pub struct Progress {
 /// What a running generation is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// Install the Python runtime and download missing model files.
+    Downloading,
     /// FLUX generates the line art and the fill.
     Generating,
     /// BiRefNet cuts the generated fill out.

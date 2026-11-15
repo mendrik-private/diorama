@@ -115,3 +115,22 @@ DIORAMA_SCREENSHOT_MENU_ONLY=1 GSK_RENDERER=cairo GDK_BACKEND=wayland \
 
 The menu capture was reviewed at native PNG size and as embedded in the guide.
 Other screenshots remain accurate because this release changes only the menu.
+
+## Automatic FLUX setup capture (0.3.29)
+
+`game-asset-download.png` was captured on 2026-11-15 from the real Diorama
+0.3.29 native build, based on `v0.3.28` (`c0699db`) with the automatic setup
+changes included in this release. It shows an uncached Game Asset preview
+entering **Downloading line-art dependencies…** with the actual production
+setup helper running. No generated preview or progress event was fabricated.
+The pending size field reads 527 × 527, and no scale edit has been applied.
+
+The source is an unmodified temporary copy of `50-wyvern.png`, with original
+SHA-256 `19b02e2e569ae23b4592913d818c3997dd3018d48e6f21ebdb299b2349101e5c`.
+The capture used isolated headless Weston at 1280 × 800, kiosk shell, scale 1,
+`GDK_SCALE=1`, `GDK_DPI_SCALE=1`, the Cairo GTK renderer, and `gtk-xft-dpi=98304`
+(96 DPI) with Adwaita Sans 11 in a temporary GTK settings directory. The app
+used its normal dark theme. The screenshot is an unedited compositor capture;
+its SHA-256 is `820ccb013c2c2080c219552fa9557c4498a1d0baf2d341e9841ef4a8373b657a`.
+It was reviewed at native size and at the guide's embedded size. Existing
+completed-preview screenshots remain accurate because rendering is unchanged.

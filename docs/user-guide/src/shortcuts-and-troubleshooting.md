@@ -45,6 +45,10 @@ configured BiRefNet model and cannot continue if segmentation fails. A warning
 about content-aware fill is different: Diorama can still create the cutout,
 but moving it fills the old location with the detected background colour.
 
+### Game Asset is downloading dependencies
+
+The first uncached preview automatically downloads missing FLUX model files and installs its Python packages. Wait for **Downloading line-art dependencies…** to finish, or cancel and retry later to reuse completed files. This requires about 22 GB of model storage, a host Python with GPU-enabled PyTorch, and access to the gated Hugging Face repository. An access error names the licence page and the runtime's `hf auth login` command. See [model setup](model-setup.md).
+
 ### What will Delete remove?
 
 With a region selection, <kbd>Delete</kbd> fills that rectangle with the

@@ -1,7 +1,7 @@
 //! Local FLUX.2 [klein] 9B generation of the Game Asset layers.
 //!
 //! A Python worker runs the Q4_K_M GGUF transformer on the GPU, offline, from
-//! files the user installed with `build-aux/setup-line-art.py`. Prompts are
+//! files installed on demand by the embedded setup helper. Prompts are
 //! encoded once, on the CPU, in a separate worker process, and their
 //! embeddings are cached next to the model. For a target
 //! size it generates line art and a de-inked fill, one after the other on one
@@ -14,6 +14,7 @@
 mod estimate;
 mod progress;
 mod resident;
+mod setup;
 
 use std::{
     fs::{self, File},
@@ -141,8 +142,11 @@ pub struct GameAssetLayers {
 /// Cuts out an opaque image: its foreground mask, at its size.
 type Cutout<'a> = dyn Fn(&RgbaImage, &CancellationToken) -> Result<GrayImage> + 'a;
 
+#[derive(Clone)]
 struct Runtime {
     python: PathBuf,
+    /// No usable recorded interpreter: bootstrap a venv with the host Python.
+    bootstrap_venv: Option<PathBuf>,
     model: PathBuf,
     gguf: PathBuf,
     device: Option<String>,
@@ -242,6 +246,7 @@ pub(crate) mod fake_worker {
         Ok((
             Runtime {
                 python: root.join("python"),
+                bootstrap_venv: None,
                 model: root.join("model"),
                 gguf: root.join(GGUF_FILE),
                 device: None,
@@ -272,18 +277,23 @@ impl Runtime {
         let launch = Launch::detect();
         let config = launch.runtime_config_path(RUNTIME_CONFIG);
         let configuration = RuntimeConfiguration::read(config.as_deref());
-        let python = std::env::var_os("DIORAMA_LINE_ART_PYTHON")
+        let configured_python = std::env::var_os("DIORAMA_LINE_ART_PYTHON")
             .map(PathBuf::from)
-            .or(configuration.python)
-            .ok_or_else(|| {
-                AppError::SketchGeneration(format!(
-                    "Local line art is not set up: {} records no Python runtime. Run {SETUP} or set DIORAMA_LINE_ART_PYTHON",
-                    config.map_or_else(
-                        || RUNTIME_CONFIG.to_owned(),
-                        |path| path.display().to_string()
-                    ),
-                ))
-            })?;
+            .or(configuration.python.filter(|python| python.is_file()));
+        let bootstrap_venv = if configured_python.is_none() {
+            Some(
+                worker_process::cache_home()
+                    .ok_or_else(|| {
+                        AppError::SketchGeneration(
+                            "HOME is unavailable; cannot install line-art dependencies".into(),
+                        )
+                    })?
+                    .join("diorama/line-art-venv"),
+            )
+        } else {
+            None
+        };
+        let python = configured_python.unwrap_or_else(|| PathBuf::from("python3"));
         let install =
             |variable: &str, relative: &Path, present: fn(&Path) -> bool| -> Result<PathBuf> {
                 if let Some(path) = std::env::var_os(variable) {
@@ -302,15 +312,16 @@ impl Runtime {
         let model = install(
             "DIORAMA_LINE_ART_MODEL",
             Path::new(MODEL_DIRECTORY),
-            |model| model.join("model_index.json").is_file(),
+            |model| verify_model(model).is_ok(),
         )?;
         let gguf = install(
             "DIORAMA_LINE_ART_GGUF",
             &Path::new(GGUF_DIRECTORY).join(GGUF_FILE),
-            Path::is_file,
+            |gguf| verify_gguf(gguf).is_ok(),
         )?;
         Ok(Self {
             python,
+            bootstrap_venv,
             model,
             gguf,
             device: std::env::var("DIORAMA_LINE_ART_DEVICE")
@@ -814,8 +825,8 @@ fn run_worker(
     residency: &Residency,
     progress: &dyn Fn(Progress),
 ) -> Result<Run> {
-    verify_model(&runtime.model)?;
-    verify_gguf(&runtime.gguf)?;
+    let prepared = setup::prepare(runtime, cache, cancellation, progress)?;
+    let runtime = &prepared;
     // Another window may be running a model that takes minutes; only
     // cancellation ends the wait.
     let _permit = runtime.inference.permit(cancellation)?;
@@ -1598,6 +1609,7 @@ mod tests {
     fn host_launch_passes_the_fixed_generation_parameters_and_spaced_paths() {
         let runtime = Runtime {
             python: PathBuf::from("/host/line art/venv/bin/python"),
+            bootstrap_venv: None,
             model: PathBuf::from("/host/cache/diorama/flux2 klein"),
             gguf: PathBuf::from("/host/cache/diorama/gguf/q4 k m.gguf"),
             device: None,
@@ -1759,6 +1771,10 @@ fi"#;
                 &format!(
                     r#"#!/bin/bash
 dir="$(dirname "$0")"
+if [[ "$1" == */setup-line-art.py ]]; then
+  echo setup >> "$dir/setups"
+  exit 0
+fi
 mode=serve
 prompts=0
 while [ $# -gt 0 ]; do
@@ -1802,6 +1818,7 @@ echo stopped >> "$dir/launches"
             fs::write(gguf.with_file_name(GGUF_MARKER), RECIPE.gguf_sha256).unwrap();
             Runtime {
                 python,
+                bootstrap_venv: None,
                 model,
                 gguf,
                 device: None,
@@ -1920,6 +1937,62 @@ echo stopped >> "$dir/launches"
                 .iter()
                 .filter(|name| name.ends_with(LINE_ART_SUFFIX))
                 .count()
+        }
+
+        #[test]
+        fn missing_dependencies_are_installed_before_generation_and_reused() {
+            let root = tempfile::tempdir().unwrap();
+            let source = shapes(96);
+            prepare_results(root.path(), &source, (80, 80));
+            let runtime = succeeding(root.path());
+            fs::remove_dir_all(&runtime.model).unwrap();
+            fs::remove_file(&runtime.gguf).unwrap();
+            let worker = fs::read_to_string(&runtime.python).unwrap();
+            worker_process::write_test_executable(
+                &runtime.python,
+                &format!(
+                    r#"#!/bin/bash
+if [[ "$1" == */setup-line-art.py ]]; then
+  dir="$(dirname "$0")"
+  echo setup >> "$dir/setups"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model="$2"; shift ;;
+      --gguf) gguf="$2"; shift ;;
+    esac
+    shift
+  done
+  mkdir -p "$model" "$(dirname "$gguf")"
+  echo '{{}}' > "$model/model_index.json"
+  echo '{revision}' > "$model/{REVISION_MARKER}"
+  truncate -s {GGUF_SIZE} "$gguf"
+  echo '{hash}' > "$(dirname "$gguf")/{GGUF_MARKER}"
+  exit 0
+fi
+{worker}
+"#,
+                    revision = RECIPE.revision,
+                    hash = RECIPE.gguf_sha256,
+                ),
+            );
+            let cache = root.path().join("cache");
+            let reported = RefCell::new(Vec::new());
+            for _ in 0..2 {
+                run_worker(
+                    &reference(&source, (512, 512), &token()).unwrap(),
+                    &token(),
+                    &runtime,
+                    &cache,
+                    &Residency::default(),
+                    &|p| reported.borrow_mut().push(p),
+                )
+                .unwrap_or_else(|error| panic!("missing dependencies must be installed: {error}"));
+            }
+            assert_eq!(
+                fs::read_to_string(root.path().join("setups")).unwrap(),
+                "setup\n"
+            );
+            assert_eq!(launches(root.path()), 3, "one encode and two generations");
         }
 
         #[test]
@@ -2646,7 +2719,7 @@ echo stopped >> "$dir/launches"
         }
 
         #[test]
-        fn missing_runtime_model_or_gguf_fails_before_launch() {
+        fn incomplete_setup_or_missing_runtime_cannot_start_inference() {
             let root = tempfile::tempdir().unwrap();
             let run = |runtime: Runtime| {
                 generate_in(
@@ -2667,6 +2740,11 @@ echo stopped >> "$dir/launches"
             fs::remove_file(runtime.gguf.with_file_name(GGUF_MARKER)).unwrap();
             let error = run(runtime);
             assert!(error.contains("Q4_K_M") && error.contains(SETUP), "{error}");
+            assert_eq!(
+                fs::read_to_string(root.path().join("setups")).unwrap(),
+                "setup\nsetup\n",
+                "both incomplete installs must attempt automatic setup"
+            );
             assert_eq!(launches(root.path()), 0);
 
             let mut runtime = succeeding(root.path());
